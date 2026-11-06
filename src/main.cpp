@@ -47,38 +47,154 @@
 #include <Wire.h>
 #include <LiquidCrystal_I2C.h>
 
-// --- ESP32 Pin Definitions ---
-#define RST_PIN         4       // Safe GPIO for RC522 Reset
-#define SS_PIN          5       // Standard ESP32 VSPI Chip Select (SS/SDA)
-#define BUZZER_PIN      27      // Safe output GPIO for Buzzer
-#define RED_LED_PIN     26      // Safe output GPIO for Red LED
+// ==========================================
+// 1. PIN DEFINITIONS & HARDWARE SETUP
+// ==========================================
+#define RST_PIN     4       // RC522 Reset
+#define SS_PIN      5       // RC522 Chip Select (SDA)
+#define BUZZER_PIN  27      // Buzzer (+)
+#define RED_LED_PIN 26      // Red LED (+)
 
-// --- Object Initialization ---
 MFRC522 mfrc522(SS_PIN, RST_PIN);
-LiquidCrystal_I2C lcd(0x27, 16, 2); // Verify your I2C address (usually 0x27 or 0x3F)
+LiquidCrystal_I2C lcd(0x27, 16, 2);
 
-// --- Database ---
-// Registered Student RFID UIDs (NO spaces)
-String registeredStudents[] = {
+// ==========================================
+// 2. SYSTEM STATES & DATA MODELS
+// ==========================================
+enum SystemState {
+  WAITING_FOR_STUDENT,
+  WAITING_FOR_BOOK
+};
+
+SystemState currentState = WAITING_FOR_STUDENT;
+
+// Book structure: keeps RFID tag and shelf number together
+struct Book {
+  String uid;
+  int shelf;
+};
+
+// Database: Registered students
+const String registeredStudents[] = {
   "37E09604"  // Student 1
 };
-const int numStudents = 1;
 
-// Registered Book RFID UIDs (NO spaces)
-String registeredBooks[] = {
-  "F10F7E05", // Book 1 
-  "8DC0FA6B"  // Book 2
+// Database: Registered books and their shelf locations
+const Book registeredBooks[] = {
+  { "F10F7E05", 2 }, // Book 1 -> Shelf 2
+  { "8DC0FA6B", 4 }  // Book 2 -> Shelf 4
 };
-// Which shelf each book belongs to (Book 1 -> Shelf 2, Book 2 -> Shelf 4)
-int bookShelfMap[] = {2, 4}; 
-const int numBooks = 2;
 
-// --- System State ---
-int currentState = 0; // 0: Waiting for Student, 1: Waiting for Book
+// ==========================================
+// 3. UI & FEEDBACK HELPERS
+// ==========================================
+
+// Display up to 2 lines of text on the LCD
+void showMessage(const String& line1, const String& line2 = "") {
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print(line1);
+  if (line2.length() > 0) {
+    lcd.setCursor(0, 1);
+    lcd.print(line2);
+  }
+}
+
+// Beep the buzzer a given number of times
+void beep(int times, int durationMs = 100) {
+  for (int i = 0; i < times; i++) {
+    digitalWrite(BUZZER_PIN, HIGH);
+    delay(durationMs);
+    digitalWrite(BUZZER_PIN, LOW);
+    delay(durationMs);
+  }
+}
+
+// Return the system to the initial ready state
+void resetSystem() {
+  currentState = WAITING_FOR_STUDENT;
+  digitalWrite(RED_LED_PIN, LOW);
+  showMessage("ShelfSense Ready", "Tap Student ID");
+}
+
+// Flash error LED, sound warning beeps, and show error text
+void showError(const String& message) {
+  showMessage(message);
+  digitalWrite(RED_LED_PIN, HIGH);
+  beep(2, 200);
+  digitalWrite(RED_LED_PIN, LOW);
+  delay(2000);
+}
+
+// ==========================================
+// 4. RFID & DATABASE LOOKUP HELPERS
+// ==========================================
+
+// Read the scanned card's UID as an uppercase hex string (e.g. "37E09604")
+String readCardUID() {
+  String uid = "";
+  for (byte i = 0; i < mfrc522.uid.size; i++) {
+    if (mfrc522.uid.uidByte[i] < 0x10) uid += "0";
+    uid += String(mfrc522.uid.uidByte[i], HEX);
+  }
+  uid.toUpperCase();
+  mfrc522.PICC_HaltA(); // Stop reading current card to prevent repeated triggers
+  return uid;
+}
+
+// Check if a student UID is registered
+bool isStudentRegistered(const String& uid) {
+  for (const String& student : registeredStudents) {
+    if (student == uid) return true;
+  }
+  return false;
+}
+
+// Find a book's shelf. Returns shelf number, or -1 if book is not registered
+int findBookShelf(const String& uid) {
+  for (const Book& book : registeredBooks) {
+    if (book.uid == uid) return book.shelf;
+  }
+  return -1;
+}
+
+// ==========================================
+// 5. STEP HANDLERS (BUSINESS LOGIC)
+// ==========================================
+
+void handleStudentScan(const String& uid) {
+  if (isStudentRegistered(uid)) {
+    showMessage("Welcome, Student!", "Tap Your Book...");
+    beep(1, 100);
+    currentState = WAITING_FOR_BOOK;
+    delay(1500); // Debounce delay
+  } else {
+    showError("Access Denied");
+    resetSystem();
+  }
+}
+
+void handleBookScan(const String& uid) {
+  int shelf = findBookShelf(uid);
+  
+  if (shelf != -1) {
+    showMessage("Book Found ->", "Go to Shelf " + String(shelf));
+    beep(2, 100); // Success double-beep
+    delay(4000);  // Allow time to read shelf number
+    resetSystem();
+  } else {
+    showError("Invalid Book Tag");
+    showMessage("Tap Your Book..."); // Prompt again without logging student out
+  }
+}
+
+// ==========================================
+// 6. MAIN ARDUINO SETUP & LOOP
+// ==========================================
 
 void setup() {
-  Serial.begin(115200); // Set to 115200 to match platformio.ini monitor_speed
-  SPI.begin();          // Initializes VSPI: SCK=18, MISO=19, MOSI=23, SS=5
+  Serial.begin(115200);
+  SPI.begin();
   mfrc522.PCD_Init();
   
   lcd.init();
@@ -91,113 +207,18 @@ void setup() {
 }
 
 void loop() {
-  // Check for new RFID card
+  // Check for an RFID card
   if (!mfrc522.PICC_IsNewCardPresent() || !mfrc522.PICC_ReadCardSerial()) {
     return;
   }
-  
-  String scannedUID = getUID();
+
+  String scannedUID = readCardUID();
   Serial.println("Scanned UID: " + scannedUID);
-  
-  if (currentState == 0) {
-    // Step 1: Student Check-In
-    if (isValidStudent(scannedUID)) {
-      lcd.clear();
-      lcd.setCursor(0, 0);
-      lcd.print("Welcome, Student!");
-      lcd.setCursor(0, 1);
-      lcd.print("Tap Your Book...");
-      beep(1, 100);
-      currentState = 1; // Move to book scanning state
-      delay(1500);      // Debounce delay
-    } else {
-      lcd.clear();
-      lcd.print("Access Denied");
-      digitalWrite(RED_LED_PIN, HIGH);
-      beep(2, 200); // Error beeps
-      digitalWrite(RED_LED_PIN, LOW);
-      delay(2000);
-      resetSystem();
-    }
-    
-  } else if (currentState == 1) {
-    // Step 2: Book Tag Scanning & Location Display
-    int bookIndex = getBookIndex(scannedUID);
-    
-    if (bookIndex != -1) {
-      int targetShelf = bookShelfMap[bookIndex];
-      
-      lcd.clear();
-      lcd.setCursor(0, 0);
-      lcd.print("Book Found ->");
-      lcd.setCursor(0, 1);
-      lcd.print("Go to Shelf " + String(targetShelf));
-      
-      beep(2, 100); // Success double-beep
-      
-      // Give the student 4 seconds to read the screen before resetting
-      delay(4000); 
-      resetSystem();
-      
-    } else {
-      lcd.clear();
-      lcd.print("Invalid Book Tag");
-      digitalWrite(RED_LED_PIN, HIGH);
-      beep(2, 200); // Error beeps
-      digitalWrite(RED_LED_PIN, LOW);
-      delay(2000);
-      
-      // Prompt for book again without resetting student login
-      lcd.clear();
-      lcd.setCursor(0, 0);
-      lcd.print("Tap Your Book...");
-    }
-  }
-}
 
-// --- Helper Functions ---
-
-// Converts the scanned byte array into a readable HEX string without spaces
-String getUID() {
-  String uidString = "";
-  for (byte i = 0; i < mfrc522.uid.size; i++) {
-    uidString += String(mfrc522.uid.uidByte[i] < 0x10 ? "0" : "");
-    uidString += String(mfrc522.uid.uidByte[i], HEX);
-  }
-  uidString.toUpperCase();
-  mfrc522.PICC_HaltA(); // Halt PICC to prevent multiple rapid reads
-  return uidString;
-}
-
-bool isValidStudent(String uid) {
-  for (int i = 0; i < numStudents; i++) {
-    if (uid == registeredStudents[i]) return true;
-  }
-  return false;
-}
-
-int getBookIndex(String uid) {
-  for (int i = 0; i < numBooks; i++) {
-    if (uid == registeredBooks[i]) return i;
-  }
-  return -1; // Not found
-}
-
-void resetSystem() {
-  currentState = 0;
-  lcd.clear();
-  lcd.setCursor(0, 0);
-  lcd.print("ShelfSense Ready");
-  lcd.setCursor(0, 1);
-  lcd.print("Tap Student ID");
-  digitalWrite(RED_LED_PIN, LOW);
-}
-
-void beep(int times, int duration) {
-  for (int i = 0; i < times; i++) {
-    digitalWrite(BUZZER_PIN, HIGH);
-    delay(duration);
-    digitalWrite(BUZZER_PIN, LOW);
-    delay(duration);
+  // Handle RFID card based on current step
+  if (currentState == WAITING_FOR_STUDENT) {
+    handleStudentScan(scannedUID);
+  } else if (currentState == WAITING_FOR_BOOK) {
+    handleBookScan(scannedUID);
   }
 }
