@@ -120,8 +120,8 @@ const Student registeredStudents[] = {
 
 // Database of registered books: { "Book Title", "RFID UID", Shelf Number, Rack Number }
 const Book registeredBooks[] = {
-  { "Algorithms", "F10F7E05", 2, 1 }, // Shelf 2, Rack 1
-  { "DSP",        "8DC0FA6B", 4, 3 }  // Shelf 4, Rack 3
+  { "Geronimo Stilton - Journey to the Center of the Earth", "F10F7E05", 2, 1 }, // Shelf 2, Rack 1
+  { "Dragon Masters - The Lost Kingdom", "8DC0FA6B", 4, 3 }  // Shelf 4, Rack 3
   // Add new books here in the format: { "Title", "UID", shelf, rack },
 };
 
@@ -182,7 +182,7 @@ void logStateTransition(SystemState fromState, SystemState toState) {
 void showMessage(const String& line1, const String& line2 = "") {
   lcd.clear();
   lcd.setCursor(0, 0);
-  lcd.print(line1);
+  lcd.print(line1.length() > 16 ? line1.substring(0, 16) : line1);
 
   Serial.print("[LCD]     Line 1: \"");
   Serial.print(line1);
@@ -190,12 +190,65 @@ void showMessage(const String& line1, const String& line2 = "") {
 
   if (line2.length() > 0) {
     lcd.setCursor(0, 1);
-    lcd.print(line2);
+    lcd.print(line2.length() > 16 ? line2.substring(0, 16) : line2);
     Serial.print(" | Line 2: \"");
     Serial.print(line2);
     Serial.print("\"");
   }
   Serial.println();
+}
+
+// Scrolls line 1 smoothly from right to left if it exceeds 16 characters while keeping line 2 static
+void showMessageWithScroll(const String& line1, const String& line2 = "", int scrollSpeedMs = 280, int totalDurationMs = 3500) {
+  Serial.print("[LCD]     Line 1: \"");
+  Serial.print(line1);
+  Serial.print("\"");
+  if (line2.length() > 0) {
+    Serial.print(" | Line 2: \"");
+    Serial.print(line2);
+    Serial.print("\"");
+  }
+  Serial.println();
+
+  lcd.clear();
+
+  // Print line 2 (static)
+  if (line2.length() > 0) {
+    lcd.setCursor(0, 1);
+    lcd.print(line2.length() > 16 ? line2.substring(0, 16) : line2);
+  }
+
+  // If line 1 fits within 16 chars, simply display without scrolling
+  if (line1.length() <= 16) {
+    lcd.setCursor(0, 0);
+    lcd.print(line1);
+    delay(totalDurationMs);
+    return;
+  }
+
+  // If line 1 is longer than 16 chars:
+  // Show initial view, pause briefly so user can start reading, then scroll smoothly
+  lcd.setCursor(0, 0);
+  lcd.print(line1.substring(0, 16));
+  delay(800);
+
+  // Add spacing so it wraps around cleanly if scrolling loops
+  String paddedText = line1 + "    ";
+  int maxOffset = paddedText.length();
+  unsigned long startTime = millis();
+
+  int offset = 0;
+  while (millis() - startTime < (unsigned long)totalDurationMs) {
+    String frame = "";
+    for (int i = 0; i < 16; i++) {
+      int charIdx = (offset + i) % maxOffset;
+      frame += paddedText.charAt(charIdx);
+    }
+    lcd.setCursor(0, 0);
+    lcd.print(frame);
+    delay(scrollSpeedMs);
+    offset++;
+  }
 }
 
 // Resets system back to the default student check-in state (turns off all LEDs)
@@ -364,16 +417,16 @@ void handleStudentScan(const String& uid) {
     const Student& student = registeredStudents[studentIdx];
     logSuccess("Student authenticated: " + student.name + " (" + student.uid + ")");
     
-    // Display student name on LCD & mirror to Serial
-    showMessage("Hi " + student.name, "Tap Book Tag...");
-    
     // Short confirmation beep with green LED flash
     indicateSuccess(1, 100, false);
 
     logStateTransition(WAITING_FOR_STUDENT, WAITING_FOR_BOOK);
     currentState = WAITING_FOR_BOOK;
 
-    delay(1500); // Debounce to allow user to remove card
+    // Display student name on LCD: if longer than 16 chars (e.g. "Hi " + name), scroll smoothly!
+    String studentLine = "Hi " + student.name;
+    showMessageWithScroll(studentLine, "Tap Book Tag...", 260, 2500);
+
     logInfo("Ready for book tag. Waiting for book scan...");
   } else {
     // Red LED + buzzer simultaneous error alarm
@@ -396,19 +449,16 @@ void handleBookScan(const String& uid) {
     logSuccess("Book identified: \"" + foundBook.title + "\" located on Shelf " + 
                String(foundBook.shelf) + ", Rack " + String(foundBook.rack));
     
-    // Line 1: Book title (truncated if > 16 chars)
-    // Line 2: Shelf and Rack location (e.g. "Shelf:2  Rack:1")
-    String line1 = foundBook.title.substring(0, 16);
-    String line2 = "Shelf:" + String(foundBook.shelf) + " Rack:" + String(foundBook.rack);
-    showMessage(line1, line2);
-    
-    // Short beep with Green LED simultaneously, and keep Green LED ON during the 4s shelf display
+    // Short beep with Green LED simultaneously, and keep Green LED ON during display
     indicateSuccess(1, 150, true);
 
-    logInfo("Displaying shelf & rack location for 4 seconds with Green LED glowing...");
-    delay(4000); // Hold message & green light so student can read shelf number
+    // Line 1: Book title (scrolls smoothly from right to left if > 16 characters)
+    // Line 2: Fixed Shelf and Rack location (e.g. "Shelf:2  Rack:1")
+    String line2 = "Shelf:" + String(foundBook.shelf) + " Rack:" + String(foundBook.rack);
+    logInfo("Displaying shelf & rack location with Green LED glowing...");
+    showMessageWithScroll(foundBook.title, line2, 280, 5000);
 
-    // Turn off Green LED after student finishes reading
+    // Turn off Green LED after display finishes
     digitalWrite(GREEN_LED_PIN, LOW);
     logInfo("Session completed. Resetting for next student...");
     resetSystem();
