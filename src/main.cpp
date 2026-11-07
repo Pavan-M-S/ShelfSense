@@ -452,11 +452,19 @@ void handleBookScan(const String& uid) {
     // Short beep with Green LED simultaneously, and keep Green LED ON during display
     indicateSuccess(1, 150, true);
 
-    // Line 1: Book title (scrolls smoothly from right to left if > 16 characters)
-    // Line 2: Fixed Shelf and Rack location (e.g. "Shelf:2  Rack:1")
-    String line2 = "Shelf:" + String(foundBook.shelf) + " Rack:" + String(foundBook.rack);
-    logInfo("Displaying shelf & rack location with Green LED glowing...");
-    showMessageWithScroll(foundBook.title, line2, 280, 5000);
+    // First display Shelf number on Line 2 while book title displays / scrolls
+    String shelfLine = "Shelf: " + String(foundBook.shelf);
+    logInfo("Displaying shelf location with Green LED glowing...");
+    showMessageWithScroll(foundBook.title, shelfLine, 280, 4700);
+
+    // Just 300ms before completing, update Line 2 to display the Rack name/number
+    String rackLine = "Rack: " + String(foundBook.rack);
+    lcd.setCursor(0, 1);
+    lcd.print("                "); // clear line 2
+    lcd.setCursor(0, 1);
+    lcd.print(rackLine);
+    Serial.println("[LCD]     Just 300ms before completing -> " + rackLine);
+    delay(300);
 
     // Turn off Green LED after display finishes
     digitalWrite(GREEN_LED_PIN, LOW);
