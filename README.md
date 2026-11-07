@@ -52,17 +52,19 @@ stateDiagram-v2
     BookEarlyWarn --> WaitingForStudent: LCD: "Please Tap Your / Student ID First" (2 Warning Beeps + Red LED)
     UnrecognizedAlarm0 --> WaitingForStudent: LCD: "Unrecognized ID / Access Denied!" (2s Rapid Alarm + Red Strobe)
 
-    AuthSuccess --> WaitingForBook: Beep + Green Pulse | LCD: "Hi <Name>" (Smooth Scroll) / "Tap Book Tag..."
+    AuthSuccess --> WaitingForBook: Beep + Green Pulse | LCD: "Hi <Name>" (Smooth Scroll) / "Tap Book Tag..." (20s Timer Started)
 
     state "State 1: WAITING_FOR_BOOK" as WaitingForBook {
-        [*] --> DetectTag1: Card Presented
+        [*] --> DetectTag1: Card Presented or Inactivity
         DetectTag1 --> BookFound: Valid Book Tag
-        DetectTag1 --> StudentAgainWarn: Scanned Student Card Again
-        DetectTag1 --> UnrecognizedAlarm1: Unregistered Tag
+        DetectTag1 --> StudentAgainWarn: Scanned Student Card Again (Timer Renewed +20s)
+        DetectTag1 --> UnrecognizedAlarm1: Unregistered Tag (Timer Renewed +20s)
+        DetectTag1 --> SessionTimeout: Inactivity >= 20s
     }
 
     StudentAgainWarn --> WaitingForBook: LCD: "Please Tap Book / Tag (Not ID)" (Session Maintained)
     UnrecognizedAlarm1 --> WaitingForBook: LCD: "Unrecognized ID / Unknown Book Tag" (2s Alarm, Session Maintained)
+    SessionTimeout --> WaitingForStudent: LCD: "Session Expired / Please Try Again" (2 Warning Beeps + Red LED)
 
     BookFound --> AnimatedGuidance: Beep + Green Pulse
 
@@ -87,8 +89,15 @@ stateDiagram-v2
   - **Book Localization (`WAITING_FOR_BOOK`)**: Maps book tags to designated **Shelf** and **Rack** coordinates.
 - **Cross-Tag Type Resolution & Session Memory**:
   - Scanning a book tag before student login prompts: `"Please Tap Your Student ID First"`.
-  - Scanning a student ID while already in book-scan mode prompts: `"Please Tap Book Tag (Not ID)"` without ending the active student session.
-  - Unrecognized tags trigger a **2-second emergency alarm** (rapid 100ms pulsing audio-visual strobe), while preserving the authenticated session during book lookups for frictionless retry.
+  - Scanning a student ID while already in book-scan mode prompts: `"Please Tap Book Tag (Not ID)"` without ending the active student session (renews timer).
+  - Unrecognized tags trigger a **2-second emergency alarm** (rapid 100ms pulsing audio-visual strobe), while preserving the authenticated session during book lookups for frictionless retry (renews timer).
+- **Non-Blocking Inactivity Session Timeout (`SESSION_TIMEOUT_MS = 20000`)**:
+  - Automatically expires abandoned patron sessions after 20 seconds of inactivity in `WAITING_FOR_BOOK`.
+  - Issues 2 warning beeps + Red LED flashes, presents `"Session Expired / Please Try Again"` on LCD, and cleanly returns to standby.
+  - Interactive retries (scanning a book out of order or unrecognized tag) automatically renew the 20-second session window (`+20s`).
+- **Zero Dynamic Allocation Architecture (24/7 Production Stability)**:
+  - Eliminates heap-allocating Arduino `String` instances in database models, RFID reading, and logging routines.
+  - Utilizes fixed-size stack buffers (`char[]`), `const char*` pointers, and `F(...)` flash-string macros to prevent RAM heap fragmentation and Out-Of-Memory (OOM) crashes during continuous 24/7 public kiosk operation.
 - **Dynamic Animated Guidance Choreography**:
   - **Adaptive Title Scrolling**: Automatically chooses 280ms/char for titles $\le 30$ characters and accelerates to 180ms/char for longer titles, accompanied by rhythmic Green LED blinking.
   - **Pre-Reveal Cue**: Exactly 4 characters before title scrolling concludes, Line 2 reveals `Shelf:X  Rack:Y` with an immediate single audio chime.
@@ -167,29 +176,39 @@ stateDiagram-v2
 | **Session Ending Warning** | Line 1: `Shelf:X  Rack:Y`<br>Line 2: `Session Ending..` | 3 medium beeps (500ms ON / 500ms OFF) | Green LED flashes synchronously | 3.0 seconds |
 | **Out-of-Order Scan** | E.g. `Please Tap Your`<br>`Student ID First` | 2 warning pulses (180ms ON / 120ms OFF) | Red LED flashes synchronously | 1.5s pause |
 | **Emergency Alarm** | `Unrecognized ID`<br>`Access Denied!` / `Unknown Book Tag` | Rapid 10-pulse siren (100ms ON / 100ms OFF) | Red LED rapid strobe | 2.0s alarm + 1.0s read time |
+| **Session Inactivity Timeout** | `Session Expired `<br>`Please Try Again` | 2 short beeps (150ms ON / 150ms OFF) | Red LED flashes synchronously | Triggered after 20s; 1.0s pause before reset |
+| **Step 2 Retry (Renew)** | `Tap Your Book...` | Feedback matching scan result | Corresponding LED | Renews 20s session countdown (`+20s`) |
 
 ---
 
 ## Software Configuration & Database Management
 
-### Data Structures
+### Data Structures & Zero-Heap Architecture
 
-Records are defined using strongly-typed structs in [`src/main.cpp`](src/main.cpp):
+To guarantee long-term stability without RAM heap fragmentation, records are defined using lightweight C-string pointers and fixed types in [`src/main.cpp`](src/main.cpp):
 
 ```cpp
-// Structure modeling student credentials
+// Structure modeling student credentials (zero heap allocation)
 struct Student {
-  String name;     // Student's full name (e.g. "Pavan")
-  String uid;      // RFID tag UID in uppercase HEX without spaces (e.g. "37E09604")
+  const char* name;     // Student's full name (e.g. "Pavan")
+  const char* uid;      // RFID tag UID in uppercase HEX without spaces (e.g. "37E09604")
 };
 
 // Structure modeling book catalog entries with spatial coordinates
 struct Book {
-  String title;    // Book title (e.g. "Algorithms")
-  String uid;      // RFID tag UID in uppercase HEX without spaces (e.g. "F10F7E05")
-  int shelf;       // Assigned shelf number
-  int rack;        // Assigned rack number
+  const char* title;    // Book title (e.g. "Algorithms")
+  const char* uid;      // RFID tag UID in uppercase HEX without spaces (e.g. "F10F7E05")
+  uint8_t shelf;        // Assigned shelf number
+  uint8_t rack;         // Assigned rack number
 };
+```
+
+### Session Timeout Configuration
+
+The duration a patron can keep the book-scanning state active before an automated timeout is set via:
+
+```cpp
+#define SESSION_TIMEOUT_MS 20000 // Inactivity timeout in ms (default: 20 seconds)
 ```
 
 ### Adding Students and Books
@@ -282,7 +301,8 @@ ShelfSense produces categorized, human-readable serial logs for observability an
 | `[FEEDBACK]` | Buzzer, Red LED, and Green LED hardware invocations | `[FEEDBACK] SUCCESS -> Green LED + Buzzer (1 beep @ 150 ms)` |
 | `[LCD]` | Display screen updates and scroll frame activity | `[LCD] Line 2 revealed (4 chars before end): "Shelf:2 Rack:1"` |
 | `[TIMER]` | Second-by-second countdown logs for guidance holds | `[TIMER] Hold elapsed: 4s / 8s [View: Title + Shelf & Rack]` |
-| `[WARN]` | Non-fatal warnings (e.g. wrong scan order) | `[WARN] Book tag scanned at Step 1 instead of Student ID!` |
+| `[INFO]` | General info & session inactivity timer renewals | `[INFO] Session timer renewed (+20s). Ready for book tag retry...` |
+| `[WARN]` | Warnings (e.g. wrong scan order, session timeout) | `[WARN] Session timed out: No book scan received within 20 seconds.` |
 | `[ERROR]` | Serious faults (unrecognized tag emergency, hardware failure) | `[ERROR] EMERGENCY ALARM TRIGGERED: Unrecognized tag UID: A1B2C3D4` |
 
 ---
