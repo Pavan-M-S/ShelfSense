@@ -251,37 +251,42 @@ void showMessageWithScroll(const String& line1, const String& line2 = "", int sc
   }
 }
 
-// Helper to handle the final 8-second shelf/rack wait with buzzer & LED timing:
-// Total wait = 8000ms
-// - Wait initial 7200ms (7.2s) with Green LED solidly ON
-// - At last 800ms: Turn BUZZER ON for 700ms
-// - Stop buzzer, wait last 100ms
-// - Turn Green LED OFF
-void holdLocationWait(int totalDurationMs = 8000, int beepDurationMs = 700, int finalWaitMs = 100) {
-  int initialWaitMs = totalDurationMs - (beepDurationMs + finalWaitMs);
-  if (initialWaitMs < 0) initialWaitMs = 0;
-
+// Helper to handle the post-scroll 8-second shelf/rack wait and 2-second warning beeps:
+// 1. Wait full 8 seconds (8000ms) with Green LED solidly ON.
+// 2. Then warning phase: 3 medium beeps over 2 seconds (~2000ms), where Green LED blinks simultaneously with buzzer.
+// 3. Green LED turns OFF and returns to normal standby.
+void holdLocationWait() {
+  // Phase 1: Wait 8 seconds with Green LED solid ON
   digitalWrite(GREEN_LED_PIN, HIGH);
-  Serial.println("[LCD]     Holding book location for 8 seconds with Green LED ON...");
-  delay(initialWaitMs);
+  Serial.println("[LCD]     Holding book location for 8 seconds with Green LED solid ON...");
+  delay(8000);
 
-  // At last 800ms: beep for 700ms
-  Serial.println("[BUZZER]  Warning beep for 700ms (at last 800ms)...");
-  digitalWrite(BUZZER_PIN, HIGH);
-  delay(beepDurationMs);
-  digitalWrite(BUZZER_PIN, LOW);
+  // Phase 2: Warning phase (~2 seconds total) -> 3 medium beeps with simultaneous LED blink
+  // (350ms ON + 250ms OFF) * 3 = 1800ms + 200ms finish = 2000ms (2 seconds)
+  Serial.println("[FEEDBACK] 2-second warning alert: 3 medium beeps with simultaneous LED flash...");
+  for (int i = 0; i < 3; i++) {
+    digitalWrite(BUZZER_PIN, HIGH);
+    digitalWrite(GREEN_LED_PIN, HIGH);
+    delay(350);
 
-  // Then stop beep after 100ms LED OFF
-  delay(finalWaitMs);
-  digitalWrite(GREEN_LED_PIN, LOW);
-  Serial.println("[LED]      Green LED turned OFF. Done.");
+    digitalWrite(BUZZER_PIN, LOW);
+    digitalWrite(GREEN_LED_PIN, LOW);
+    if (i < 2) {
+      delay(250);
+    }
+  }
+  delay(200); // Settle before returning to ready state
+
+  Serial.println("[LED]      Warning complete. Green LED OFF. Returning to normal.");
 }
 
 // Dedicated animated handler for displaying book title, shelf, and rack:
 // 1. Line 2 remains empty while scrolling the book title.
-// 2. Green LED blinks during scroll: ON for 2 characters, OFF for 1 character.
-// 3. Exactly 4 characters before scroll ends, Line 2 appears showing "Shelf:X  Rack:Y".
-// 4. Once scrolling completes, holds display for 8 seconds (at last 800ms beeps for 700ms, then after 100ms LED off).
+// 2. Adaptive scroll speed: 280ms if <= 30 characters, faster (180ms) if > 30 characters.
+// 3. Green LED blinks during scroll: ON for 2 characters, OFF for 1 character.
+// 4. Exactly 4 characters before scroll ends, Line 2 appears showing "Shelf:X  Rack:Y" and beeps once immediately.
+// 5. Once scrolling completes, holds display for 8 seconds (Green LED solid ON).
+// 6. Then 2-second warning alert (3 medium beeps with simultaneous LED blinks), then LED off and return to normal.
 void displayBookLocationSequence(const String& title, int shelf, int rack) {
   String locationLine = "Shelf:" + String(shelf) + " Rack:" + String(rack);
 
@@ -296,18 +301,20 @@ void displayBookLocationSequence(const String& title, int shelf, int rack) {
     lcd.setCursor(0, 1);
     lcd.print(locationLine);
 
-    // Beep when showing shelf and rack info
+    // Beep once when showing shelf and rack info
     digitalWrite(BUZZER_PIN, HIGH);
     delay(100);
     digitalWrite(BUZZER_PIN, LOW);
 
-    // Wait 8 seconds with last 800ms beep (700ms beep + 100ms stop -> LED off)
-    holdLocationWait(8000, 700, 100);
+    // Wait 8 seconds with solid LED, followed by 3 warning beeps/blinks over 2 seconds
+    holdLocationWait();
     return;
   }
 
   // Case B: Long title (> 16 characters)
-  // Total steps to scroll title fully across the 16-character window
+  // Adaptive scroll speed: 280ms per step if <= 30 chars; faster 180ms if > 30 chars
+  int scrollSpeedMs = (title.length() > 30) ? 180 : 280;
+
   int totalSteps = title.length() - 16;
   int triggerStep = totalSteps > 4 ? (totalSteps - 4) : 0;
   bool locationShown = false;
@@ -327,7 +334,7 @@ void displayBookLocationSequence(const String& title, int shelf, int rack) {
       locationShown = true;
       Serial.println("[LCD]     Line 2 revealed (4 chars before end): \"" + locationLine + "\"");
 
-      // Beep immediately when shelf & rack appears
+      // Beep once immediately when shelf & rack appears
       digitalWrite(BUZZER_PIN, HIGH);
       delay(100);
       digitalWrite(BUZZER_PIN, LOW);
@@ -343,7 +350,7 @@ void displayBookLocationSequence(const String& title, int shelf, int rack) {
     // Render 16 characters on Line 1 starting at current offset
     lcd.setCursor(0, 0);
     lcd.print(title.substring(step, step + 16));
-    delay(280);
+    delay(scrollSpeedMs);
   }
 
   // Ensure Line 2 is displayed if it was very short
@@ -355,8 +362,8 @@ void displayBookLocationSequence(const String& title, int shelf, int rack) {
     digitalWrite(BUZZER_PIN, LOW);
   }
 
-  // After scrolling completes fully: wait 8 seconds with last 800ms beep (700ms beep + 100ms stop -> LED off)
-  holdLocationWait(8000, 700, 100);
+  // After scrolling completes fully: wait 8 seconds with solid LED, followed by 3 warning beeps/blinks
+  holdLocationWait();
 }
 
 // Resets system back to the default student check-in state (turns off all LEDs)
