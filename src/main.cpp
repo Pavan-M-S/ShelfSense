@@ -453,30 +453,47 @@ void indicateSuccess(int times = 1, int durationMs = 150, bool keepGreenLit = fa
   }
 }
 
-// ERROR FEEDBACK: Red LED glowing at the same time Buzzer is beeping SIMULTANEOUSLY
-void showError(const String& message, const String& serialReason) {
-  logError("ALARM TRIGGERED: " + serialReason);
-  
-  showMessage(message);
-  
-  Serial.println("[FEEDBACK] ERROR -> Red LED + Buzzer pulsing simultaneously (2 beeps @ 200 ms)");
-  
-  for (int i = 0; i < 2; i++) {
-    // Turn BOTH Red LED and Buzzer ON at the exact same instant
+// EMERGENCY ERROR FEEDBACK: Rapid Red LED + Buzzer pulsing alarm for unrecognized/invalid tags (2 seconds)
+void showEmergencyAlarm(const String& line1, const String& line2, const String& serialReason) {
+  logError("EMERGENCY ALARM TRIGGERED: " + serialReason);
+  showMessage(line1, line2);
+
+  Serial.println("[FEEDBACK] EMERGENCY ALARM -> Rapid Red LED + Buzzer pulsing for 2 seconds!");
+
+  // Rapid alarm: 10 fast pulses (100ms ON, 100ms OFF) = 2000ms (2 seconds)
+  for (int i = 0; i < 10; i++) {
     digitalWrite(RED_LED_PIN, HIGH);
     digitalWrite(BUZZER_PIN, HIGH);
-    delay(200);
+    delay(100);
 
-    // Turn BOTH OFF together
     digitalWrite(RED_LED_PIN, LOW);
     digitalWrite(BUZZER_PIN, LOW);
+    delay(100);
+  }
 
+  delay(1000); // Allow user time to read the message on LCD
+}
+
+// STANDARD ERROR FEEDBACK: Red LED glowing at the same time Buzzer is beeping SIMULTANEOUSLY (e.g. out-of-order scans)
+void showError(const String& line1, const String& line2, const String& serialReason) {
+  logWarn("NOTICE: " + serialReason);
+  showMessage(line1, line2);
+
+  Serial.println("[FEEDBACK] ERROR -> Red LED + Buzzer pulsing (2 beeps @ 180 ms)");
+
+  for (int i = 0; i < 2; i++) {
+    digitalWrite(RED_LED_PIN, HIGH);
+    digitalWrite(BUZZER_PIN, HIGH);
+    delay(180);
+
+    digitalWrite(RED_LED_PIN, LOW);
+    digitalWrite(BUZZER_PIN, LOW);
     if (i < 1) {
-      delay(150); // Pause between the two warning pulses
+      delay(120);
     }
   }
-  
-  delay(1500); // Give user time to see error message on the LCD
+
+  delay(1500); // Pause so student can see the prompt on LCD
 }
 
 // =========================================================================================
@@ -567,6 +584,7 @@ int findBookIndex(const String& uid) {
 void handleStudentScan(const String& uid) {
   int studentIdx = findStudentIndex(uid);
   if (studentIdx != -1) {
+    // 1. Authorized Student scanned
     const Student& student = registeredStudents[studentIdx];
     logSuccess("Student authenticated: " + student.name + " (" + student.uid + ")");
     
@@ -581,11 +599,27 @@ void handleStudentScan(const String& uid) {
     showMessageWithScroll(studentLine, "Tap Book Tag...", 260, 2500);
 
     logInfo("Ready for book tag. Waiting for book scan...");
-  } else {
-    // Red LED + buzzer simultaneous error alarm
-    showError("Access Denied", "Unauthorized Student Card UID: " + uid);
-    resetSystem();
+    return;
   }
+
+  // 2. Not a student card -> Check if user accidentally scanned a registered Book Tag!
+  int bookIdx = findBookIndex(uid);
+  if (bookIdx != -1) {
+    const Book& scannedBook = registeredBooks[bookIdx];
+    logWarn("Book tag (\"" + scannedBook.title + "\") scanned at Step 1 instead of Student ID!");
+    
+    // Prompt student: "Please Tap Your" / "Student ID First"
+    showError("Please Tap Your", "Student ID First", "Book tag scanned before student ID authentication");
+    
+    // Return cleanly to standby
+    resetSystem();
+    return;
+  }
+
+  // 3. Tag is neither student nor book in database -> Unrecognized ID emergency alarm!
+  logError("Unrecognized tag UID: " + uid);
+  showEmergencyAlarm("Unrecognized ID", "Access Denied!", "Unrecognized tag scanned at Step 1: " + uid);
+  resetSystem();
 }
 
 // Handles Book Scanning and Shelf Lookup (Step 2)
@@ -593,10 +627,7 @@ void handleBookScan(const String& uid) {
   int bookIdx = findBookIndex(uid);
 
   if (bookIdx != -1) {
-    // -------------------------------------------------------------
-    // BOOK PLACED CORRECTLY / FOUND IN SYSTEM:
-    // Buzzer short beep + Green LED glowing SIMULTANEOUSLY
-    // -------------------------------------------------------------
+    // 1. Registered Book Tag identified -> Run full sequence!
     const Book& foundBook = registeredBooks[bookIdx];
     
     logSuccess("Book identified: \"" + foundBook.title + "\" located on Shelf " + 
@@ -605,32 +636,33 @@ void handleBookScan(const String& uid) {
     // Initial success feedback: short confirmation beep + green LED blink
     indicateSuccess(1, 150, false);
 
-    // Run custom animated display sequence:
-    // - Line 2 stays empty while scrolling
-    // - LED blinks: ON for 2 characters, OFF for 1 character
-    // - Exactly 4 characters before scroll completes, Line 2 reveals "Shelf:X Rack:Y"
-    // - Once scroll completes, LED stays solid ON for 4 seconds
+    // Run custom animated display sequence (title scroll, reveal, 8s hold, 3s warning)
     displayBookLocationSequence(foundBook.title, foundBook.shelf, foundBook.rack);
 
     logInfo("Session completed. Resetting for next student...");
     resetSystem();
+    return;
+  }
 
-  } else {
-    // -------------------------------------------------------------
-    // BOOK PLACED WRONG / UNREGISTERED TAG:
-    // Red LED glowing at the same time Buzzer is beeping SIMULTANEOUSLY
-    // -------------------------------------------------------------
-    if (isStudentRegistered(uid)) {
-      logWarn("Student ID scanned again instead of a book! Prompting for book...");
-      showError("Please Tap Book", "Student card tapped during book scan step");
-    } else {
-      showError("Invalid Book Tag", "Unregistered Book UID: " + uid);
-    }
-
-    // Maintain student login state so they can retry without scanning student ID again
+  // 2. Check if student card was scanned again instead of a book
+  int studentIdx = findStudentIndex(uid);
+  if (studentIdx != -1) {
+    logWarn("Student ID scanned again instead of a book! Prompting for book tag...");
+    showError("Please Tap Book", "Tag (Not ID)", "Student ID card tapped during book scan step");
+    
+    // Maintain student login session so they can retry scanning the book
     logInfo("Maintaining student session. Ready for book tag retry...");
     showMessage("Tap Your Book...");
+    return;
   }
+
+  // 3. Tag is completely unrecognized -> Emergency alarm!
+  logError("Unrecognized tag UID: " + uid + " during book lookup step!");
+  showEmergencyAlarm("Unrecognized ID", "Unknown Book Tag", "Unregistered tag scanned at Step 2: " + uid);
+
+  // Maintain session so authorized student can scan a valid book without re-authenticating
+  logInfo("Maintaining student session. Ready for book tag retry...");
+  showMessage("Tap Your Book...");
 }
 
 // =========================================================================================
