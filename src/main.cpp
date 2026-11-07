@@ -93,26 +93,36 @@ enum SystemState {
 // Variable holding the current system state
 SystemState currentState = WAITING_FOR_STUDENT;
 
+// Structure to model a student in the library system
+struct Student {
+  String name;     // Student's full name (e.g. "Pavan")
+  String uid;      // RFID tag UID in uppercase HEX without spaces (e.g. "37E09604")
+};
+
 // Structure to model a book in the library system
 struct Book {
+  String title;    // Book title (e.g. "Algorithms")
   String uid;      // RFID tag UID in uppercase HEX without spaces (e.g. "F10F7E05")
   int shelf;       // Assigned shelf number
-  String title;    // Optional human-readable book title for serial debugging
+  int rack;        // Assigned rack number
 };
 
 // -----------------------------------------------------------------------------------------
 // DATABASE CONFIGURATION: Students & Books
+// Easily add, modify, or remove students and books below!
 // -----------------------------------------------------------------------------------------
 
-// List of authorized student RFID UIDs
-const String registeredStudents[] = {
-  "37E09604"       // Student 1
+// List of authorized students: { "Student Name", "RFID UID" }
+const Student registeredStudents[] = {
+  { "Pavan", "37E09604" }
+  // Add new students here in the format: { "Name", "UID" },
 };
 
-// Database of registered books and their assigned shelves
+// Database of registered books: { "Book Title", "RFID UID", Shelf Number, Rack Number }
 const Book registeredBooks[] = {
-  { "F10F7E05", 2, "Introduction to Algorithms" }, // Book 1 -> Shelf 2
-  { "8DC0FA6B", 4, "Digital Signal Processing"  }  // Book 2 -> Shelf 4
+  { "Algorithms", "F10F7E05", 2, 1 }, // Shelf 2, Rack 1
+  { "DSP",        "8DC0FA6B", 4, 3 }  // Shelf 4, Rack 3
+  // Add new books here in the format: { "Title", "UID", shelf, rack },
 };
 
 // Helper constants for database sizes
@@ -295,23 +305,30 @@ String readCardUID() {
   return uid;
 }
 
-// Checks if the UID belongs to an authorized student
-bool isStudentRegistered(const String& uid) {
+// Searches registered students for UID. Returns index if found, -1 if not found
+int findStudentIndex(const String& uid) {
   Serial.print("[AUTH]    Checking student database for UID [");
   Serial.print(uid);
   Serial.println("]...");
 
   for (size_t i = 0; i < NUM_STUDENTS; i++) {
-    if (registeredStudents[i] == uid) {
-      Serial.print("[AUTH]    Match found at student index [");
+    if (registeredStudents[i].uid == uid) {
+      Serial.print("[AUTH]    Match found! Student: \"");
+      Serial.print(registeredStudents[i].name);
+      Serial.print("\" at index [");
       Serial.print(i);
       Serial.println("]");
-      return true;
+      return (int)i;
     }
   }
 
   Serial.println("[AUTH]    No match found in student database!");
-  return false;
+  return -1;
+}
+
+// Checks if the UID belongs to an authorized student
+bool isStudentRegistered(const String& uid) {
+  return findStudentIndex(uid) != -1;
 }
 
 // Searches registered books for UID. Returns index if found, -1 if not found
@@ -325,7 +342,9 @@ int findBookIndex(const String& uid) {
       Serial.print("[LOOKUP]  Match found! Book: \"");
       Serial.print(registeredBooks[i].title);
       Serial.print("\" -> Shelf ");
-      Serial.println(registeredBooks[i].shelf);
+      Serial.print(registeredBooks[i].shelf);
+      Serial.print(", Rack ");
+      Serial.println(registeredBooks[i].rack);
       return (int)i;
     }
   }
@@ -340,9 +359,13 @@ int findBookIndex(const String& uid) {
 
 // Handles Student Check-In (Step 1)
 void handleStudentScan(const String& uid) {
-  if (isStudentRegistered(uid)) {
-    logSuccess("Student authenticated successfully!");
-    showMessage("Welcome, Student!", "Tap Your Book...");
+  int studentIdx = findStudentIndex(uid);
+  if (studentIdx != -1) {
+    const Student& student = registeredStudents[studentIdx];
+    logSuccess("Student authenticated: " + student.name + " (" + student.uid + ")");
+    
+    // Display student name on LCD & mirror to Serial
+    showMessage("Hi " + student.name, "Tap Book Tag...");
     
     // Short confirmation beep with green LED flash
     indicateSuccess(1, 100, false);
@@ -370,14 +393,19 @@ void handleBookScan(const String& uid) {
     // -------------------------------------------------------------
     const Book& foundBook = registeredBooks[bookIdx];
     
-    logSuccess("Book identified: \"" + foundBook.title + "\" located on Shelf " + String(foundBook.shelf));
+    logSuccess("Book identified: \"" + foundBook.title + "\" located on Shelf " + 
+               String(foundBook.shelf) + ", Rack " + String(foundBook.rack));
     
-    showMessage("Book Found ->", "Go to Shelf " + String(foundBook.shelf));
+    // Line 1: Book title (truncated if > 16 chars)
+    // Line 2: Shelf and Rack location (e.g. "Shelf:2  Rack:1")
+    String line1 = foundBook.title.substring(0, 16);
+    String line2 = "Shelf:" + String(foundBook.shelf) + " Rack:" + String(foundBook.rack);
+    showMessage(line1, line2);
     
     // Short beep with Green LED simultaneously, and keep Green LED ON during the 4s shelf display
     indicateSuccess(1, 150, true);
 
-    logInfo("Displaying shelf location for 4 seconds with Green LED glowing...");
+    logInfo("Displaying shelf & rack location for 4 seconds with Green LED glowing...");
     delay(4000); // Hold message & green light so student can read shelf number
 
     // Turn off Green LED after student finishes reading
@@ -420,22 +448,48 @@ void runHardwareDiagnostics() {
   Serial.println(" bytes");
 
   // 1. Check I2C Bus & LCD Presence
-  Serial.println("[BOOT]    Scanning I2C bus for LCD...");
-  Wire.beginTransmission(LCD_I2C_ADDR);
+  Serial.println("[BOOT]    Initializing I2C bus and scanning for LCD...");
+  Wire.begin(21, 22); // Start I2C explicitly on ESP32 default pins: SDA=21, SCL=22
+  delay(50);
+
+  // If configured address fails, scan I2C bus to find the actual address
+  uint8_t targetAddr = LCD_I2C_ADDR;
+  Wire.beginTransmission(targetAddr);
   byte i2cError = Wire.endTransmission();
+
+  if (i2cError != 0) {
+    // Probe alternative standard address 0x3F or others
+    Serial.print("[BOOT]    LCD not found at 0x");
+    Serial.print(targetAddr, HEX);
+    Serial.println(", scanning bus...");
+    for (uint8_t addr = 1; addr < 127; addr++) {
+      Wire.beginTransmission(addr);
+      if (Wire.endTransmission() == 0) {
+        Serial.print("[BOOT]    Found I2C device at address 0x");
+        Serial.println(addr, HEX);
+        targetAddr = addr;
+        i2cError = 0;
+        break;
+      }
+    }
+  }
 
   if (i2cError == 0) {
     Serial.print("[BOOT]    I2C LCD detected at address 0x");
-    Serial.println(LCD_I2C_ADDR, HEX);
+    Serial.println(targetAddr, HEX);
+    lcd = LiquidCrystal_I2C(targetAddr, LCD_COLUMNS, LCD_ROWS);
     lcd.init();
     lcd.backlight();
-    showMessage("ShelfSense Init", "Checking HW...");
+    lcd.clear();
+    
+    // Welcome splash screens
+    showMessage("  ABPS Nandyal  ", "    Welcome!    ");
+    delay(2000); // Display for 2 seconds
+    showMessage("   ShelfSense   ", " Smart Library  ");
+    delay(2000); // Display for 2 seconds
+    showMessage("ShelfSense Ready", "Tap Student ID");
   } else {
-    logError("I2C LCD NOT responding at address 0x" + String(LCD_I2C_ADDR, HEX) + "!");
-    Serial.println("          [Troubleshooting I2C LCD]:");
-    Serial.println("          - Check SDA (GPIO 21) and SCL (GPIO 22) connections");
-    Serial.println("          - Ensure LCD VCC is connected to 5V (3.3V is insufficient for display)");
-    Serial.println("          - Check if your I2C backpack uses address 0x3F instead of 0x27");
+    logError("I2C LCD NOT responding! Check 5V power and SDA(21)/SCL(22) wiring.");
   }
 
   // 2. Check SPI & RC522 RFID Reader
@@ -491,8 +545,10 @@ void runHardwareDiagnostics() {
   for (size_t i = 0; i < NUM_STUDENTS; i++) {
     Serial.print("            [Student ");
     Serial.print(i + 1);
-    Serial.print("] UID: ");
-    Serial.println(registeredStudents[i]);
+    Serial.print("] Name: \"");
+    Serial.print(registeredStudents[i].name);
+    Serial.print("\" | UID: ");
+    Serial.println(registeredStudents[i].uid);
   }
 
   Serial.print("          - Registered Books:    ");
@@ -500,13 +556,14 @@ void runHardwareDiagnostics() {
   for (size_t i = 0; i < NUM_BOOKS; i++) {
     Serial.print("            [Book ");
     Serial.print(i + 1);
-    Serial.print("] UID: ");
-    Serial.print(registeredBooks[i].uid);
-    Serial.print(" | Shelf ");
-    Serial.print(registeredBooks[i].shelf);
-    Serial.print(" | Title: \"");
+    Serial.print("] Title: \"");
     Serial.print(registeredBooks[i].title);
-    Serial.println("\"");
+    Serial.print("\" | UID: ");
+    Serial.print(registeredBooks[i].uid);
+    Serial.print(" | Shelf: ");
+    Serial.print(registeredBooks[i].shelf);
+    Serial.print(" | Rack: ");
+    Serial.println(registeredBooks[i].rack);
   }
 
   Serial.println("===================================================");
