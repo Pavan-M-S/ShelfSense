@@ -251,11 +251,37 @@ void showMessageWithScroll(const String& line1, const String& line2 = "", int sc
   }
 }
 
+// Helper to handle the final 8-second shelf/rack wait with buzzer & LED timing:
+// Total wait = 8000ms
+// - Wait initial 7200ms (7.2s) with Green LED solidly ON
+// - At last 800ms: Turn BUZZER ON for 700ms
+// - Stop buzzer, wait last 100ms
+// - Turn Green LED OFF
+void holdLocationWait(int totalDurationMs = 8000, int beepDurationMs = 700, int finalWaitMs = 100) {
+  int initialWaitMs = totalDurationMs - (beepDurationMs + finalWaitMs);
+  if (initialWaitMs < 0) initialWaitMs = 0;
+
+  digitalWrite(GREEN_LED_PIN, HIGH);
+  Serial.println("[LCD]     Holding book location for 8 seconds with Green LED ON...");
+  delay(initialWaitMs);
+
+  // At last 800ms: beep for 700ms
+  Serial.println("[BUZZER]  Warning beep for 700ms (at last 800ms)...");
+  digitalWrite(BUZZER_PIN, HIGH);
+  delay(beepDurationMs);
+  digitalWrite(BUZZER_PIN, LOW);
+
+  // Then stop beep after 100ms LED OFF
+  delay(finalWaitMs);
+  digitalWrite(GREEN_LED_PIN, LOW);
+  Serial.println("[LED]      Green LED turned OFF. Done.");
+}
+
 // Dedicated animated handler for displaying book title, shelf, and rack:
 // 1. Line 2 remains empty while scrolling the book title.
 // 2. Green LED blinks during scroll: ON for 2 characters, OFF for 1 character.
 // 3. Exactly 4 characters before scroll ends, Line 2 appears showing "Shelf:X  Rack:Y".
-// 4. Once scrolling completes, Green LED turns solidly ON and holds for 4 full seconds.
+// 4. Once scrolling completes, holds display for 8 seconds (at last 800ms beeps for 700ms, then after 100ms LED off).
 void displayBookLocationSequence(const String& title, int shelf, int rack) {
   String locationLine = "Shelf:" + String(shelf) + " Rack:" + String(rack);
 
@@ -275,18 +301,8 @@ void displayBookLocationSequence(const String& title, int shelf, int rack) {
     delay(100);
     digitalWrite(BUZZER_PIN, LOW);
 
-    // Keep Green LED solid ON during the 4 seconds hold
-    digitalWrite(GREEN_LED_PIN, HIGH);
-    // Wait first 2.5 seconds (2500 ms)
-    delay(2500);
-
-    // Short beep at last 1.5 seconds remaining
-    digitalWrite(BUZZER_PIN, HIGH);
-    delay(80);
-    digitalWrite(BUZZER_PIN, LOW);
-    delay(1420); // Finish remaining time to complete 4000ms
-
-    digitalWrite(GREEN_LED_PIN, LOW);
+    // Wait 8 seconds with last 800ms beep (700ms beep + 100ms stop -> LED off)
+    holdLocationWait(8000, 700, 100);
     return;
   }
 
@@ -339,22 +355,8 @@ void displayBookLocationSequence(const String& title, int shelf, int rack) {
     digitalWrite(BUZZER_PIN, LOW);
   }
 
-  // After scrolling completes fully: switch Green LED solid ON and wait 4 seconds
-  digitalWrite(GREEN_LED_PIN, HIGH);
-  Serial.println("[LCD]     Scroll complete. Holding solid Green LED for 4 seconds...");
-
-  // Wait first 2.5 seconds (2500 ms)
-  delay(2500);
-
-  // Short beep at last 1.5 seconds remaining
-  Serial.println("[BUZZER]  Short alert beep at last 1.5 seconds");
-  digitalWrite(BUZZER_PIN, HIGH);
-  delay(80);
-  digitalWrite(BUZZER_PIN, LOW);
-  delay(1420); // Complete the remainder of 4000ms
-
-  // Turn off Green LED
-  digitalWrite(GREEN_LED_PIN, LOW);
+  // After scrolling completes fully: wait 8 seconds with last 800ms beep (700ms beep + 100ms stop -> LED off)
+  holdLocationWait(8000, 700, 100);
 }
 
 // Resets system back to the default student check-in state (turns off all LEDs)
