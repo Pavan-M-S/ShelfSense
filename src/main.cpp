@@ -47,175 +47,457 @@
 #include <Wire.h>
 #include <LiquidCrystal_I2C.h>
 
-// ==========================================
-// 1. PIN DEFINITIONS & HARDWARE SETUP
-// ==========================================
-#define RST_PIN     4       // RC522 Reset
-#define SS_PIN      5       // RC522 Chip Select (SDA)
-#define BUZZER_PIN  27      // Buzzer (+)
-#define RED_LED_PIN 26      // Red LED (+)
+// =========================================================================================
+// SECTION 1: HARDWARE PIN ASSIGNMENTS & SETTINGS
+// =========================================================================================
 
+// RC522 RFID Reader Pins (SPI)
+#define RST_PIN         4       // Reset pin for RC522
+#define SS_PIN          5       // Slave Select / SDA pin for RC522
+
+// Feedback Peripherals
+#define BUZZER_PIN      27      // Active Buzzer positive pin
+#define RED_LED_PIN     26      // Error / Alert Red LED pin
+
+// LCD I2C Configuration
+#define LCD_I2C_ADDR    0x27    // Standard I2C address (0x27 or 0x3F)
+#define LCD_COLUMNS     16      // 16 characters wide
+#define LCD_ROWS        2       // 2 lines high
+
+// Baud Rate for USB Serial Debugging
+#define SERIAL_BAUD     115200
+
+// =========================================================================================
+// SECTION 2: HARDWARE OBJECT INSTANCES
+// =========================================================================================
+
+// MFRC522 instance communicating over SPI
 MFRC522 mfrc522(SS_PIN, RST_PIN);
-LiquidCrystal_I2C lcd(0x27, 16, 2);
 
-// ==========================================
-// 2. SYSTEM STATES & DATA MODELS
-// ==========================================
+// LiquidCrystal_I2C instance communicating over standard I2C (SDA=21, SCL=22)
+LiquidCrystal_I2C lcd(LCD_I2C_ADDR, LCD_COLUMNS, LCD_ROWS);
+
+// =========================================================================================
+// SECTION 3: SYSTEM STATES & DATA MODELS
+// =========================================================================================
+
+// Finite State Machine (FSM) States
 enum SystemState {
-  WAITING_FOR_STUDENT,
-  WAITING_FOR_BOOK
+  WAITING_FOR_STUDENT,  // Ready state: Waiting for student ID card to be scanned
+  WAITING_FOR_BOOK      // Authenticated state: Waiting for a book tag to be scanned
 };
 
+// Variable holding the current system state
 SystemState currentState = WAITING_FOR_STUDENT;
 
-// Book structure: keeps RFID tag and shelf number together
+// Structure to model a book in the library system
 struct Book {
-  String uid;
-  int shelf;
+  String uid;      // RFID tag UID in uppercase HEX without spaces (e.g. "F10F7E05")
+  int shelf;       // Assigned shelf number
+  String title;    // Optional human-readable book title for serial debugging
 };
 
-// Database: Registered students
+// -----------------------------------------------------------------------------------------
+// DATABASE CONFIGURATION: Students & Books
+// -----------------------------------------------------------------------------------------
+
+// List of authorized student RFID UIDs
 const String registeredStudents[] = {
-  "37E09604"  // Student 1
+  "37E09604"       // Student 1
 };
 
-// Database: Registered books and their shelf locations
+// Database of registered books and their assigned shelves
 const Book registeredBooks[] = {
-  { "F10F7E05", 2 }, // Book 1 -> Shelf 2
-  { "8DC0FA6B", 4 }  // Book 2 -> Shelf 4
+  { "F10F7E05", 2, "Introduction to Algorithms" }, // Book 1 -> Shelf 2
+  { "8DC0FA6B", 4, "Digital Signal Processing"  }  // Book 2 -> Shelf 4
 };
 
-// ==========================================
-// 3. UI & FEEDBACK HELPERS
-// ==========================================
+// Helper constants for database sizes
+const size_t NUM_STUDENTS = sizeof(registeredStudents) / sizeof(registeredStudents[0]);
+const size_t NUM_BOOKS    = sizeof(registeredBooks) / sizeof(registeredBooks[0]);
 
-// Display up to 2 lines of text on the LCD
+// =========================================================================================
+// SECTION 4: SERIAL LOGGING & DIAGNOSTIC HELPERS
+// =========================================================================================
+
+// Returns a human-readable name of the current state
+String getStateName(SystemState state) {
+  switch (state) {
+    case WAITING_FOR_STUDENT: return "WAITING_FOR_STUDENT";
+    case WAITING_FOR_BOOK:    return "WAITING_FOR_BOOK";
+    default:                  return "UNKNOWN_STATE";
+  }
+}
+
+// Log general informational messages
+void logInfo(const String& message) {
+  Serial.print("[INFO]    ");
+  Serial.println(message);
+}
+
+// Log success events
+void logSuccess(const String& message) {
+  Serial.print("[SUCCESS] ");
+  Serial.println(message);
+}
+
+// Log warnings (e.g. invalid tags)
+void logWarn(const String& message) {
+  Serial.print("[WARN]    ");
+  Serial.println(message);
+}
+
+// Log errors (e.g. hardware faults or unauthorized access)
+void logError(const String& message) {
+  Serial.print("[ERROR]   ");
+  Serial.println(message);
+}
+
+// Log state machine transitions
+void logStateTransition(SystemState fromState, SystemState toState) {
+  Serial.print("[STATE]   Transition: ");
+  Serial.print(getStateName(fromState));
+  Serial.print(" -> ");
+  Serial.println(getStateName(toState));
+}
+
+// =========================================================================================
+// SECTION 5: HARDWARE FEEDBACK & LCD HELPERS
+// =========================================================================================
+
+// Displays a message on the LCD and mirrors it to the Serial Monitor
 void showMessage(const String& line1, const String& line2 = "") {
   lcd.clear();
   lcd.setCursor(0, 0);
   lcd.print(line1);
+
+  Serial.print("[LCD]     Line 1: \"");
+  Serial.print(line1);
+  Serial.print("\"");
+
   if (line2.length() > 0) {
     lcd.setCursor(0, 1);
     lcd.print(line2);
+    Serial.print(" | Line 2: \"");
+    Serial.print(line2);
+    Serial.print("\"");
   }
+  Serial.println();
 }
 
-// Beep the buzzer a given number of times
+// Activates buzzer for a specified count and duration
 void beep(int times, int durationMs = 100) {
+  Serial.print("[BUZZER]  Beeping ");
+  Serial.print(times);
+  Serial.print(" time(s) @ ");
+  Serial.print(durationMs);
+  Serial.println(" ms");
+
   for (int i = 0; i < times; i++) {
     digitalWrite(BUZZER_PIN, HIGH);
     delay(durationMs);
     digitalWrite(BUZZER_PIN, LOW);
-    delay(durationMs);
+    if (i < times - 1) {
+      delay(durationMs);
+    }
   }
 }
 
-// Return the system to the initial ready state
+// Resets system back to the default student check-in state
 void resetSystem() {
+  SystemState previousState = currentState;
   currentState = WAITING_FOR_STUDENT;
+  
   digitalWrite(RED_LED_PIN, LOW);
+
+  if (previousState != WAITING_FOR_STUDENT) {
+    logStateTransition(previousState, WAITING_FOR_STUDENT);
+  } else {
+    logInfo("System reset to ready state (waiting for student ID)");
+  }
+
   showMessage("ShelfSense Ready", "Tap Student ID");
 }
 
-// Flash error LED, sound warning beeps, and show error text
-void showError(const String& message) {
+// Triggers visual and audible error alerts
+void showError(const String& message, const String& serialReason) {
+  logError("ALARM TRIGGERED: " + serialReason);
+  
   showMessage(message);
+  
+  Serial.println("[LED]     Red LED turned ON");
   digitalWrite(RED_LED_PIN, HIGH);
-  beep(2, 200);
+  
+  beep(2, 200); // 2 long alert beeps
+  
+  Serial.println("[LED]     Red LED turned OFF");
   digitalWrite(RED_LED_PIN, LOW);
-  delay(2000);
+  
+  delay(2000); // Give user time to see error on display
 }
 
-// ==========================================
-// 4. RFID & DATABASE LOOKUP HELPERS
-// ==========================================
+// =========================================================================================
+// SECTION 6: RFID & DATABASE LOOKUP FUNCTIONS
+// =========================================================================================
 
-// Read the scanned card's UID as an uppercase hex string (e.g. "37E09604")
+// Reads the card UID and returns it formatted as uppercase HEX (e.g. "37E09604")
 String readCardUID() {
   String uid = "";
   for (byte i = 0; i < mfrc522.uid.size; i++) {
-    if (mfrc522.uid.uidByte[i] < 0x10) uid += "0";
+    if (mfrc522.uid.uidByte[i] < 0x10) {
+      uid += "0";
+    }
     uid += String(mfrc522.uid.uidByte[i], HEX);
   }
   uid.toUpperCase();
-  mfrc522.PICC_HaltA(); // Stop reading current card to prevent repeated triggers
+
+  // Log card technical details to Serial Monitor
+  MFRC522::PICC_Type piccType = mfrc522.PICC_GetType(mfrc522.uid.sak);
+  Serial.println("---------------------------------------------------");
+  Serial.print("[RFID]    Card Detected! UID: ");
+  Serial.print(uid);
+  Serial.print(" | Size: ");
+  Serial.print(mfrc522.uid.size);
+  Serial.print(" bytes | PICC Type: ");
+  Serial.println(mfrc522.PICC_GetTypeName(piccType));
+  Serial.print("[RFID]    Current System State: ");
+  Serial.println(getStateName(currentState));
+
+  // Halt card to prevent repeated reads in the same pass
+  mfrc522.PICC_HaltA();
   return uid;
 }
 
-// Check if a student UID is registered
+// Checks if the UID belongs to an authorized student
 bool isStudentRegistered(const String& uid) {
-  for (const String& student : registeredStudents) {
-    if (student == uid) return true;
+  Serial.print("[AUTH]    Checking student database for UID [");
+  Serial.print(uid);
+  Serial.println("]...");
+
+  for (size_t i = 0; i < NUM_STUDENTS; i++) {
+    if (registeredStudents[i] == uid) {
+      Serial.print("[AUTH]    Match found at student index [");
+      Serial.print(i);
+      Serial.println("]");
+      return true;
+    }
   }
+
+  Serial.println("[AUTH]    No match found in student database!");
   return false;
 }
 
-// Find a book's shelf. Returns shelf number, or -1 if book is not registered
-int findBookShelf(const String& uid) {
-  for (const Book& book : registeredBooks) {
-    if (book.uid == uid) return book.shelf;
+// Searches registered books for UID. Returns index if found, -1 if not found
+int findBookIndex(const String& uid) {
+  Serial.print("[LOOKUP]  Searching library database for book UID [");
+  Serial.print(uid);
+  Serial.println("]...");
+
+  for (size_t i = 0; i < NUM_BOOKS; i++) {
+    if (registeredBooks[i].uid == uid) {
+      Serial.print("[LOOKUP]  Match found! Book: \"");
+      Serial.print(registeredBooks[i].title);
+      Serial.print("\" -> Shelf ");
+      Serial.println(registeredBooks[i].shelf);
+      return (int)i;
+    }
   }
+
+  Serial.println("[LOOKUP]  No match found in book database!");
   return -1;
 }
 
-// ==========================================
-// 5. STEP HANDLERS (BUSINESS LOGIC)
-// ==========================================
+// =========================================================================================
+// SECTION 7: STEP HANDLERS (BUSINESS LOGIC)
+// =========================================================================================
 
+// Handles Student Check-In (Step 1)
 void handleStudentScan(const String& uid) {
   if (isStudentRegistered(uid)) {
+    logSuccess("Student authenticated successfully!");
     showMessage("Welcome, Student!", "Tap Your Book...");
-    beep(1, 100);
+    beep(1, 100); // 1 short confirmation beep
+
+    logStateTransition(WAITING_FOR_STUDENT, WAITING_FOR_BOOK);
     currentState = WAITING_FOR_BOOK;
-    delay(1500); // Debounce delay
+
+    delay(1500); // Debounce to allow user to remove card
+    logInfo("Ready for book tag. Waiting for book scan...");
   } else {
-    showError("Access Denied");
+    showError("Access Denied", "Unauthorized Student Card UID: " + uid);
     resetSystem();
   }
 }
 
+// Handles Book Scanning and Shelf Lookup (Step 2)
 void handleBookScan(const String& uid) {
-  int shelf = findBookShelf(uid);
-  
-  if (shelf != -1) {
-    showMessage("Book Found ->", "Go to Shelf " + String(shelf));
-    beep(2, 100); // Success double-beep
-    delay(4000);  // Allow time to read shelf number
+  int bookIdx = findBookIndex(uid);
+
+  if (bookIdx != -1) {
+    const Book& foundBook = registeredBooks[bookIdx];
+    
+    logSuccess("Book identified: \"" + foundBook.title + "\" located on Shelf " + String(foundBook.shelf));
+    
+    showMessage("Book Found ->", "Go to Shelf " + String(foundBook.shelf));
+    beep(2, 100); // 2 short success beeps
+
+    logInfo("Displaying shelf location for 4 seconds...");
+    delay(4000); // Hold message so user can read it
+
+    logInfo("Session completed. Resetting for next student...");
     resetSystem();
   } else {
-    showError("Invalid Book Tag");
-    showMessage("Tap Your Book..."); // Prompt again without logging student out
+    // If the student mistakenly scans their student ID again or an unregistered book
+    if (isStudentRegistered(uid)) {
+      logWarn("Student ID scanned again instead of a book! Prompting for book...");
+      showError("Please Tap Book", "Student card tapped during book scan step");
+    } else {
+      showError("Invalid Book Tag", "Unregistered Book UID: " + uid);
+    }
+
+    // Maintain student login state so they can retry without scanning student ID again
+    logInfo("Maintaining student session. Ready for book tag retry...");
+    showMessage("Tap Your Book...");
   }
 }
 
-// ==========================================
-// 6. MAIN ARDUINO SETUP & LOOP
-// ==========================================
+// =========================================================================================
+// SECTION 8: HARDWARE DIAGNOSTICS AT BOOT
+// =========================================================================================
 
-void setup() {
-  Serial.begin(115200);
+void runHardwareDiagnostics() {
+  Serial.println();
+  Serial.println("===================================================");
+  Serial.println("         SHELFSENSE ESP32 SYSTEM STARTUP           ");
+  Serial.println("===================================================");
+  Serial.print("[BOOT]    CPU Frequency: ");
+  Serial.print(getCpuFrequencyMhz());
+  Serial.println(" MHz");
+  Serial.print("[BOOT]    Free Heap RAM: ");
+  Serial.print(ESP.getFreeHeap());
+  Serial.println(" bytes");
+
+  // 1. Check I2C Bus & LCD Presence
+  Serial.println("[BOOT]    Scanning I2C bus for LCD...");
+  Wire.beginTransmission(LCD_I2C_ADDR);
+  byte i2cError = Wire.endTransmission();
+
+  if (i2cError == 0) {
+    Serial.print("[BOOT]    I2C LCD detected at address 0x");
+    Serial.println(LCD_I2C_ADDR, HEX);
+    lcd.init();
+    lcd.backlight();
+    showMessage("ShelfSense Init", "Checking HW...");
+  } else {
+    logError("I2C LCD NOT responding at address 0x" + String(LCD_I2C_ADDR, HEX) + "!");
+    Serial.println("          [Troubleshooting I2C LCD]:");
+    Serial.println("          - Check SDA (GPIO 21) and SCL (GPIO 22) connections");
+    Serial.println("          - Ensure LCD VCC is connected to 5V (3.3V is insufficient for display)");
+    Serial.println("          - Check if your I2C backpack uses address 0x3F instead of 0x27");
+  }
+
+  // 2. Check SPI & RC522 RFID Reader
+  Serial.println("[BOOT]    Initializing SPI and RC522 Reader...");
   SPI.begin();
   mfrc522.PCD_Init();
   
-  lcd.init();
-  lcd.backlight();
-  
+  byte readerVersion = mfrc522.PCD_ReadRegister(MFRC522::VersionReg);
+  Serial.print("[BOOT]    RC522 Firmware Version Register: 0x");
+  Serial.println(readerVersion, HEX);
+
+  if (readerVersion == 0x92) {
+    logSuccess("RC522 Reader verified (Version 2.0 detected)");
+  } else if (readerVersion == 0x91) {
+    logSuccess("RC522 Reader verified (Version 1.0 detected)");
+  } else if (readerVersion == 0x88) {
+    logSuccess("RC522 Reader verified (FM17522 clone detected - OK)");
+  } else if (readerVersion == 0x00 || readerVersion == 0xFF) {
+    logError("RC522 RFID READER COMMUNICATION FAILED!");
+    Serial.println("          [Troubleshooting RC522]:");
+    Serial.println("          - CRITICAL: VCC must be connected to 3.3V ONLY (5V can damage RC522)");
+    Serial.println("          - Ensure common GND with ESP32");
+    Serial.println("          - Verify SPI Wiring: SCK=GPIO 18, MISO=GPIO 19, MOSI=GPIO 23, SS=GPIO 5, RST=GPIO 4");
+    Serial.println("          - Check soldered header pins for cold joints or short circuits");
+  } else {
+    logWarn("Unrecognized RC522 version 0x" + String(readerVersion, HEX) + " (Reader may still function)");
+  }
+
+  // 3. Test Output Indicators (Buzzer & LED)
+  Serial.println("[BOOT]    Testing Buzzer (GPIO 27) and Red LED (GPIO 26)...");
   pinMode(BUZZER_PIN, OUTPUT);
   pinMode(RED_LED_PIN, OUTPUT);
-  
+
+  // Short welcome indicator
+  digitalWrite(RED_LED_PIN, HIGH);
+  digitalWrite(BUZZER_PIN, HIGH);
+  delay(100);
+  digitalWrite(RED_LED_PIN, LOW);
+  digitalWrite(BUZZER_PIN, LOW);
+  logSuccess("Buzzer and LED hardware test passed");
+
+  // 4. Print Database Summary
+  Serial.println("[BOOT]    Loading Registered Database:");
+  Serial.print("          - Registered Students: ");
+  Serial.println(NUM_STUDENTS);
+  for (size_t i = 0; i < NUM_STUDENTS; i++) {
+    Serial.print("            [Student ");
+    Serial.print(i + 1);
+    Serial.print("] UID: ");
+    Serial.println(registeredStudents[i]);
+  }
+
+  Serial.print("          - Registered Books:    ");
+  Serial.println(NUM_BOOKS);
+  for (size_t i = 0; i < NUM_BOOKS; i++) {
+    Serial.print("            [Book ");
+    Serial.print(i + 1);
+    Serial.print("] UID: ");
+    Serial.print(registeredBooks[i].uid);
+    Serial.print(" | Shelf ");
+    Serial.print(registeredBooks[i].shelf);
+    Serial.print(" | Title: \"");
+    Serial.print(registeredBooks[i].title);
+    Serial.println("\"");
+  }
+
+  Serial.println("===================================================");
+  Serial.println("[BOOT]    Diagnostics complete. System is ready!");
+  Serial.println("===================================================");
+  Serial.println();
+}
+
+// =========================================================================================
+// SECTION 9: MAIN ARDUINO SETUP & LOOP
+// =========================================================================================
+
+void setup() {
+  // Start Serial Monitor at 115200 baud
+  Serial.begin(SERIAL_BAUD);
+  delay(500); // Allow USB serial link to stabilize
+
+  // Perform full hardware diagnostics & initialization
+  runHardwareDiagnostics();
+
+  // Reset to initial ready state
   resetSystem();
 }
 
 void loop() {
-  // Check for an RFID card
-  if (!mfrc522.PICC_IsNewCardPresent() || !mfrc522.PICC_ReadCardSerial()) {
+  // Check if a new RFID card is present on the reader
+  if (!mfrc522.PICC_IsNewCardPresent()) {
     return;
   }
 
-  String scannedUID = readCardUID();
-  Serial.println("Scanned UID: " + scannedUID);
+  // Read card serial number
+  if (!mfrc522.PICC_ReadCardSerial()) {
+    logWarn("Card detected but serial read failed! Please hold card steady.");
+    return;
+  }
 
-  // Handle RFID card based on current step
+  // Retrieve formatted UID
+  String scannedUID = readCardUID();
+
+  // Route scanned card to the appropriate step handler
   if (currentState == WAITING_FOR_STUDENT) {
     handleStudentScan(scannedUID);
   } else if (currentState == WAITING_FOR_BOOK) {
