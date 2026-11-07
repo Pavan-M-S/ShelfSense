@@ -263,11 +263,14 @@ void showMessageWithScroll(const String& line1, const String& line2 = "", int sc
 void holdLocationWait(const String& locationLine) {
   // Phase 1: First 4 seconds (0 - 4000ms) with Green LED solid ON
   digitalWrite(GREEN_LED_PIN, HIGH);
-  Serial.println("[LCD]     Holding initial view for 4 seconds with Green LED solid ON...");
-  delay(4000);
+  Serial.println("[TIMER]   Holding book view (0-4s)...");
+  for (int sec = 1; sec <= 4; sec++) {
+    delay(1000);
+    Serial.println("[TIMER]   Hold elapsed: " + String(sec) + "s / 8s [View: Title + Shelf & Rack]");
+  }
 
   // Phase 2: After 4 seconds, move shelf/rack to Line 1; scroll instruction on Line 2
-  Serial.println("[LCD]     Moving shelf/rack to Line 1; scrolling prompt on Line 2...");
+  Serial.println("[STATUS]  4 seconds elapsed. Moving shelf/rack to Line 1; scrolling prompt on Line 2...");
   lcd.clear();
   lcd.setCursor(0, 0);
   lcd.print(locationLine.length() > 16 ? locationLine.substring(0, 16) : locationLine);
@@ -277,23 +280,26 @@ void holdLocationWait(const String& locationLine) {
   int promptOffset = 0;
 
   // Run remaining 4 seconds (4000ms) of hold with prompt scrolling at 200ms per step
-  unsigned long startPhase2 = millis();
-  while (millis() - startPhase2 < 4000) {
-    String frame = "";
-    for (int i = 0; i < 16; i++) {
-      frame += promptMsg.charAt((promptOffset + i) % promptLen);
+  for (int sec = 5; sec <= 8; sec++) {
+    unsigned long startSec = millis();
+    while (millis() - startSec < 1000) {
+      String frame = "";
+      for (int i = 0; i < 16; i++) {
+        frame += promptMsg.charAt((promptOffset + i) % promptLen);
+      }
+      lcd.setCursor(0, 1);
+      lcd.print(frame);
+      delay(200);
+      promptOffset++;
     }
-    lcd.setCursor(0, 1);
-    lcd.print(frame);
-    delay(200);
-    promptOffset++;
+    Serial.println("[TIMER]   Hold elapsed: " + String(sec) + "s / 8s [Line 1: " + locationLine + " | Line 2: Scrolling prompt]");
   }
 
   // Phase 3: 3-second warning phase (3000ms total) -> 3 medium beeps with simultaneous LED blink
-  // Each beep cycle: 500ms ON + 500ms OFF = 1000ms * 3 = 3000ms
-  // Prompt on line 2 keeps scrolling in sync during the 3 seconds
-  Serial.println("[FEEDBACK] 3-second warning alert: 3 beeps with simultaneous LED flash...");
+  Serial.println("[STATUS]  8-second hold completed. Starting 3-second warning alert (3 beeps + LED flashes)...");
   for (int b = 0; b < 3; b++) {
+    Serial.println("[WARN]    Warning beep " + String(b + 1) + " of 3 (Warning second " + String(b + 1) + "/3s)");
+
     // 500ms BEEP + LED ON
     digitalWrite(BUZZER_PIN, HIGH);
     digitalWrite(GREEN_LED_PIN, HIGH);
@@ -803,12 +809,14 @@ void setup() {
 void loop() {
   // Check if a new RFID card is present on the reader
   if (!mfrc522.PICC_IsNewCardPresent()) {
+    delay(50);
     return;
   }
 
   // Read card serial number
   if (!mfrc522.PICC_ReadCardSerial()) {
-    logWarn("Card detected but serial read failed! Please hold card steady.");
+    // Suppress repeated spam if it's transient RF noise or card bounce
+    delay(50);
     return;
   }
 
