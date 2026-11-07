@@ -101,16 +101,16 @@ unsigned long sessionStartTime = 0;
 
 // Structure to model a student in the library system
 struct Student {
-  String name;     // Student's full name (e.g. "Pavan")
-  String uid;      // RFID tag UID in uppercase HEX without spaces (e.g. "37E09604")
+  const char* name;     // Student's full name (e.g. "Pavan")
+  const char* uid;      // RFID tag UID in uppercase HEX without spaces (e.g. "37E09604")
 };
 
 // Structure to model a book in the library system
 struct Book {
-  String title;    // Book title (e.g. "Algorithms")
-  String uid;      // RFID tag UID in uppercase HEX without spaces (e.g. "F10F7E05")
-  int shelf;       // Assigned shelf number
-  int rack;        // Assigned rack number
+  const char* title;    // Book title (e.g. "Algorithms")
+  const char* uid;      // RFID tag UID in uppercase HEX without spaces (e.g. "F10F7E05")
+  uint8_t shelf;        // Assigned shelf number
+  uint8_t rack;         // Assigned rack number
 };
 
 // -----------------------------------------------------------------------------------------
@@ -144,7 +144,7 @@ const size_t NUM_BOOKS    = sizeof(registeredBooks) / sizeof(registeredBooks[0])
 // =========================================================================================
 
 // Returns a human-readable name of the current state
-String getStateName(SystemState state) {
+const char* getStateName(SystemState state) {
   switch (state) {
     case WAITING_FOR_STUDENT: return "WAITING_FOR_STUDENT";
     case WAITING_FOR_BOOK:    return "WAITING_FOR_BOOK";
@@ -153,34 +153,66 @@ String getStateName(SystemState state) {
 }
 
 // Log general informational messages
+void logInfo(const __FlashStringHelper* message) {
+  Serial.print(F("[INFO]    "));
+  Serial.println(message);
+}
+void logInfo(const char* message) {
+  Serial.print(F("[INFO]    "));
+  Serial.println(message);
+}
 void logInfo(const String& message) {
-  Serial.print("[INFO]    ");
+  Serial.print(F("[INFO]    "));
   Serial.println(message);
 }
 
 // Log success events
+void logSuccess(const __FlashStringHelper* message) {
+  Serial.print(F("[SUCCESS] "));
+  Serial.println(message);
+}
+void logSuccess(const char* message) {
+  Serial.print(F("[SUCCESS] "));
+  Serial.println(message);
+}
 void logSuccess(const String& message) {
-  Serial.print("[SUCCESS] ");
+  Serial.print(F("[SUCCESS] "));
   Serial.println(message);
 }
 
 // Log warnings (e.g. invalid tags)
+void logWarn(const __FlashStringHelper* message) {
+  Serial.print(F("[WARN]    "));
+  Serial.println(message);
+}
+void logWarn(const char* message) {
+  Serial.print(F("[WARN]    "));
+  Serial.println(message);
+}
 void logWarn(const String& message) {
-  Serial.print("[WARN]    ");
+  Serial.print(F("[WARN]    "));
   Serial.println(message);
 }
 
 // Log errors (e.g. hardware faults or unauthorized access)
+void logError(const __FlashStringHelper* message) {
+  Serial.print(F("[ERROR]   "));
+  Serial.println(message);
+}
+void logError(const char* message) {
+  Serial.print(F("[ERROR]   "));
+  Serial.println(message);
+}
 void logError(const String& message) {
-  Serial.print("[ERROR]   ");
+  Serial.print(F("[ERROR]   "));
   Serial.println(message);
 }
 
 // Log state machine transitions
 void logStateTransition(SystemState fromState, SystemState toState) {
-  Serial.print("[STATE]   Transition: ");
+  Serial.print(F("[STATE]   Transition: "));
   Serial.print(getStateName(fromState));
-  Serial.print(" -> ");
+  Serial.print(F(" -> "));
   Serial.println(getStateName(toState));
 }
 
@@ -189,47 +221,62 @@ void logStateTransition(SystemState fromState, SystemState toState) {
 // =========================================================================================
 
 // Displays a message on the LCD and mirrors it to the Serial Monitor
-void showMessage(const String& line1, const String& line2 = "") {
+void showMessage(const char* line1, const char* line2 = "") {
   lcd.clear();
   lcd.setCursor(0, 0);
-  lcd.print(line1.length() > 16 ? line1.substring(0, 16) : line1);
 
-  Serial.print("[LCD]     Line 1: \"");
+  char buf[17];
+  strncpy(buf, line1, 16);
+  buf[16] = '\0';
+  lcd.print(buf);
+
+  Serial.print(F("[LCD]     Line 1: \""));
   Serial.print(line1);
-  Serial.print("\"");
+  Serial.print(F("\""));
 
-  if (line2.length() > 0) {
+  if (line2 != nullptr && line2[0] != '\0') {
     lcd.setCursor(0, 1);
-    lcd.print(line2.length() > 16 ? line2.substring(0, 16) : line2);
-    Serial.print(" | Line 2: \"");
+    strncpy(buf, line2, 16);
+    buf[16] = '\0';
+    lcd.print(buf);
+    Serial.print(F(" | Line 2: \""));
     Serial.print(line2);
-    Serial.print("\"");
+    Serial.print(F("\""));
   }
   Serial.println();
 }
 
+inline void showMessage(const String& line1, const String& line2 = "") {
+  showMessage(line1.c_str(), line2.c_str());
+}
+
 // Scrolls line 1 smoothly from right to left if it exceeds 16 characters while keeping line 2 static
-void showMessageWithScroll(const String& line1, const String& line2 = "", int scrollSpeedMs = 280, int totalDurationMs = 3500) {
-  Serial.print("[LCD]     Line 1: \"");
+void showMessageWithScroll(const char* line1, const char* line2 = "", int scrollSpeedMs = 280, int totalDurationMs = 3500) {
+  Serial.print(F("[LCD]     Line 1: \""));
   Serial.print(line1);
-  Serial.print("\"");
-  if (line2.length() > 0) {
-    Serial.print(" | Line 2: \"");
+  Serial.print(F("\""));
+  if (line2 != nullptr && line2[0] != '\0') {
+    Serial.print(F(" | Line 2: \""));
     Serial.print(line2);
-    Serial.print("\"");
+    Serial.print(F("\""));
   }
   Serial.println();
 
   lcd.clear();
 
   // Print line 2 (static)
-  if (line2.length() > 0) {
+  if (line2 != nullptr && line2[0] != '\0') {
     lcd.setCursor(0, 1);
-    lcd.print(line2.length() > 16 ? line2.substring(0, 16) : line2);
+    char buf[17];
+    strncpy(buf, line2, 16);
+    buf[16] = '\0';
+    lcd.print(buf);
   }
 
+  size_t len1 = strlen(line1);
+
   // If line 1 fits within 16 chars, simply display without scrolling
-  if (line1.length() <= 16) {
+  if (len1 <= 16) {
     lcd.setCursor(0, 0);
     lcd.print(line1);
     delay(totalDurationMs);
@@ -238,22 +285,28 @@ void showMessageWithScroll(const String& line1, const String& line2 = "", int sc
 
   // If line 1 is longer than 16 chars:
   // Show initial view, pause briefly so user can start reading, then scroll smoothly
+  char frame[17];
+  strncpy(frame, line1, 16);
+  frame[16] = '\0';
   lcd.setCursor(0, 0);
-  lcd.print(line1.substring(0, 16));
+  lcd.print(frame);
   delay(800);
 
-  // Add spacing so it wraps around cleanly if scrolling loops
-  String paddedText = line1 + "    ";
-  int maxOffset = paddedText.length();
+  // Smooth scroll using stack buffer without creating heap Strings
+  size_t padLen = len1 + 4; // virtual padded length (line1 + "    ")
   unsigned long startTime = millis();
 
   int offset = 0;
   while (millis() - startTime < (unsigned long)totalDurationMs) {
-    String frame = "";
     for (int i = 0; i < 16; i++) {
-      int charIdx = (offset + i) % maxOffset;
-      frame += paddedText.charAt(charIdx);
+      size_t charIdx = (offset + i) % padLen;
+      if (charIdx < len1) {
+        frame[i] = line1[charIdx];
+      } else {
+        frame[i] = ' ';
+      }
     }
+    frame[16] = '\0';
     lcd.setCursor(0, 0);
     lcd.print(frame);
     delay(scrollSpeedMs);
@@ -261,56 +314,70 @@ void showMessageWithScroll(const String& line1, const String& line2 = "", int sc
   }
 }
 
+inline void showMessageWithScroll(const String& line1, const String& line2 = "", int scrollSpeedMs = 280, int totalDurationMs = 3500) {
+  showMessageWithScroll(line1.c_str(), line2.c_str(), scrollSpeedMs, totalDurationMs);
+}
+
 // Helper to handle the post-scroll 8-second shelf/rack hold and 3-second warning beeps:
 // 1. Initial 4 seconds (0 - 4s): Displays original screen with Green LED solid ON.
 // 2. Next 4 seconds (4s - 8s):
 //    - Line 1 becomes the shelf/rack info (locationLine)
-//    - Line 2 continuously scrolls "Please place your book in respective shelf" at 200ms speed, repeating until the end.
+//    - Line 2 continuously scrolls "Please place it in given shelf" at 280ms speed, repeating until the end.
 // 3. 3-second warning phase:
 //    - 3 medium beeps spaced evenly across 3 seconds (~3000ms), while Green LED blinks simultaneously with buzzer.
 //    - Line 2 continues scrolling or displaying during warning beeps.
 // 4. Green LED turns OFF and returns to normal standby.
-void holdLocationWait(const String& locationLine) {
+void holdLocationWait(const char* locationLine) {
   // Phase 1: First 4 seconds (0 - 4000ms) with Green LED solid ON
   digitalWrite(GREEN_LED_PIN, HIGH);
-  Serial.println("[TIMER]   Holding book view (0-4s)...");
+  Serial.println(F("[TIMER]   Holding book view (0-4s)..."));
   for (int sec = 1; sec <= 4; sec++) {
     delay(1000);
-    Serial.println("[TIMER]   Hold elapsed: " + String(sec) + "s / 8s [View: Title + Shelf & Rack]");
+    Serial.print(F("[TIMER]   Hold elapsed: "));
+    Serial.print(sec);
+    Serial.println(F("s / 8s [View: Title + Shelf & Rack]"));
   }
 
   // Phase 2: After 4 seconds, move shelf/rack to Line 1; display prompt on Line 2
-  Serial.println("[STATUS]  4 seconds elapsed. Moving shelf/rack to Line 1; showing prompt on Line 2...");
+  Serial.println(F("[STATUS]  4 seconds elapsed. Moving shelf/rack to Line 1; showing prompt on Line 2..."));
   lcd.clear();
   lcd.setCursor(0, 0);
-  lcd.print(locationLine.length() > 16 ? locationLine.substring(0, 16) : locationLine);
+  char locBuf[17];
+  strncpy(locBuf, locationLine, 16);
+  locBuf[16] = '\0';
+  lcd.print(locBuf);
 
   // Smooth readable scrolling for "Please place it in given shelf"
-  String promptMsg = "Please place it in given shelf    ";
-  int promptLen = promptMsg.length();
+  const char promptMsg[] = "Please place it in given shelf    ";
+  const int promptLen = sizeof(promptMsg) - 1;
   int promptOffset = 0;
 
   // Run remaining 4 seconds (4000ms) with relaxed, easy-to-read scroll speed (280ms per character)
   unsigned long startPhase2 = millis();
   while (millis() - startPhase2 < 4000) {
-    String frame = "";
+    char frame[17];
     for (int i = 0; i < 16; i++) {
-      frame += promptMsg.charAt((promptOffset + i) % promptLen);
+      frame[i] = promptMsg[(promptOffset + i) % promptLen];
     }
+    frame[16] = '\0';
     lcd.setCursor(0, 1);
     lcd.print(frame);
     delay(280);
     promptOffset++;
   }
-  Serial.println("[TIMER]   Hold elapsed: 8s / 8s [Line 2: \"Please place it in given shelf\"]");
+  Serial.println(F("[TIMER]   Hold elapsed: 8s / 8s [Line 2: \"Please place it in given shelf\"]"));
 
   // Phase 3: 3-second warning phase (3000ms total) -> 3 medium beeps with simultaneous LED blink
-  Serial.println("[STATUS]  8-second hold completed. Starting 3-second warning alert (3 beeps + LED flashes)...");
+  Serial.println(F("[STATUS]  8-second hold completed. Starting 3-second warning alert (3 beeps + LED flashes)..."));
   lcd.setCursor(0, 1);
-  lcd.print("Session Ending..");
+  lcd.print(F("Session Ending.."));
 
   for (int b = 0; b < 3; b++) {
-    Serial.println("[WARN]    Warning beep " + String(b + 1) + " of 3 (Warning second " + String(b + 1) + "/3s)");
+    Serial.print(F("[WARN]    Warning beep "));
+    Serial.print(b + 1);
+    Serial.print(F(" of 3 (Warning second "));
+    Serial.print(b + 1);
+    Serial.println(F("/3s)"));
 
     // 500ms BEEP + LED ON
     digitalWrite(BUZZER_PIN, HIGH);
@@ -325,7 +392,11 @@ void holdLocationWait(const String& locationLine) {
 
   digitalWrite(BUZZER_PIN, LOW);
   digitalWrite(GREEN_LED_PIN, LOW);
-  Serial.println("[LED]      Warning complete. Green LED OFF. Returning to normal.");
+  Serial.println(F("[LED]      Warning complete. Green LED OFF. Returning to normal."));
+}
+
+inline void holdLocationWait(const String& locationLine) {
+  holdLocationWait(locationLine.c_str());
 }
 
 // Dedicated animated handler for displaying book title, shelf, and rack:
@@ -335,15 +406,22 @@ void holdLocationWait(const String& locationLine) {
 // 4. Exactly 4 characters before scroll ends, Line 2 appears showing "Shelf:X  Rack:Y" and beeps once immediately.
 // 5. Once scrolling completes, holds display for 8 seconds (Green LED solid ON).
 // 6. Then 2-second warning alert (3 medium beeps with simultaneous LED blinks), then LED off and return to normal.
-void displayBookLocationSequence(const String& title, int shelf, int rack) {
-  String locationLine = "Shelf:" + String(shelf) + " Rack:" + String(rack);
+void displayBookLocationSequence(const char* title, uint8_t shelf, uint8_t rack) {
+  char locationLine[32];
+  snprintf(locationLine, sizeof(locationLine), "Shelf:%u Rack:%u", (unsigned int)shelf, (unsigned int)rack);
 
-  Serial.println("[LCD]     Book Title: \"" + title + "\" | Location: \"" + locationLine + "\"");
+  Serial.print(F("[LCD]     Book Title: \""));
+  Serial.print(title);
+  Serial.print(F("\" | Location: \""));
+  Serial.print(locationLine);
+  Serial.println(F("\""));
 
   lcd.clear();
 
+  size_t titleLen = strlen(title);
+
   // Case A: Short title (<= 16 characters) - No scrolling needed
-  if (title.length() <= 16) {
+  if (titleLen <= 16) {
     lcd.setCursor(0, 0);
     lcd.print(title);
     lcd.setCursor(0, 1);
@@ -361,15 +439,18 @@ void displayBookLocationSequence(const String& title, int shelf, int rack) {
 
   // Case B: Long title (> 16 characters)
   // Adaptive scroll speed: 280ms per step if <= 30 chars; faster 180ms if > 30 chars
-  int scrollSpeedMs = (title.length() > 30) ? 180 : 280;
+  int scrollSpeedMs = (titleLen > 30) ? 180 : 280;
 
-  int totalSteps = title.length() - 16;
+  int totalSteps = (int)titleLen - 16;
   int triggerStep = totalSteps > 4 ? (totalSteps - 4) : 0;
   bool locationShown = false;
 
   // Initial pause on the first 16 characters so user can start reading
+  char frame[17];
+  strncpy(frame, title, 16);
+  frame[16] = '\0';
   lcd.setCursor(0, 0);
-  lcd.print(title.substring(0, 16));
+  lcd.print(frame);
   digitalWrite(GREEN_LED_PIN, HIGH);
   delay(800);
 
@@ -380,7 +461,9 @@ void displayBookLocationSequence(const String& title, int shelf, int rack) {
       lcd.setCursor(0, 1);
       lcd.print(locationLine);
       locationShown = true;
-      Serial.println("[LCD]     Line 2 revealed (4 chars before end): \"" + locationLine + "\"");
+      Serial.print(F("[LCD]     Line 2 revealed (4 chars before end): \""));
+      Serial.print(locationLine);
+      Serial.println(F("\""));
 
       // Beep once immediately when shelf & rack appears
       digitalWrite(BUZZER_PIN, HIGH);
@@ -396,8 +479,10 @@ void displayBookLocationSequence(const String& title, int shelf, int rack) {
     }
 
     // Render 16 characters on Line 1 starting at current offset
+    strncpy(frame, title + step, 16);
+    frame[16] = '\0';
     lcd.setCursor(0, 0);
-    lcd.print(title.substring(step, step + 16));
+    lcd.print(frame);
     delay(scrollSpeedMs);
   }
 
@@ -414,6 +499,10 @@ void displayBookLocationSequence(const String& title, int shelf, int rack) {
   holdLocationWait(locationLine);
 }
 
+inline void displayBookLocationSequence(const String& title, uint8_t shelf, uint8_t rack) {
+  displayBookLocationSequence(title.c_str(), shelf, rack);
+}
+
 // Resets system back to the default student check-in state (turns off all LEDs)
 void resetSystem() {
   SystemState previousState = currentState;
@@ -427,7 +516,7 @@ void resetSystem() {
   if (previousState != WAITING_FOR_STUDENT) {
     logStateTransition(previousState, WAITING_FOR_STUDENT);
   } else {
-    logInfo("System reset to ready state (waiting for student ID)");
+    logInfo(F("System reset to ready state (waiting for student ID)"));
   }
 
   // Show "ShelfSense Ready" for a short time, then transition to steady "Please Tap Your Student ID Card"
@@ -439,11 +528,11 @@ void resetSystem() {
 // SUCCESS FEEDBACK: Buzzer short beep + Green LED glow SIMULTANEOUSLY
 // Optionally leaves the Green LED lit while the shelf location is being displayed
 void indicateSuccess(int times = 1, int durationMs = 150, bool keepGreenLit = false) {
-  Serial.print("[FEEDBACK] SUCCESS -> Green LED + Buzzer (");
+  Serial.print(F("[FEEDBACK] SUCCESS -> Green LED + Buzzer ("));
   Serial.print(times);
-  Serial.print(" beep(s) @ ");
+  Serial.print(F(" beep(s) @ "));
   Serial.print(durationMs);
-  Serial.println(" ms simultaneously)");
+  Serial.println(F(" ms simultaneously)"));
 
   for (int i = 0; i < times; i++) {
     // Turn BOTH Green LED and Buzzer ON at the exact same instant
@@ -463,16 +552,17 @@ void indicateSuccess(int times = 1, int durationMs = 150, bool keepGreenLit = fa
   // Keep Green LED glowing for visual confirmation while shelf number is shown
   if (keepGreenLit) {
     digitalWrite(GREEN_LED_PIN, HIGH);
-    Serial.println("[LED]      Green LED glowing for shelf location display");
+    Serial.println(F("[LED]      Green LED glowing for shelf location display"));
   }
 }
 
 // EMERGENCY ERROR FEEDBACK: Rapid Red LED + Buzzer pulsing alarm for unrecognized/invalid tags (2 seconds)
-void showEmergencyAlarm(const String& line1, const String& line2, const String& serialReason) {
-  logError("EMERGENCY ALARM TRIGGERED: " + serialReason);
+void showEmergencyAlarm(const char* line1, const char* line2, const char* serialReason) {
+  Serial.print(F("[ERROR]   EMERGENCY ALARM TRIGGERED: "));
+  Serial.println(serialReason);
   showMessage(line1, line2);
 
-  Serial.println("[FEEDBACK] EMERGENCY ALARM -> Rapid Red LED + Buzzer pulsing for 2 seconds!");
+  Serial.println(F("[FEEDBACK] EMERGENCY ALARM -> Rapid Red LED + Buzzer pulsing for 2 seconds!"));
 
   // Rapid alarm: 10 fast pulses (100ms ON, 100ms OFF) = 2000ms (2 seconds)
   for (int i = 0; i < 10; i++) {
@@ -488,12 +578,17 @@ void showEmergencyAlarm(const String& line1, const String& line2, const String& 
   delay(1000); // Allow user time to read the message on LCD
 }
 
+inline void showEmergencyAlarm(const String& line1, const String& line2, const String& serialReason) {
+  showEmergencyAlarm(line1.c_str(), line2.c_str(), serialReason.c_str());
+}
+
 // STANDARD ERROR FEEDBACK: Red LED glowing at the same time Buzzer is beeping SIMULTANEOUSLY (e.g. out-of-order scans)
-void showError(const String& line1, const String& line2, const String& serialReason) {
-  logWarn("NOTICE: " + serialReason);
+void showError(const char* line1, const char* line2, const char* serialReason) {
+  Serial.print(F("[WARN]    NOTICE: "));
+  Serial.println(serialReason);
   showMessage(line1, line2);
 
-  Serial.println("[FEEDBACK] ERROR -> Red LED + Buzzer pulsing (2 beeps @ 180 ms)");
+  Serial.println(F("[FEEDBACK] ERROR -> Red LED + Buzzer pulsing (2 beeps @ 180 ms)"));
 
   for (int i = 0; i < 2; i++) {
     digitalWrite(RED_LED_PIN, HIGH);
@@ -510,84 +605,106 @@ void showError(const String& line1, const String& line2, const String& serialRea
   delay(1500); // Pause so student can see the prompt on LCD
 }
 
+inline void showError(const String& line1, const String& line2, const String& serialReason) {
+  showError(line1.c_str(), line2.c_str(), serialReason.c_str());
+}
+
 // =========================================================================================
 // SECTION 6: RFID & DATABASE LOOKUP FUNCTIONS
 // =========================================================================================
 
-// Reads the card UID and returns it formatted as uppercase HEX (e.g. "37E09604")
-String readCardUID() {
-  String uid = "";
+// Fills outBuffer with formatted uppercase HEX UID (e.g. "37E09604")
+void readCardUID(char* outBuffer, size_t maxLen) {
+  outBuffer[0] = '\0';
+  size_t offset = 0;
   for (byte i = 0; i < mfrc522.uid.size; i++) {
-    if (mfrc522.uid.uidByte[i] < 0x10) {
-      uid += "0";
+    if (offset + 2 < maxLen) {
+      snprintf(outBuffer + offset, maxLen - offset, "%02X", mfrc522.uid.uidByte[i]);
+      offset += 2;
     }
-    uid += String(mfrc522.uid.uidByte[i], HEX);
   }
-  uid.toUpperCase();
 
   // Log card technical details to Serial Monitor
   MFRC522::PICC_Type piccType = mfrc522.PICC_GetType(mfrc522.uid.sak);
-  Serial.println("---------------------------------------------------");
-  Serial.print("[RFID]    Card Detected! UID: ");
-  Serial.print(uid);
-  Serial.print(" | Size: ");
+  Serial.println(F("---------------------------------------------------"));
+  Serial.print(F("[RFID]    Card Detected! UID: "));
+  Serial.print(outBuffer);
+  Serial.print(F(" | Size: "));
   Serial.print(mfrc522.uid.size);
-  Serial.print(" bytes | PICC Type: ");
+  Serial.print(F(" bytes | PICC Type: "));
   Serial.println(mfrc522.PICC_GetTypeName(piccType));
-  Serial.print("[RFID]    Current System State: ");
+  Serial.print(F("[RFID]    Current System State: "));
   Serial.println(getStateName(currentState));
 
   // Halt card to prevent repeated reads in the same pass
   mfrc522.PICC_HaltA();
-  return uid;
+}
+
+// Backward-compatible overload returning String
+inline String readCardUID() {
+  char buf[32];
+  readCardUID(buf, sizeof(buf));
+  return String(buf);
 }
 
 // Searches registered students for UID. Returns index if found, -1 if not found
-int findStudentIndex(const String& uid) {
-  Serial.print("[AUTH]    Checking student database for UID [");
+int findStudentIndex(const char* uid) {
+  Serial.print(F("[AUTH]    Checking student database for UID ["));
   Serial.print(uid);
-  Serial.println("]...");
+  Serial.println(F("]..."));
 
   for (size_t i = 0; i < NUM_STUDENTS; i++) {
-    if (registeredStudents[i].uid == uid) {
-      Serial.print("[AUTH]    Match found! Student: \"");
+    if (strcmp(registeredStudents[i].uid, uid) == 0) {
+      Serial.print(F("[AUTH]    Match found! Student: \""));
       Serial.print(registeredStudents[i].name);
-      Serial.print("\" at index [");
+      Serial.print(F("\" at index ["));
       Serial.print(i);
-      Serial.println("]");
+      Serial.println(F("]"));
       return (int)i;
     }
   }
 
-  Serial.println("[AUTH]    No match found in student database!");
+  Serial.println(F("[AUTH]    No match found in student database!"));
   return -1;
 }
 
+inline int findStudentIndex(const String& uid) {
+  return findStudentIndex(uid.c_str());
+}
+
 // Checks if the UID belongs to an authorized student
-bool isStudentRegistered(const String& uid) {
+bool isStudentRegistered(const char* uid) {
   return findStudentIndex(uid) != -1;
 }
 
+inline bool isStudentRegistered(const String& uid) {
+  return isStudentRegistered(uid.c_str());
+}
+
 // Searches registered books for UID. Returns index if found, -1 if not found
-int findBookIndex(const String& uid) {
-  Serial.print("[LOOKUP]  Searching library database for book UID [");
+int findBookIndex(const char* uid) {
+  Serial.print(F("[LOOKUP]  Searching library database for book UID ["));
   Serial.print(uid);
-  Serial.println("]...");
+  Serial.println(F("]..."));
 
   for (size_t i = 0; i < NUM_BOOKS; i++) {
-    if (registeredBooks[i].uid == uid) {
-      Serial.print("[LOOKUP]  Match found! Book: \"");
+    if (strcmp(registeredBooks[i].uid, uid) == 0) {
+      Serial.print(F("[LOOKUP]  Match found! Book: \""));
       Serial.print(registeredBooks[i].title);
-      Serial.print("\" -> Shelf ");
+      Serial.print(F("\" -> Shelf "));
       Serial.print(registeredBooks[i].shelf);
-      Serial.print(", Rack ");
+      Serial.print(F(", Rack "));
       Serial.println(registeredBooks[i].rack);
       return (int)i;
     }
   }
 
-  Serial.println("[LOOKUP]  No match found in book database!");
+  Serial.println(F("[LOOKUP]  No match found in book database!"));
   return -1;
+}
+
+inline int findBookIndex(const String& uid) {
+  return findBookIndex(uid.c_str());
 }
 
 // =========================================================================================
@@ -595,12 +712,16 @@ int findBookIndex(const String& uid) {
 // =========================================================================================
 
 // Handles Student Check-In (Step 1)
-void handleStudentScan(const String& uid) {
+void handleStudentScan(const char* uid) {
   int studentIdx = findStudentIndex(uid);
   if (studentIdx != -1) {
     // 1. Authorized Student scanned
     const Student& student = registeredStudents[studentIdx];
-    logSuccess("Student authenticated: " + student.name + " (" + student.uid + ")");
+    Serial.print(F("[SUCCESS] Student authenticated: "));
+    Serial.print(student.name);
+    Serial.print(F(" ("));
+    Serial.print(student.uid);
+    Serial.println(F(")"));
     
     // Short confirmation beep with green LED flash
     indicateSuccess(1, 100, false);
@@ -610,13 +731,16 @@ void handleStudentScan(const String& uid) {
 
     // Start session timer for non-blocking inactivity tracking
     sessionStartTime = millis();
-    logInfo("Session timer started (" + String(SESSION_TIMEOUT_MS / 1000) + "s window for book scan)");
+    Serial.print(F("[INFO]    Session timer started ("));
+    Serial.print(SESSION_TIMEOUT_MS / 1000);
+    Serial.println(F("s window for book scan)"));
 
     // Display student name on LCD: if longer than 16 chars (e.g. "Hi " + name), scroll smoothly!
-    String studentLine = "Hi " + student.name;
+    char studentLine[48];
+    snprintf(studentLine, sizeof(studentLine), "Hi %s", student.name);
     showMessageWithScroll(studentLine, "Tap Book Tag...", 260, 2500);
 
-    logInfo("Ready for book tag. Waiting for book scan...");
+    Serial.println(F("[INFO]    Ready for book tag. Waiting for book scan..."));
     return;
   }
 
@@ -624,7 +748,9 @@ void handleStudentScan(const String& uid) {
   int bookIdx = findBookIndex(uid);
   if (bookIdx != -1) {
     const Book& scannedBook = registeredBooks[bookIdx];
-    logWarn("Book tag (\"" + scannedBook.title + "\") scanned at Step 1 instead of Student ID!");
+    Serial.print(F("[WARN]    Book tag (\""));
+    Serial.print(scannedBook.title);
+    Serial.println(F("\") scanned at Step 1 instead of Student ID!"));
     
     // Prompt student: "Please Tap Your" / "Student ID First"
     showError("Please Tap Your", "Student ID First", "Book tag scanned before student ID authentication");
@@ -635,21 +761,32 @@ void handleStudentScan(const String& uid) {
   }
 
   // 3. Tag is neither student nor book in database -> Unrecognized ID emergency alarm!
-  logError("Unrecognized tag UID: " + uid);
-  showEmergencyAlarm("Unrecognized ID", "Access Denied!", "Unrecognized tag scanned at Step 1: " + uid);
+  Serial.print(F("[ERROR]   Unrecognized tag UID: "));
+  Serial.println(uid);
+  char reason[64];
+  snprintf(reason, sizeof(reason), "Unrecognized tag scanned at Step 1: %s", uid);
+  showEmergencyAlarm("Unrecognized ID", "Access Denied!", reason);
   resetSystem();
 }
 
+inline void handleStudentScan(const String& uid) {
+  handleStudentScan(uid.c_str());
+}
+
 // Handles Book Scanning and Shelf Lookup (Step 2)
-void handleBookScan(const String& uid) {
+void handleBookScan(const char* uid) {
   int bookIdx = findBookIndex(uid);
 
   if (bookIdx != -1) {
     // 1. Registered Book Tag identified -> Run full sequence!
     const Book& foundBook = registeredBooks[bookIdx];
     
-    logSuccess("Book identified: \"" + foundBook.title + "\" located on Shelf " + 
-               String(foundBook.shelf) + ", Rack " + String(foundBook.rack));
+    Serial.print(F("[SUCCESS] Book identified: \""));
+    Serial.print(foundBook.title);
+    Serial.print(F("\" located on Shelf "));
+    Serial.print(foundBook.shelf);
+    Serial.print(F(", Rack "));
+    Serial.println(foundBook.rack);
     
     // Initial success feedback: short confirmation beep + green LED blink
     indicateSuccess(1, 150, false);
@@ -660,7 +797,7 @@ void handleBookScan(const String& uid) {
     // Run custom animated display sequence (title scroll, reveal, 8s hold, 3s warning)
     displayBookLocationSequence(foundBook.title, foundBook.shelf, foundBook.rack);
 
-    logInfo("Session completed. Resetting for next student...");
+    Serial.println(F("[INFO]    Session completed. Resetting for next student..."));
     resetSystem();
     return;
   }
@@ -668,24 +805,32 @@ void handleBookScan(const String& uid) {
   // 2. Check if student card was scanned again instead of a book
   int studentIdx = findStudentIndex(uid);
   if (studentIdx != -1) {
-    logWarn("Student ID scanned again instead of a book! Prompting for book tag...");
+    Serial.println(F("[WARN]    Student ID scanned again instead of a book! Prompting for book tag..."));
     showError("Please Tap Book", "Tag (Not ID)", "Student ID card tapped during book scan step");
     
     // Renew session timer to give the student an additional 20 seconds to correct their action
     sessionStartTime = millis();
-    logInfo("Session timer renewed (+20s). Ready for book tag retry...");
+    Serial.println(F("[INFO]    Session timer renewed (+20s). Ready for book tag retry..."));
     showMessage("Tap Your Book...");
     return;
   }
 
   // 3. Tag is completely unrecognized -> Emergency alarm!
-  logError("Unrecognized tag UID: " + uid + " during book lookup step!");
-  showEmergencyAlarm("Unrecognized ID", "Unknown Book Tag", "Unregistered tag scanned at Step 2: " + uid);
+  Serial.print(F("[ERROR]   Unrecognized tag UID: "));
+  Serial.print(uid);
+  Serial.println(F(" during book lookup step!"));
+  char reason[64];
+  snprintf(reason, sizeof(reason), "Unregistered tag scanned at Step 2: %s", uid);
+  showEmergencyAlarm("Unrecognized ID", "Unknown Book Tag", reason);
 
   // Renew session timer to give the student an additional 20 seconds to correct their action
   sessionStartTime = millis();
-  logInfo("Session timer renewed (+20s). Ready for book tag retry...");
+  Serial.println(F("[INFO]    Session timer renewed (+20s). Ready for book tag retry..."));
   showMessage("Tap Your Book...");
+}
+
+inline void handleBookScan(const String& uid) {
+  handleBookScan(uid.c_str());
 }
 
 // =========================================================================================
@@ -694,18 +839,18 @@ void handleBookScan(const String& uid) {
 
 void runHardwareDiagnostics() {
   Serial.println();
-  Serial.println("===================================================");
-  Serial.println("         SHELFSENSE ESP32 SYSTEM STARTUP           ");
-  Serial.println("===================================================");
-  Serial.print("[BOOT]    CPU Frequency: ");
+  Serial.println(F("==================================================="));
+  Serial.println(F("         SHELFSENSE ESP32 SYSTEM STARTUP           "));
+  Serial.println(F("==================================================="));
+  Serial.print(F("[BOOT]    CPU Frequency: "));
   Serial.print(getCpuFrequencyMhz());
-  Serial.println(" MHz");
-  Serial.print("[BOOT]    Free Heap RAM: ");
+  Serial.println(F(" MHz"));
+  Serial.print(F("[BOOT]    Free Heap RAM: "));
   Serial.print(ESP.getFreeHeap());
-  Serial.println(" bytes");
+  Serial.println(F(" bytes"));
 
   // 1. Check I2C Bus & LCD Presence
-  Serial.println("[BOOT]    Initializing I2C bus and scanning for LCD...");
+  Serial.println(F("[BOOT]    Initializing I2C bus and scanning for LCD..."));
   Wire.begin(21, 22); // Start I2C explicitly on ESP32 default pins: SDA=21, SCL=22
   delay(50);
 
@@ -716,13 +861,13 @@ void runHardwareDiagnostics() {
 
   if (i2cError != 0) {
     // Probe alternative standard address 0x3F or others
-    Serial.print("[BOOT]    LCD not found at 0x");
+    Serial.print(F("[BOOT]    LCD not found at 0x"));
     Serial.print(targetAddr, HEX);
-    Serial.println(", scanning bus...");
+    Serial.println(F(", scanning bus..."));
     for (uint8_t addr = 1; addr < 127; addr++) {
       Wire.beginTransmission(addr);
       if (Wire.endTransmission() == 0) {
-        Serial.print("[BOOT]    Found I2C device at address 0x");
+        Serial.print(F("[BOOT]    Found I2C device at address 0x"));
         Serial.println(addr, HEX);
         targetAddr = addr;
         i2cError = 0;
@@ -732,7 +877,7 @@ void runHardwareDiagnostics() {
   }
 
   if (i2cError == 0) {
-    Serial.print("[BOOT]    I2C LCD detected at address 0x");
+    Serial.print(F("[BOOT]    I2C LCD detected at address 0x"));
     Serial.println(targetAddr, HEX);
     lcd = LiquidCrystal_I2C(targetAddr, LCD_COLUMNS, LCD_ROWS);
     lcd.init();
@@ -746,37 +891,39 @@ void runHardwareDiagnostics() {
     delay(2000); // Display for 2 seconds
     showMessage("ShelfSense Ready", "Tap Student ID");
   } else {
-    logError("I2C LCD NOT responding! Check 5V power and SDA(21)/SCL(22) wiring.");
+    logError(F("I2C LCD NOT responding! Check 5V power and SDA(21)/SCL(22) wiring."));
   }
 
   // 2. Check SPI & RC522 RFID Reader
-  Serial.println("[BOOT]    Initializing SPI and RC522 Reader...");
+  Serial.println(F("[BOOT]    Initializing SPI and RC522 Reader..."));
   SPI.begin();
   mfrc522.PCD_Init();
   
   byte readerVersion = mfrc522.PCD_ReadRegister(MFRC522::VersionReg);
-  Serial.print("[BOOT]    RC522 Firmware Version Register: 0x");
+  Serial.print(F("[BOOT]    RC522 Firmware Version Register: 0x"));
   Serial.println(readerVersion, HEX);
 
   if (readerVersion == 0x92) {
-    logSuccess("RC522 Reader verified (Version 2.0 detected)");
+    logSuccess(F("RC522 Reader verified (Version 2.0 detected)"));
   } else if (readerVersion == 0x91) {
-    logSuccess("RC522 Reader verified (Version 1.0 detected)");
+    logSuccess(F("RC522 Reader verified (Version 1.0 detected)"));
   } else if (readerVersion == 0x88) {
-    logSuccess("RC522 Reader verified (FM17522 clone detected - OK)");
+    logSuccess(F("RC522 Reader verified (FM17522 clone detected - OK)"));
   } else if (readerVersion == 0x00 || readerVersion == 0xFF) {
-    logError("RC522 RFID READER COMMUNICATION FAILED!");
-    Serial.println("          [Troubleshooting RC522]:");
-    Serial.println("          - CRITICAL: VCC must be connected to 3.3V ONLY (5V can damage RC522)");
-    Serial.println("          - Ensure common GND with ESP32");
-    Serial.println("          - Verify SPI Wiring: SCK=GPIO 18, MISO=GPIO 19, MOSI=GPIO 23, SS=GPIO 5, RST=GPIO 4");
-    Serial.println("          - Check soldered header pins for cold joints or short circuits");
+    logError(F("RC522 RFID READER COMMUNICATION FAILED!"));
+    Serial.println(F("          [Troubleshooting RC522]:"));
+    Serial.println(F("          - CRITICAL: VCC must be connected to 3.3V ONLY (5V can damage RC522)"));
+    Serial.println(F("          - Ensure common GND with ESP32"));
+    Serial.println(F("          - Verify SPI Wiring: SCK=GPIO 18, MISO=GPIO 19, MOSI=GPIO 23, SS=GPIO 5, RST=GPIO 4"));
+    Serial.println(F("          - Check soldered header pins for cold joints or short circuits"));
   } else {
-    logWarn("Unrecognized RC522 version 0x" + String(readerVersion, HEX) + " (Reader may still function)");
+    Serial.print(F("[WARN]    Unrecognized RC522 version 0x"));
+    Serial.print(readerVersion, HEX);
+    Serial.println(F(" (Reader may still function)"));
   }
 
   // 3. Test Output Indicators (Buzzer, Red LED, Green LED)
-  Serial.println("[BOOT]    Testing Buzzer (GPIO 27), Red LED (GPIO 26), and Green LED (GPIO 25)...");
+  Serial.println(F("[BOOT]    Testing Buzzer (GPIO 27), Red LED (GPIO 26), and Green LED (GPIO 25)..."));
   pinMode(BUZZER_PIN, OUTPUT);
   pinMode(RED_LED_PIN, OUTPUT);
   pinMode(GREEN_LED_PIN, OUTPUT);
@@ -793,39 +940,39 @@ void runHardwareDiagnostics() {
   digitalWrite(RED_LED_PIN, LOW);
   digitalWrite(BUZZER_PIN, LOW);
   
-  logSuccess("Green LED, Red LED, and Buzzer hardware test passed");
+  logSuccess(F("Green LED, Red LED, and Buzzer hardware test passed"));
 
   // 4. Print Database Summary
-  Serial.println("[BOOT]    Loading Registered Database:");
-  Serial.print("          - Registered Students: ");
+  Serial.println(F("[BOOT]    Loading Registered Database:"));
+  Serial.print(F("          - Registered Students: "));
   Serial.println(NUM_STUDENTS);
   for (size_t i = 0; i < NUM_STUDENTS; i++) {
-    Serial.print("            [Student ");
+    Serial.print(F("            [Student "));
     Serial.print(i + 1);
-    Serial.print("] Name: \"");
+    Serial.print(F("] Name: \""));
     Serial.print(registeredStudents[i].name);
-    Serial.print("\" | UID: ");
+    Serial.print(F("\" | UID: "));
     Serial.println(registeredStudents[i].uid);
   }
 
-  Serial.print("          - Registered Books:    ");
+  Serial.print(F("          - Registered Books:    "));
   Serial.println(NUM_BOOKS);
   for (size_t i = 0; i < NUM_BOOKS; i++) {
-    Serial.print("            [Book ");
+    Serial.print(F("            [Book "));
     Serial.print(i + 1);
-    Serial.print("] Title: \"");
+    Serial.print(F("] Title: \""));
     Serial.print(registeredBooks[i].title);
-    Serial.print("\" | UID: ");
+    Serial.print(F("\" | UID: "));
     Serial.print(registeredBooks[i].uid);
-    Serial.print(" | Shelf: ");
+    Serial.print(F(" | Shelf: "));
     Serial.print(registeredBooks[i].shelf);
-    Serial.print(" | Rack: ");
+    Serial.print(F(" | Rack: "));
     Serial.println(registeredBooks[i].rack);
   }
 
-  Serial.println("===================================================");
-  Serial.println("[BOOT]    Diagnostics complete. System is ready!");
-  Serial.println("===================================================");
+  Serial.println(F("==================================================="));
+  Serial.println(F("[BOOT]    Diagnostics complete. System is ready!"));
+  Serial.println(F("==================================================="));
   Serial.println();
 }
 
@@ -848,7 +995,9 @@ void setup() {
 void loop() {
   // Non-blocking inactivity detection for student check-in session
   if (currentState == WAITING_FOR_BOOK && (millis() - sessionStartTime >= SESSION_TIMEOUT_MS)) {
-    logWarn("Session timed out: No book scan received within " + String(SESSION_TIMEOUT_MS / 1000) + " seconds.");
+    Serial.print(F("[WARN]    Session timed out: No book scan received within "));
+    Serial.print(SESSION_TIMEOUT_MS / 1000);
+    Serial.println(F(" seconds."));
 
     // Auditory and visual timeout notification on LCD and status peripherals
     showMessage("Session Expired ", "Please Try Again");
@@ -884,8 +1033,9 @@ void loop() {
     return;
   }
 
-  // Retrieve formatted UID
-  String scannedUID = readCardUID();
+  // Retrieve formatted UID into stack buffer (prevents dynamic heap allocation)
+  char scannedUID[32];
+  readCardUID(scannedUID, sizeof(scannedUID));
 
   // Route scanned card to the appropriate step handler
   if (currentState == WAITING_FOR_STUDENT) {
