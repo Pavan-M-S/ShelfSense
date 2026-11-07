@@ -115,7 +115,7 @@ struct Book {
 // List of authorized students: { "Student Name", "RFID UID" }
 const Student registeredStudents[] = {
   { "Pavan", "37E09604" },
-  { "Ravinath", "A97AF8B2" }
+  { "Donkey DVS", "A97AF8B2" }
   // Add new students here in the format: { "Name", "UID" },
 };
 
