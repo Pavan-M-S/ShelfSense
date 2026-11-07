@@ -275,21 +275,24 @@ void holdLocationWait(const String& locationLine) {
   lcd.setCursor(0, 0);
   lcd.print(locationLine.length() > 16 ? locationLine.substring(0, 16) : locationLine);
 
-  // Clear, friendly message: fits 16 chars or alternates so students can easily read it
-  // First show "Place Book Here" for 2 seconds, then "On Above Shelf" for 2 seconds
-  lcd.setCursor(0, 1);
-  lcd.print("Place Book Here ");
-  Serial.println("[TIMER]   Hold elapsed: 5s / 8s [Line 2: \"Place Book Here\"]");
-  delay(1000);
-  Serial.println("[TIMER]   Hold elapsed: 6s / 8s [Line 2: \"Place Book Here\"]");
-  delay(1000);
+  // Smooth readable scrolling for "Please place it in given shelf"
+  String promptMsg = "Please place it in given shelf    ";
+  int promptLen = promptMsg.length();
+  int promptOffset = 0;
 
-  lcd.setCursor(0, 1);
-  lcd.print("On Above Shelf! ");
-  Serial.println("[TIMER]   Hold elapsed: 7s / 8s [Line 2: \"On Above Shelf!\"]");
-  delay(1000);
-  Serial.println("[TIMER]   Hold elapsed: 8s / 8s [Line 2: \"On Above Shelf!\"]");
-  delay(1000);
+  // Run remaining 4 seconds (4000ms) with relaxed, easy-to-read scroll speed (280ms per character)
+  unsigned long startPhase2 = millis();
+  while (millis() - startPhase2 < 4000) {
+    String frame = "";
+    for (int i = 0; i < 16; i++) {
+      frame += promptMsg.charAt((promptOffset + i) % promptLen);
+    }
+    lcd.setCursor(0, 1);
+    lcd.print(frame);
+    delay(280);
+    promptOffset++;
+  }
+  Serial.println("[TIMER]   Hold elapsed: 8s / 8s [Line 2: \"Please place it in given shelf\"]");
 
   // Phase 3: 3-second warning phase (3000ms total) -> 3 medium beeps with simultaneous LED blink
   Serial.println("[STATUS]  8-second hold completed. Starting 3-second warning alert (3 beeps + LED flashes)...");
