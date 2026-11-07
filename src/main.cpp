@@ -114,7 +114,8 @@ struct Book {
 
 // List of authorized students: { "Student Name", "RFID UID" }
 const Student registeredStudents[] = {
-  { "Pavan", "37E09604" }
+  { "Pavan", "37E09604" },
+  { "Ravinath", "A97AF8B2" }
   // Add new students here in the format: { "Name", "UID" },
 };
 
@@ -420,7 +421,7 @@ void resetSystem() {
   }
 
   // Show "ShelfSense Ready" for a short time, then transition to steady "Please Tap Your Student ID Card"
-  showMessage("ShelfSense Ready", "   Smart Lib    ");
+  showMessage("ShelfSense Ready", "  Smart Library   ");
   delay(1800); // Display for 1.8 seconds, then disappear
   showMessage("Please Tap Your ", "Student ID Card ");
 }
