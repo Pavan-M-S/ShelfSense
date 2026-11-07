@@ -200,7 +200,9 @@ Modify the database arrays directly in [`src/main.cpp`](src/main.cpp):
 // List of authorized students
 const Student registeredStudents[] = {
   { "Pavan", "37E09604" },
-  { "Donkey DVS", "A97AF8B2" }
+  { "Rehan", "A97AF8B2" },
+  { "DVS", "0203448B258000" },
+  { "Pruthvi", "C94B8554" }
   // Add new students: { "Name", "UID" },
 };
 
