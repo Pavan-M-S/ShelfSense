@@ -116,7 +116,9 @@ struct Book {
 const Student registeredStudents[] = {
   { "Pavan", "37E09604" },
   { "Rehan", "A97AF8B2" },
-  { "DVS"  , "B92061B2"}
+  { "DVS"  , "0203448B258000"},
+  { "Pruthvi", "C94B8554" }  // Placeholder for future students
+
   // Add new students here in the format: { "Name", "UID" },
 };
 
