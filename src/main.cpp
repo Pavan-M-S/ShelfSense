@@ -404,6 +404,33 @@ void displayBookLocationSequence(const String& title, int shelf, int rack) {
   holdLocationWait(locationLine);
 }
 
+// Non-blocking timer to alternate standby display while waiting for a student ID:
+// Screen 1: "ShelfSense Ready" / "Tap Student ID" (2.5 seconds)
+// Screen 2: "Scan Student ID"  / "To Begin..."      (2.5 seconds)
+unsigned long lastStandbyFlipMs = 0;
+int standbyScreenIndex = 0;
+
+void updateStandbyDisplay() {
+  unsigned long now = millis();
+  if (now - lastStandbyFlipMs >= 2500) {
+    lastStandbyFlipMs = now;
+    standbyScreenIndex = 1 - standbyScreenIndex; // Toggle between 0 and 1
+
+    lcd.clear();
+    if (standbyScreenIndex == 0) {
+      lcd.setCursor(0, 0);
+      lcd.print("ShelfSense Ready");
+      lcd.setCursor(0, 1);
+      lcd.print("Tap Student ID  ");
+    } else {
+      lcd.setCursor(0, 0);
+      lcd.print("Please Tap Your ");
+      lcd.setCursor(0, 1);
+      lcd.print("Student ID Card ");
+    }
+  }
+}
+
 // Resets system back to the default student check-in state (turns off all LEDs)
 void resetSystem() {
   SystemState previousState = currentState;
@@ -419,6 +446,9 @@ void resetSystem() {
     logInfo("System reset to ready state (waiting for student ID)");
   }
 
+  // Show "ShelfSense Ready" immediately upon reset
+  standbyScreenIndex = 0;
+  lastStandbyFlipMs = millis();
   showMessage("ShelfSense Ready", "Tap Student ID");
 }
 
@@ -823,6 +853,11 @@ void setup() {
 }
 
 void loop() {
+  // While waiting for a student ID, rotate the standby message on LCD smoothly
+  if (currentState == WAITING_FOR_STUDENT) {
+    updateStandbyDisplay();
+  }
+
   // Check if a new RFID card is present on the reader
   if (!mfrc522.PICC_IsNewCardPresent()) {
     delay(50);
