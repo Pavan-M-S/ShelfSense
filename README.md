@@ -40,7 +40,7 @@ ShelfSense runs a deterministic Finite State Machine (FSM) with intelligent cros
 ```mermaid
 stateDiagram-v2
     [*] --> BootDiagnostics: Power ON / Reset
-    BootDiagnostics --> WaitingForStudent: LCD: "ShelfSense Ready" / "Tap Student ID"
+    BootDiagnostics --> WaitingForStudent: Splash (1.8s) -> Steady LCD: "Please Tap Your Student ID Card"
 
     state "State 0: WAITING_FOR_STUDENT" as WaitingForStudent {
         [*] --> DetectTag0: Card Presented
@@ -83,7 +83,7 @@ stateDiagram-v2
 ## Key Features
 
 - **Sequential Two-Tier State Machine**:
-  - **Patron Authentication (`WAITING_FOR_STUDENT`)**: Validates student identity against registered credentials. Displays personalized greetings with smooth scrolling for long names.
+  - **Patron Authentication (`WAITING_FOR_STUDENT`)**: Validates student identity against registered credentials. Displays a brief reset splash (`"ShelfSense Ready / Smart Library"` for 1.8s) before settling into steady standby (`"Please Tap Your / Student ID Card"`), with personalized greetings and smooth scrolling for long names.
   - **Book Localization (`WAITING_FOR_BOOK`)**: Maps book tags to designated **Shelf** and **Rack** coordinates.
 - **Cross-Tag Type Resolution & Session Memory**:
   - Scanning a book tag before student login prompts: `"Please Tap Your Student ID First"`.
@@ -157,7 +157,8 @@ stateDiagram-v2
 
 | Event / Phase | Visual Display (16x2 LCD) | Audio Feedback (Buzzer) | Visual LED Status | Duration / Timing |
 | :--- | :--- | :--- | :--- | :--- |
-| **Standby / Ready** | `ShelfSense Ready`<br>`Tap Student ID` | Silent | All LEDs OFF | Continuous |
+| **Reset Transition** | `ShelfSense Ready`<br>`Smart Library` | Silent | All LEDs OFF | 1.8 seconds splash |
+| **Standby / Ready** | `Please Tap Your`<br>`Student ID Card` | Silent | All LEDs OFF | Continuous steady standby |
 | **Student Authenticated** | `Hi <Student Name>` (scrolling)<br>`Tap Book Tag...` | 1 short beep (100ms) | Green LED pulse | 2.5s |
 | **Book Tag Identified** | Line 1: Book Title (adaptive scroll)<br>Line 2: Blank initially | 1 confirmation beep (150ms) | Green LED blinks (2 ON, 1 OFF) | Dynamic title length |
 | **Shelf/Rack Pre-Reveal** | Line 1: Continuing title scroll<br>Line 2: `Shelf:X  Rack:Y` | 1 single chime (100ms) | Green LED continues | Exactly 4 chars before end |
@@ -198,7 +199,8 @@ Modify the database arrays directly in [`src/main.cpp`](src/main.cpp):
 ```cpp
 // List of authorized students
 const Student registeredStudents[] = {
-  { "Pavan", "37E09604" }
+  { "Pavan", "37E09604" },
+  { "Donkey DVS", "A97AF8B2" }
   // Add new students: { "Name", "UID" },
 };
 
