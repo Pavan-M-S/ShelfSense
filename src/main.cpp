@@ -251,6 +251,82 @@ void showMessageWithScroll(const String& line1, const String& line2 = "", int sc
   }
 }
 
+// Dedicated animated handler for displaying book title, shelf, and rack:
+// 1. Line 2 remains empty while scrolling the book title.
+// 2. Green LED blinks during scroll: ON for 2 characters, OFF for 1 character.
+// 3. Exactly 4 characters before scroll ends, Line 2 appears showing "Shelf:X  Rack:Y".
+// 4. Once scrolling completes, Green LED turns solidly ON and holds for 4 full seconds.
+void displayBookLocationSequence(const String& title, int shelf, int rack) {
+  String locationLine = "Shelf:" + String(shelf) + " Rack:" + String(rack);
+
+  Serial.println("[LCD]     Book Title: \"" + title + "\" | Location: \"" + locationLine + "\"");
+
+  lcd.clear();
+
+  // Case A: Short title (<= 16 characters) - No scrolling needed
+  if (title.length() <= 16) {
+    lcd.setCursor(0, 0);
+    lcd.print(title);
+    lcd.setCursor(0, 1);
+    lcd.print(locationLine);
+
+    // Keep Green LED solid ON for 4 seconds
+    digitalWrite(GREEN_LED_PIN, HIGH);
+    delay(4000);
+    digitalWrite(GREEN_LED_PIN, LOW);
+    return;
+  }
+
+  // Case B: Long title (> 16 characters)
+  // Total steps to scroll title fully across the 16-character window
+  int totalSteps = title.length() - 16;
+  int triggerStep = totalSteps > 4 ? (totalSteps - 4) : 0;
+  bool locationShown = false;
+
+  // Initial pause on the first 16 characters so user can start reading
+  lcd.setCursor(0, 0);
+  lcd.print(title.substring(0, 16));
+  digitalWrite(GREEN_LED_PIN, HIGH);
+  delay(800);
+
+  // Scroll step by step from offset 0 to totalSteps
+  for (int step = 0; step <= totalSteps; step++) {
+    // Green LED blinking pattern: ON for 2 chars, OFF for 1 char
+    if (step % 3 == 2) {
+      digitalWrite(GREEN_LED_PIN, LOW);
+    } else {
+      digitalWrite(GREEN_LED_PIN, HIGH);
+    }
+
+    // When we reach 4 characters before finishing scroll, reveal Shelf and Rack on line 2!
+    if (step >= triggerStep && !locationShown) {
+      lcd.setCursor(0, 1);
+      lcd.print(locationLine);
+      locationShown = true;
+      Serial.println("[LCD]     Line 2 revealed (4 chars before end): \"" + locationLine + "\"");
+    }
+
+    // Render 16 characters on Line 1 starting at current offset
+    lcd.setCursor(0, 0);
+    lcd.print(title.substring(step, step + 16));
+    delay(280);
+  }
+
+  // Ensure Line 2 is displayed if it was very short
+  if (!locationShown) {
+    lcd.setCursor(0, 1);
+    lcd.print(locationLine);
+  }
+
+  // After scrolling completes fully: switch Green LED solid ON and wait 4 seconds
+  digitalWrite(GREEN_LED_PIN, HIGH);
+  Serial.println("[LCD]     Scroll complete. Holding solid Green LED for 4 seconds...");
+  delay(4000);
+
+  // Turn off Green LED
+  digitalWrite(GREEN_LED_PIN, LOW);
+}
+
 // Resets system back to the default student check-in state (turns off all LEDs)
 void resetSystem() {
   SystemState previousState = currentState;
@@ -449,25 +525,16 @@ void handleBookScan(const String& uid) {
     logSuccess("Book identified: \"" + foundBook.title + "\" located on Shelf " + 
                String(foundBook.shelf) + ", Rack " + String(foundBook.rack));
     
-    // Short beep with Green LED simultaneously, and keep Green LED ON during display
-    indicateSuccess(1, 150, true);
+    // Initial success feedback: short confirmation beep + green LED blink
+    indicateSuccess(1, 150, false);
 
-    // First display Shelf number on Line 2 while book title displays / scrolls
-    String shelfLine = "Shelf: " + String(foundBook.shelf);
-    logInfo("Displaying shelf location with Green LED glowing...");
-    showMessageWithScroll(foundBook.title, shelfLine, 280, 4700);
+    // Run custom animated display sequence:
+    // - Line 2 stays empty while scrolling
+    // - LED blinks: ON for 2 characters, OFF for 1 character
+    // - Exactly 4 characters before scroll completes, Line 2 reveals "Shelf:X Rack:Y"
+    // - Once scroll completes, LED stays solid ON for 4 seconds
+    displayBookLocationSequence(foundBook.title, foundBook.shelf, foundBook.rack);
 
-    // Just 300ms before completing, update Line 2 to display the Rack name/number
-    String rackLine = "Rack: " + String(foundBook.rack);
-    lcd.setCursor(0, 1);
-    lcd.print("                "); // clear line 2
-    lcd.setCursor(0, 1);
-    lcd.print(rackLine);
-    Serial.println("[LCD]     Just 300ms before completing -> " + rackLine);
-    delay(300);
-
-    // Turn off Green LED after display finishes
-    digitalWrite(GREEN_LED_PIN, LOW);
     logInfo("Session completed. Resetting for next student...");
     resetSystem();
 
