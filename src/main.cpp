@@ -26,13 +26,15 @@
  *   SCL        | GPIO 22        | NO (Hardware I2C)     | Default Hardware I2C SCL
  *   * Note: Default I2C address is usually 0x27 or 0x3F. Turn potentiometer to adjust contrast.
  * 
- * 3. STATUS INDICATORS (Buzzer & Red LED)
+ * 3. STATUS INDICATORS (Buzzer, Red LED & Green LED)
  * -----------------------------------------------------------------------------------------
  *   Component  | Pin / Terminal       | ESP32 Pin  | Configurable? | Notes
  *  ------------+----------------------+------------+---------------+-----------------------
  *   Buzzer     | Positive (+)         | GPIO 27    | YES           | Configurable (BUZZER_PIN)
  *              | Negative (-)         | GND        | No (Fixed)    | Common Ground
  *   Red LED    | Anode (+) [Long leg] | GPIO 26    | YES           | Configurable (RED_LED_PIN)
+ *              | Cathode (-)          | GND        | No (Fixed)    | Connect with 220Ω-330Ω resistor
+ *   Green LED  | Anode (+) [Long leg] | GPIO 25    | YES           | Configurable (GREEN_LED_PIN)
  *              | Cathode (-)          | GND        | No (Fixed)    | Connect with 220Ω-330Ω resistor
  * 
  * -----------------------------------------------------------------------------------------
@@ -55,9 +57,10 @@
 #define RST_PIN         4       // Reset pin for RC522
 #define SS_PIN          5       // Slave Select / SDA pin for RC522
 
-// Feedback Peripherals
+// Feedback Peripherals (Buzzer, Red LED for Errors, Green LED for Success)
 #define BUZZER_PIN      27      // Active Buzzer positive pin
 #define RED_LED_PIN     26      // Error / Alert Red LED pin
+#define GREEN_LED_PIN   25      // Correct / Success Green LED pin
 
 // LCD I2C Configuration
 #define LCD_I2C_ADDR    0x27    // Standard I2C address (0x27 or 0x3F)
@@ -162,7 +165,7 @@ void logStateTransition(SystemState fromState, SystemState toState) {
 }
 
 // =========================================================================================
-// SECTION 5: HARDWARE FEEDBACK & LCD HELPERS
+// SECTION 5: HARDWARE FEEDBACK & LCD HELPERS (SIMULTANEOUS LED & BUZZER)
 // =========================================================================================
 
 // Displays a message on the LCD and mirrors it to the Serial Monitor
@@ -185,30 +188,14 @@ void showMessage(const String& line1, const String& line2 = "") {
   Serial.println();
 }
 
-// Activates buzzer for a specified count and duration
-void beep(int times, int durationMs = 100) {
-  Serial.print("[BUZZER]  Beeping ");
-  Serial.print(times);
-  Serial.print(" time(s) @ ");
-  Serial.print(durationMs);
-  Serial.println(" ms");
-
-  for (int i = 0; i < times; i++) {
-    digitalWrite(BUZZER_PIN, HIGH);
-    delay(durationMs);
-    digitalWrite(BUZZER_PIN, LOW);
-    if (i < times - 1) {
-      delay(durationMs);
-    }
-  }
-}
-
-// Resets system back to the default student check-in state
+// Resets system back to the default student check-in state (turns off all LEDs)
 void resetSystem() {
   SystemState previousState = currentState;
   currentState = WAITING_FOR_STUDENT;
   
+  // Ensure both indicator LEDs are OFF in standby
   digitalWrite(RED_LED_PIN, LOW);
+  digitalWrite(GREEN_LED_PIN, LOW);
 
   if (previousState != WAITING_FOR_STUDENT) {
     logStateTransition(previousState, WAITING_FOR_STUDENT);
@@ -219,21 +206,61 @@ void resetSystem() {
   showMessage("ShelfSense Ready", "Tap Student ID");
 }
 
-// Triggers visual and audible error alerts
+// SUCCESS FEEDBACK: Buzzer short beep + Green LED glow SIMULTANEOUSLY
+// Optionally leaves the Green LED lit while the shelf location is being displayed
+void indicateSuccess(int times = 1, int durationMs = 150, bool keepGreenLit = false) {
+  Serial.print("[FEEDBACK] SUCCESS -> Green LED + Buzzer (");
+  Serial.print(times);
+  Serial.print(" beep(s) @ ");
+  Serial.print(durationMs);
+  Serial.println(" ms simultaneously)");
+
+  for (int i = 0; i < times; i++) {
+    // Turn BOTH Green LED and Buzzer ON at the exact same instant
+    digitalWrite(GREEN_LED_PIN, HIGH);
+    digitalWrite(BUZZER_PIN, HIGH);
+    delay(durationMs);
+
+    // Turn BOTH OFF together
+    digitalWrite(GREEN_LED_PIN, LOW);
+    digitalWrite(BUZZER_PIN, LOW);
+
+    if (i < times - 1) {
+      delay(100);
+    }
+  }
+
+  // Keep Green LED glowing for visual confirmation while shelf number is shown
+  if (keepGreenLit) {
+    digitalWrite(GREEN_LED_PIN, HIGH);
+    Serial.println("[LED]      Green LED glowing for shelf location display");
+  }
+}
+
+// ERROR FEEDBACK: Red LED glowing at the same time Buzzer is beeping SIMULTANEOUSLY
 void showError(const String& message, const String& serialReason) {
   logError("ALARM TRIGGERED: " + serialReason);
   
   showMessage(message);
   
-  Serial.println("[LED]     Red LED turned ON");
-  digitalWrite(RED_LED_PIN, HIGH);
+  Serial.println("[FEEDBACK] ERROR -> Red LED + Buzzer pulsing simultaneously (2 beeps @ 200 ms)");
   
-  beep(2, 200); // 2 long alert beeps
+  for (int i = 0; i < 2; i++) {
+    // Turn BOTH Red LED and Buzzer ON at the exact same instant
+    digitalWrite(RED_LED_PIN, HIGH);
+    digitalWrite(BUZZER_PIN, HIGH);
+    delay(200);
+
+    // Turn BOTH OFF together
+    digitalWrite(RED_LED_PIN, LOW);
+    digitalWrite(BUZZER_PIN, LOW);
+
+    if (i < 1) {
+      delay(150); // Pause between the two warning pulses
+    }
+  }
   
-  Serial.println("[LED]     Red LED turned OFF");
-  digitalWrite(RED_LED_PIN, LOW);
-  
-  delay(2000); // Give user time to see error on display
+  delay(1500); // Give user time to see error message on the LCD
 }
 
 // =========================================================================================
@@ -316,7 +343,9 @@ void handleStudentScan(const String& uid) {
   if (isStudentRegistered(uid)) {
     logSuccess("Student authenticated successfully!");
     showMessage("Welcome, Student!", "Tap Your Book...");
-    beep(1, 100); // 1 short confirmation beep
+    
+    // Short confirmation beep with green LED flash
+    indicateSuccess(1, 100, false);
 
     logStateTransition(WAITING_FOR_STUDENT, WAITING_FOR_BOOK);
     currentState = WAITING_FOR_BOOK;
@@ -324,6 +353,7 @@ void handleStudentScan(const String& uid) {
     delay(1500); // Debounce to allow user to remove card
     logInfo("Ready for book tag. Waiting for book scan...");
   } else {
+    // Red LED + buzzer simultaneous error alarm
     showError("Access Denied", "Unauthorized Student Card UID: " + uid);
     resetSystem();
   }
@@ -334,20 +364,32 @@ void handleBookScan(const String& uid) {
   int bookIdx = findBookIndex(uid);
 
   if (bookIdx != -1) {
+    // -------------------------------------------------------------
+    // BOOK PLACED CORRECTLY / FOUND IN SYSTEM:
+    // Buzzer short beep + Green LED glowing SIMULTANEOUSLY
+    // -------------------------------------------------------------
     const Book& foundBook = registeredBooks[bookIdx];
     
     logSuccess("Book identified: \"" + foundBook.title + "\" located on Shelf " + String(foundBook.shelf));
     
     showMessage("Book Found ->", "Go to Shelf " + String(foundBook.shelf));
-    beep(2, 100); // 2 short success beeps
+    
+    // Short beep with Green LED simultaneously, and keep Green LED ON during the 4s shelf display
+    indicateSuccess(1, 150, true);
 
-    logInfo("Displaying shelf location for 4 seconds...");
-    delay(4000); // Hold message so user can read it
+    logInfo("Displaying shelf location for 4 seconds with Green LED glowing...");
+    delay(4000); // Hold message & green light so student can read shelf number
 
+    // Turn off Green LED after student finishes reading
+    digitalWrite(GREEN_LED_PIN, LOW);
     logInfo("Session completed. Resetting for next student...");
     resetSystem();
+
   } else {
-    // If the student mistakenly scans their student ID again or an unregistered book
+    // -------------------------------------------------------------
+    // BOOK PLACED WRONG / UNREGISTERED TAG:
+    // Red LED glowing at the same time Buzzer is beeping SIMULTANEOUSLY
+    // -------------------------------------------------------------
     if (isStudentRegistered(uid)) {
       logWarn("Student ID scanned again instead of a book! Prompting for book...");
       showError("Please Tap Book", "Student card tapped during book scan step");
@@ -422,18 +464,25 @@ void runHardwareDiagnostics() {
     logWarn("Unrecognized RC522 version 0x" + String(readerVersion, HEX) + " (Reader may still function)");
   }
 
-  // 3. Test Output Indicators (Buzzer & LED)
-  Serial.println("[BOOT]    Testing Buzzer (GPIO 27) and Red LED (GPIO 26)...");
+  // 3. Test Output Indicators (Buzzer, Red LED, Green LED)
+  Serial.println("[BOOT]    Testing Buzzer (GPIO 27), Red LED (GPIO 26), and Green LED (GPIO 25)...");
   pinMode(BUZZER_PIN, OUTPUT);
   pinMode(RED_LED_PIN, OUTPUT);
+  pinMode(GREEN_LED_PIN, OUTPUT);
 
-  // Short welcome indicator
+  // Quick sequential test: Green LED test, then Red LED + Buzzer simultaneous test
+  digitalWrite(GREEN_LED_PIN, HIGH);
+  delay(120);
+  digitalWrite(GREEN_LED_PIN, LOW);
+  delay(80);
+
   digitalWrite(RED_LED_PIN, HIGH);
   digitalWrite(BUZZER_PIN, HIGH);
-  delay(100);
+  delay(120);
   digitalWrite(RED_LED_PIN, LOW);
   digitalWrite(BUZZER_PIN, LOW);
-  logSuccess("Buzzer and LED hardware test passed");
+  
+  logSuccess("Green LED, Red LED, and Buzzer hardware test passed");
 
   // 4. Print Database Summary
   Serial.println("[BOOT]    Loading Registered Database:");
