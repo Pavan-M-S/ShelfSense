@@ -67,6 +67,9 @@
 #define LCD_COLUMNS     16      // 16 characters wide
 #define LCD_ROWS        2       // 2 lines high
 
+// Session Timeout Configuration
+#define SESSION_TIMEOUT_MS 20000 // Configurable session timeout in ms (20 seconds)
+
 // Baud Rate for USB Serial Debugging
 #define SERIAL_BAUD     115200
 
@@ -92,6 +95,9 @@ enum SystemState {
 
 // Variable holding the current system state
 SystemState currentState = WAITING_FOR_STUDENT;
+
+// Session timer tracking (inactivity detection in WAITING_FOR_BOOK)
+unsigned long sessionStartTime = 0;
 
 // Structure to model a student in the library system
 struct Student {
@@ -412,6 +418,7 @@ void displayBookLocationSequence(const String& title, int shelf, int rack) {
 void resetSystem() {
   SystemState previousState = currentState;
   currentState = WAITING_FOR_STUDENT;
+  sessionStartTime = 0; // Reset session inactivity timer
   
   // Ensure both indicator LEDs are OFF in standby
   digitalWrite(RED_LED_PIN, LOW);
@@ -601,6 +608,10 @@ void handleStudentScan(const String& uid) {
     logStateTransition(WAITING_FOR_STUDENT, WAITING_FOR_BOOK);
     currentState = WAITING_FOR_BOOK;
 
+    // Start session timer for non-blocking inactivity tracking
+    sessionStartTime = millis();
+    logInfo("Session timer started (" + String(SESSION_TIMEOUT_MS / 1000) + "s window for book scan)");
+
     // Display student name on LCD: if longer than 16 chars (e.g. "Hi " + name), scroll smoothly!
     String studentLine = "Hi " + student.name;
     showMessageWithScroll(studentLine, "Tap Book Tag...", 260, 2500);
@@ -643,6 +654,9 @@ void handleBookScan(const String& uid) {
     // Initial success feedback: short confirmation beep + green LED blink
     indicateSuccess(1, 150, false);
 
+    // Reset session timer as book checkout/location lookup is now executing
+    sessionStartTime = 0;
+
     // Run custom animated display sequence (title scroll, reveal, 8s hold, 3s warning)
     displayBookLocationSequence(foundBook.title, foundBook.shelf, foundBook.rack);
 
@@ -657,8 +671,9 @@ void handleBookScan(const String& uid) {
     logWarn("Student ID scanned again instead of a book! Prompting for book tag...");
     showError("Please Tap Book", "Tag (Not ID)", "Student ID card tapped during book scan step");
     
-    // Maintain student login session so they can retry scanning the book
-    logInfo("Maintaining student session. Ready for book tag retry...");
+    // Renew session timer to give the student an additional 20 seconds to correct their action
+    sessionStartTime = millis();
+    logInfo("Session timer renewed (+20s). Ready for book tag retry...");
     showMessage("Tap Your Book...");
     return;
   }
@@ -667,8 +682,9 @@ void handleBookScan(const String& uid) {
   logError("Unrecognized tag UID: " + uid + " during book lookup step!");
   showEmergencyAlarm("Unrecognized ID", "Unknown Book Tag", "Unregistered tag scanned at Step 2: " + uid);
 
-  // Maintain session so authorized student can scan a valid book without re-authenticating
-  logInfo("Maintaining student session. Ready for book tag retry...");
+  // Renew session timer to give the student an additional 20 seconds to correct their action
+  sessionStartTime = millis();
+  logInfo("Session timer renewed (+20s). Ready for book tag retry...");
   showMessage("Tap Your Book...");
 }
 
@@ -830,6 +846,31 @@ void setup() {
 }
 
 void loop() {
+  // Non-blocking inactivity detection for student check-in session
+  if (currentState == WAITING_FOR_BOOK && (millis() - sessionStartTime >= SESSION_TIMEOUT_MS)) {
+    logWarn("Session timed out: No book scan received within " + String(SESSION_TIMEOUT_MS / 1000) + " seconds.");
+
+    // Auditory and visual timeout notification on LCD and status peripherals
+    showMessage("Session Expired ", "Please Try Again");
+
+    // Fire 2 short warning beeps on the buzzer and Red LED flashes
+    for (int i = 0; i < 2; i++) {
+      digitalWrite(RED_LED_PIN, HIGH);
+      digitalWrite(BUZZER_PIN, HIGH);
+      delay(150);
+      digitalWrite(RED_LED_PIN, LOW);
+      digitalWrite(BUZZER_PIN, LOW);
+      if (i < 1) {
+        delay(150);
+      }
+    }
+    delay(1000); // Brief pause so student can read "Session Expired / Please Try Again"
+
+    // Revert currentState to WAITING_FOR_STUDENT and restore default standby display
+    resetSystem();
+    return;
+  }
+
   // Check if a new RFID card is present on the reader
   if (!mfrc522.PICC_IsNewCardPresent()) {
     delay(50);
