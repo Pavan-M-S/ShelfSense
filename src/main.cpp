@@ -270,9 +270,22 @@ void displayBookLocationSequence(const String& title, int shelf, int rack) {
     lcd.setCursor(0, 1);
     lcd.print(locationLine);
 
-    // Keep Green LED solid ON for 4 seconds
+    // Beep when showing shelf and rack info
+    digitalWrite(BUZZER_PIN, HIGH);
+    delay(100);
+    digitalWrite(BUZZER_PIN, LOW);
+
+    // Keep Green LED solid ON during the 4 seconds hold
     digitalWrite(GREEN_LED_PIN, HIGH);
-    delay(4000);
+    // Wait first 2.5 seconds (2500 ms)
+    delay(2500);
+
+    // Short beep at last 1.5 seconds remaining
+    digitalWrite(BUZZER_PIN, HIGH);
+    delay(80);
+    digitalWrite(BUZZER_PIN, LOW);
+    delay(1420); // Finish remaining time to complete 4000ms
+
     digitalWrite(GREEN_LED_PIN, LOW);
     return;
   }
@@ -291,19 +304,24 @@ void displayBookLocationSequence(const String& title, int shelf, int rack) {
 
   // Scroll step by step from offset 0 to totalSteps
   for (int step = 0; step <= totalSteps; step++) {
-    // Green LED blinking pattern: ON for 2 chars, OFF for 1 char
-    if (step % 3 == 2) {
-      digitalWrite(GREEN_LED_PIN, LOW);
-    } else {
-      digitalWrite(GREEN_LED_PIN, HIGH);
-    }
-
     // When we reach 4 characters before finishing scroll, reveal Shelf and Rack on line 2!
     if (step >= triggerStep && !locationShown) {
       lcd.setCursor(0, 1);
       lcd.print(locationLine);
       locationShown = true;
       Serial.println("[LCD]     Line 2 revealed (4 chars before end): \"" + locationLine + "\"");
+
+      // Beep immediately when shelf & rack appears
+      digitalWrite(BUZZER_PIN, HIGH);
+      delay(100);
+      digitalWrite(BUZZER_PIN, LOW);
+    }
+
+    // Green LED blinking pattern: ON for 2 chars, OFF for 1 char
+    if (step % 3 == 2) {
+      digitalWrite(GREEN_LED_PIN, LOW);
+    } else {
+      digitalWrite(GREEN_LED_PIN, HIGH);
     }
 
     // Render 16 characters on Line 1 starting at current offset
@@ -316,12 +334,24 @@ void displayBookLocationSequence(const String& title, int shelf, int rack) {
   if (!locationShown) {
     lcd.setCursor(0, 1);
     lcd.print(locationLine);
+    digitalWrite(BUZZER_PIN, HIGH);
+    delay(100);
+    digitalWrite(BUZZER_PIN, LOW);
   }
 
   // After scrolling completes fully: switch Green LED solid ON and wait 4 seconds
   digitalWrite(GREEN_LED_PIN, HIGH);
   Serial.println("[LCD]     Scroll complete. Holding solid Green LED for 4 seconds...");
-  delay(4000);
+
+  // Wait first 2.5 seconds (2500 ms)
+  delay(2500);
+
+  // Short beep at last 1.5 seconds remaining
+  Serial.println("[BUZZER]  Short alert beep at last 1.5 seconds");
+  digitalWrite(BUZZER_PIN, HIGH);
+  delay(80);
+  digitalWrite(BUZZER_PIN, LOW);
+  delay(1420); // Complete the remainder of 4000ms
 
   // Turn off Green LED
   digitalWrite(GREEN_LED_PIN, LOW);
