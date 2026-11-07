@@ -251,32 +251,80 @@ void showMessageWithScroll(const String& line1, const String& line2 = "", int sc
   }
 }
 
-// Helper to handle the post-scroll 8-second shelf/rack wait and 2-second warning beeps:
-// 1. Wait full 8 seconds (8000ms) with Green LED solidly ON.
-// 2. Then warning phase: 3 medium beeps over 2 seconds (~2000ms), where Green LED blinks simultaneously with buzzer.
-// 3. Green LED turns OFF and returns to normal standby.
-void holdLocationWait() {
-  // Phase 1: Wait 8 seconds with Green LED solid ON
+// Helper to handle the post-scroll 8-second shelf/rack hold and 3-second warning beeps:
+// 1. Initial 4 seconds (0 - 4s): Displays original screen with Green LED solid ON.
+// 2. Next 4 seconds (4s - 8s):
+//    - Line 1 becomes the shelf/rack info (locationLine)
+//    - Line 2 continuously scrolls "Please place your book in respective shelf" at 200ms speed, repeating until the end.
+// 3. 3-second warning phase:
+//    - 3 medium beeps spaced evenly across 3 seconds (~3000ms), while Green LED blinks simultaneously with buzzer.
+//    - Line 2 continues scrolling or displaying during warning beeps.
+// 4. Green LED turns OFF and returns to normal standby.
+void holdLocationWait(const String& locationLine) {
+  // Phase 1: First 4 seconds (0 - 4000ms) with Green LED solid ON
   digitalWrite(GREEN_LED_PIN, HIGH);
-  Serial.println("[LCD]     Holding book location for 8 seconds with Green LED solid ON...");
-  delay(8000);
+  Serial.println("[LCD]     Holding initial view for 4 seconds with Green LED solid ON...");
+  delay(4000);
 
-  // Phase 2: Warning phase (~2 seconds total) -> 3 medium beeps with simultaneous LED blink
-  // (350ms ON + 250ms OFF) * 3 = 1800ms + 200ms finish = 2000ms (2 seconds)
-  Serial.println("[FEEDBACK] 2-second warning alert: 3 medium beeps with simultaneous LED flash...");
-  for (int i = 0; i < 3; i++) {
+  // Phase 2: After 4 seconds, move shelf/rack to Line 1; scroll instruction on Line 2
+  Serial.println("[LCD]     Moving shelf/rack to Line 1; scrolling prompt on Line 2...");
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print(locationLine.length() > 16 ? locationLine.substring(0, 16) : locationLine);
+
+  String promptMsg = "Please place your book in respective shelf    ";
+  int promptLen = promptMsg.length();
+  int promptOffset = 0;
+
+  // Run remaining 4 seconds (4000ms) of hold with prompt scrolling at 200ms per step
+  unsigned long startPhase2 = millis();
+  while (millis() - startPhase2 < 4000) {
+    String frame = "";
+    for (int i = 0; i < 16; i++) {
+      frame += promptMsg.charAt((promptOffset + i) % promptLen);
+    }
+    lcd.setCursor(0, 1);
+    lcd.print(frame);
+    delay(200);
+    promptOffset++;
+  }
+
+  // Phase 3: 3-second warning phase (3000ms total) -> 3 medium beeps with simultaneous LED blink
+  // Each beep cycle: 500ms ON + 500ms OFF = 1000ms * 3 = 3000ms
+  // Prompt on line 2 keeps scrolling in sync during the 3 seconds
+  Serial.println("[FEEDBACK] 3-second warning alert: 3 beeps with simultaneous LED flash...");
+  for (int b = 0; b < 3; b++) {
+    // 500ms BEEP + LED ON
     digitalWrite(BUZZER_PIN, HIGH);
     digitalWrite(GREEN_LED_PIN, HIGH);
-    delay(350);
+    for (int t = 0; t < 2; t++) { // 2 steps * 200ms + 100ms = 500ms
+      String frame = "";
+      for (int i = 0; i < 16; i++) {
+        frame += promptMsg.charAt((promptOffset + i) % promptLen);
+      }
+      lcd.setCursor(0, 1);
+      lcd.print(frame);
+      delay(t == 1 ? 300 : 200);
+      promptOffset++;
+    }
 
+    // 500ms SILENCE + LED OFF
     digitalWrite(BUZZER_PIN, LOW);
     digitalWrite(GREEN_LED_PIN, LOW);
-    if (i < 2) {
-      delay(250);
+    for (int t = 0; t < 2; t++) { // 2 steps = 500ms
+      String frame = "";
+      for (int i = 0; i < 16; i++) {
+        frame += promptMsg.charAt((promptOffset + i) % promptLen);
+      }
+      lcd.setCursor(0, 1);
+      lcd.print(frame);
+      delay(t == 1 ? 300 : 200);
+      promptOffset++;
     }
   }
-  delay(200); // Settle before returning to ready state
 
+  digitalWrite(BUZZER_PIN, LOW);
+  digitalWrite(GREEN_LED_PIN, LOW);
   Serial.println("[LED]      Warning complete. Green LED OFF. Returning to normal.");
 }
 
@@ -306,8 +354,8 @@ void displayBookLocationSequence(const String& title, int shelf, int rack) {
     delay(100);
     digitalWrite(BUZZER_PIN, LOW);
 
-    // Wait 8 seconds with solid LED, followed by 3 warning beeps/blinks over 2 seconds
-    holdLocationWait();
+    // Wait 8 seconds with solid LED, followed by 3 warning beeps/blinks over 3 seconds
+    holdLocationWait(locationLine);
     return;
   }
 
@@ -362,8 +410,8 @@ void displayBookLocationSequence(const String& title, int shelf, int rack) {
     digitalWrite(BUZZER_PIN, LOW);
   }
 
-  // After scrolling completes fully: wait 8 seconds with solid LED, followed by 3 warning beeps/blinks
-  holdLocationWait();
+  // After scrolling completes fully: wait 8 seconds with solid LED, followed by 3 warning beeps/blinks over 3 seconds
+  holdLocationWait(locationLine);
 }
 
 // Resets system back to the default student check-in state (turns off all LEDs)
