@@ -207,7 +207,7 @@ const Student registeredStudents[] = {
 // Database of registered books with shelf and rack assignments
 const Book registeredBooks[] = {
   { "Geronimo Stilton - Journey to the Center of the Earth", "F10F7E05", 2, 1 }, // Shelf 2, Rack 1
-  { "Dragon Masters - The Lost Kingdom", "8DC0FA6B", 4, 3 }                      // Shelf 4, Rack 3
+  { "Harry Potter", "8DC0FA6B", 4, 3 }                                           // Shelf 4, Rack 3
   // Add new books: { "Title", "UID", shelf, rack },
 };
 ```

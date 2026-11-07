@@ -115,14 +115,15 @@ struct Book {
 // List of authorized students: { "Student Name", "RFID UID" }
 const Student registeredStudents[] = {
   { "Pavan", "37E09604" },
-  { "Rehan", "A97AF8B2" }
+  { "Rehan", "A97AF8B2" },
+  { "DVS"  , "B92061B2"}
   // Add new students here in the format: { "Name", "UID" },
 };
 
 // Database of registered books: { "Book Title", "RFID UID", Shelf Number, Rack Number }
 const Book registeredBooks[] = {
   { "Geronimo Stilton - Journey to the Center of the Earth", "F10F7E05", 2, 1 }, // Shelf 2, Rack 1
-  { "Dragon Masters - The Lost Kingdom", "8DC0FA6B", 4, 3 }  // Shelf 4, Rack 3
+  { "Harry Potter", "8DC0FA6B", 4, 3 }  // Shelf 4, Rack 3
   // Add new books here in the format: { "Title", "UID", shelf, rack },
 };
 
