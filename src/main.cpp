@@ -269,64 +269,45 @@ void holdLocationWait(const String& locationLine) {
     Serial.println("[TIMER]   Hold elapsed: " + String(sec) + "s / 8s [View: Title + Shelf & Rack]");
   }
 
-  // Phase 2: After 4 seconds, move shelf/rack to Line 1; scroll instruction on Line 2
-  Serial.println("[STATUS]  4 seconds elapsed. Moving shelf/rack to Line 1; scrolling prompt on Line 2...");
+  // Phase 2: After 4 seconds, move shelf/rack to Line 1; display prompt on Line 2
+  Serial.println("[STATUS]  4 seconds elapsed. Moving shelf/rack to Line 1; showing prompt on Line 2...");
   lcd.clear();
   lcd.setCursor(0, 0);
   lcd.print(locationLine.length() > 16 ? locationLine.substring(0, 16) : locationLine);
 
-  String promptMsg = "Please place your book in respective shelf    ";
-  int promptLen = promptMsg.length();
-  int promptOffset = 0;
+  // Clear, friendly message: fits 16 chars or alternates so students can easily read it
+  // First show "Place Book Here" for 2 seconds, then "On Above Shelf" for 2 seconds
+  lcd.setCursor(0, 1);
+  lcd.print("Place Book Here ");
+  Serial.println("[TIMER]   Hold elapsed: 5s / 8s [Line 2: \"Place Book Here\"]");
+  delay(1000);
+  Serial.println("[TIMER]   Hold elapsed: 6s / 8s [Line 2: \"Place Book Here\"]");
+  delay(1000);
 
-  // Run remaining 4 seconds (4000ms) of hold with prompt scrolling at 200ms per step
-  for (int sec = 5; sec <= 8; sec++) {
-    unsigned long startSec = millis();
-    while (millis() - startSec < 1000) {
-      String frame = "";
-      for (int i = 0; i < 16; i++) {
-        frame += promptMsg.charAt((promptOffset + i) % promptLen);
-      }
-      lcd.setCursor(0, 1);
-      lcd.print(frame);
-      delay(200);
-      promptOffset++;
-    }
-    Serial.println("[TIMER]   Hold elapsed: " + String(sec) + "s / 8s [Line 1: " + locationLine + " | Line 2: Scrolling prompt]");
-  }
+  lcd.setCursor(0, 1);
+  lcd.print("On Above Shelf! ");
+  Serial.println("[TIMER]   Hold elapsed: 7s / 8s [Line 2: \"On Above Shelf!\"]");
+  delay(1000);
+  Serial.println("[TIMER]   Hold elapsed: 8s / 8s [Line 2: \"On Above Shelf!\"]");
+  delay(1000);
 
   // Phase 3: 3-second warning phase (3000ms total) -> 3 medium beeps with simultaneous LED blink
   Serial.println("[STATUS]  8-second hold completed. Starting 3-second warning alert (3 beeps + LED flashes)...");
+  lcd.setCursor(0, 1);
+  lcd.print("Session Ending..");
+
   for (int b = 0; b < 3; b++) {
     Serial.println("[WARN]    Warning beep " + String(b + 1) + " of 3 (Warning second " + String(b + 1) + "/3s)");
 
     // 500ms BEEP + LED ON
     digitalWrite(BUZZER_PIN, HIGH);
     digitalWrite(GREEN_LED_PIN, HIGH);
-    for (int t = 0; t < 2; t++) { // 2 steps * 200ms + 100ms = 500ms
-      String frame = "";
-      for (int i = 0; i < 16; i++) {
-        frame += promptMsg.charAt((promptOffset + i) % promptLen);
-      }
-      lcd.setCursor(0, 1);
-      lcd.print(frame);
-      delay(t == 1 ? 300 : 200);
-      promptOffset++;
-    }
+    delay(500);
 
     // 500ms SILENCE + LED OFF
     digitalWrite(BUZZER_PIN, LOW);
     digitalWrite(GREEN_LED_PIN, LOW);
-    for (int t = 0; t < 2; t++) { // 2 steps = 500ms
-      String frame = "";
-      for (int i = 0; i < 16; i++) {
-        frame += promptMsg.charAt((promptOffset + i) % promptLen);
-      }
-      lcd.setCursor(0, 1);
-      lcd.print(frame);
-      delay(t == 1 ? 300 : 200);
-      promptOffset++;
-    }
+    delay(500);
   }
 
   digitalWrite(BUZZER_PIN, LOW);
