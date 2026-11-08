@@ -149,8 +149,8 @@ MFRC522 mfrc522(SS_PIN, RST_PIN);
 // LiquidCrystal_I2C instance communicating over standard I2C (SDA=21, SCL=22)
 LiquidCrystal_I2C lcd(LCD_I2C_ADDR, LCD_COLUMNS, LCD_ROWS);
 
-// Mobizt Firebase Data Objects (Asynchronous background operations on Core 0)
-FirebaseData fbdo;
+// Mobizt Firebase Data Objects (Dedicated to Core 0 background Firestore worker)
+FirebaseData fbdo;     // Core 0: Background Firestore worker (20s roster sync, log queue, offline flush)
 FirebaseAuth auth;
 FirebaseConfig config;
 
@@ -162,9 +162,11 @@ Preferences offlineLogsPrefs;
 QueueHandle_t firestoreQueue = NULL;
 TaskHandle_t firestoreTaskHandle = NULL;
 
-// System synchronization flags
-volatile bool triggerPostRoundSync = false; // Triggers background roster sync right after one book round finishes
-volatile bool pendingRestart = false;        // Schedules restart countdown when cloud roster changes are detected
+// System Restart Flag for automatic restart when cloud roster diff is detected
+volatile bool pendingRestart = false;
+
+// Post-Round Cloud Sync Flag: triggers immediate background roster sync after completing one book round
+volatile bool triggerPostRoundSync = false;
 
 // =========================================================================================
 // SECTION 3: SYSTEM STATES & IN-MEMORY DATABASES
@@ -397,6 +399,7 @@ bool getStudentFromROM(const char* uid, StudentRecord& outRecord);
 void saveStudentToROM(const char* uid, const char* name, bool active);
 void removeStudentFromROM(const char* uid);
 std::vector<String> getAllROMUIDs();
+void printROMCacheSummary();
 
 // Maximum number of offline log events buffered in persistent ROM (NVS)
 const uint16_t MAX_OFFLINE_LOGS = 20;
@@ -650,16 +653,18 @@ void firestoreSyncTask(void* pvParameters) {
         flushOfflineLogsFromROM();
       }
 
-      // Immediate post-round roster sync (triggered after complete book round finishes)
-      if (triggerPostRoundSync && initialSyncDone) {
+      // Immediate Post-Round Roster Sync Trigger (Triggered after completing a student + book round)
+      if (initialSyncDone && triggerPostRoundSync) {
         triggerPostRoundSync = false;
-        Serial.println(F("[AUTH-SYNC] Completed one book round. Triggering immediate background roster sync..."));
+        lastRosterCheckTime = millis();
+        Serial.println(F("---------------------------------------------------"));
+        Serial.println(F("[AUTH-SYNC] Completed one full book round! Running background cloud roster sync..."));
         bool diffDetected = false;
         compareAndSyncRoster(false /* periodic */, diffDetected);
-        lastRosterCheckTime = millis();
         if (diffDetected) {
           pendingRestart = true;
         }
+        Serial.println(F("---------------------------------------------------"));
       }
 
       // Periodic 20-second Roster check and diff sync (Requirement 3)
@@ -1268,6 +1273,32 @@ std::vector<String> getAllROMUIDs() {
   return list;
 }
 
+// Inspects and logs all student records currently stored in persistent ROM (NVS)
+void printROMCacheSummary() {
+  std::vector<String> uids = getAllROMUIDs();
+  Serial.println(F("==================================================="));
+  Serial.print(F("[ROM-CACHE] Registered Student Cards in ROM (Total: "));
+  Serial.print(uids.size());
+  Serial.println(F("):"));
+  for (size_t i = 0; i < uids.size(); i++) {
+    StudentRecord rec;
+    if (getStudentFromROM(uids[i].c_str(), rec)) {
+      Serial.print(F("            ["));
+      Serial.print(i + 1);
+      Serial.print(F("] UID: "));
+      Serial.print(uids[i]);
+      Serial.print(F(" | Name: \""));
+      Serial.print(rec.name);
+      Serial.print(F("\" | Status: "));
+      Serial.println(rec.active ? F("ACTIVE") : F("SUSPENDED"));
+    }
+  }
+  if (uids.empty()) {
+    Serial.println(F("            (No student cards cached in ROM yet)"));
+  }
+  Serial.println(F("==================================================="));
+}
+
 // Periodic (every 20s) & Boot-Time Roster Synchronization with Diff Detection
 // First reads ROM, then reads Firestore 'student_names'. If differences exist, updates ROM.
 bool compareAndSyncRoster(bool isBoot, bool &outDiffDetected) {
@@ -1462,7 +1493,7 @@ bool syncStudentsFromCloud() {
   return compareAndSyncRoster(true /* isBoot */, unused);
 }
 
-// Verifies student credentials directly and instantly from ROM cache (0 ms network latency)
+// Instant Local ROM Student Verification: Zero network latency, instant LCD & buzzer feedback
 bool verifyStudentFromROM(const char* uid, char* outName, size_t maxLen, StudentAuthStatus& outStatus) {
   if (uid == nullptr || uid[0] == '\0') {
     outStatus = STUDENT_AUTH_NOT_FOUND;
@@ -1475,37 +1506,34 @@ bool verifyStudentFromROM(const char* uid, char* outName, size_t maxLen, Student
   const char* cleanUID = uidStr.c_str();
 
   StudentRecord romRecord;
-  bool inROM = getStudentFromROM(cleanUID, romRecord);
-
-  if (inROM) {
+  if (getStudentFromROM(cleanUID, romRecord)) {
     if (outName && maxLen > 0) {
       strncpy(outName, romRecord.name, maxLen - 1);
       outName[maxLen - 1] = '\0';
     }
-
     if (romRecord.active) {
       outStatus = STUDENT_AUTH_ACTIVE;
-      Serial.print(F("[AUTH] Verified student from ROM cache: \""));
+      Serial.print(F("[AUTH-ROM] Instant Match: Found active student \""));
       Serial.print(romRecord.name);
       Serial.print(F("\" [UID: "));
       Serial.print(cleanUID);
-      Serial.println(F(" | Active: true]"));
+      Serial.println(F("]"));
       return true;
     } else {
       outStatus = STUDENT_AUTH_SUSPENDED;
-      Serial.print(F("[AUTH] Student card SUSPENDED in ROM cache: \""));
+      Serial.print(F("[AUTH-ROM] Instant Match: Card is SUSPENDED: \""));
       Serial.print(romRecord.name);
       Serial.print(F("\" [UID: "));
       Serial.print(cleanUID);
-      Serial.println(F(" | Active: false]"));
+      Serial.println(F("]"));
       return false;
     }
   }
 
   outStatus = STUDENT_AUTH_NOT_FOUND;
-  Serial.print(F("[AUTH] Card UID ["));
+  Serial.print(F("[AUTH-ROM] UID ["));
   Serial.print(cleanUID);
-  Serial.println(F("] not found in ROM cache!"));
+  Serial.println(F("] not recognized in local ROM cache."));
   return false;
 }
 
@@ -1604,7 +1632,7 @@ void handleStudentScan(const char* uid) {
   }
 
   if (authStatus == STUDENT_AUTH_SUSPENDED) {
-    // 2. Student Card Suspended (active: false in Firestore / ROM)
+    // 2. Student Card Suspended (active: false in ROM)
     Serial.print(F("[AUTH]     Student Card SUSPENDED (active=false): \""));
     Serial.print(verifiedName);
     Serial.print(F("\" [UID: "));
@@ -1621,7 +1649,7 @@ void handleStudentScan(const char* uid) {
       if (i < 1) delay(100);
     }
 
-    // Display suspended message on LCD (Requirement 1)
+    // Display suspended message on LCD
     showMessage(" Card Suspended ", " Contact Admin  ");
     delay(2500);
 
@@ -1629,30 +1657,7 @@ void handleStudentScan(const char* uid) {
     return;
   }
 
-  if (authStatus == STUDENT_AUTH_ROM_REMOVED) {
-    // 3. Card was cached in ROM, but deleted from Firestore
-    Serial.print(F("[AUTH]     Card UID ["));
-    Serial.print(uid);
-    Serial.println(F("] deleted from cloud. ROM updated (cache cleared)."));
-
-    // 2 warning beeps on buzzer + Red LED
-    for (int i = 0; i < 2; i++) {
-      digitalWrite(RED_LED_PIN, HIGH);
-      digitalWrite(BUZZER_PIN, HIGH);
-      delay(150);
-      digitalWrite(RED_LED_PIN, LOW);
-      digitalWrite(BUZZER_PIN, LOW);
-      if (i < 1) delay(100);
-    }
-
-    showMessage(" Card Inactive  ", " Access Revoked ");
-    delay(2500);
-
-    resetSystem();
-    return;
-  }
-
-  // 4. Book tag scanned instead of Student ID Card
+  // 3. Book tag scanned instead of Student ID Card
   int bookIdx = findBookIndex(uid);
   if (bookIdx != -1) {
     const Book& scannedBook = registeredBooks[bookIdx];
@@ -1720,12 +1725,12 @@ void handleBookScan(const char* uid) {
     // Run custom animated display sequence (title scroll, reveal, 8s hold, 3s warning)
     displayBookLocationSequence(foundBook.title, foundBook.shelf, foundBook.rack);
 
-    Serial.println(F("[INFO]     Book round completed. Resetting for next patron..."));
+    Serial.println(F("[INFO]     Book sequence completed. Resetting for next patron..."));
     resetSystem();
 
-    // Trigger immediate background roster sync right after one complete book round
+    // Trigger immediate background sync after completing round (Student + Book successfully logged)
     triggerPostRoundSync = true;
-    Serial.println(F("[AUTH-SYNC] Completed one book round. Triggering immediate background roster sync..."));
+    Serial.println(F("[AUTH-SYNC] Completed one full book round. Scheduled immediate background cloud sync."));
     return;
   }
 
@@ -1890,29 +1895,6 @@ void runHardwareDiagnostics() {
     Serial.println(F(")"));
   }
 
-  // 5. Inspect persistent ROM (NVS) for cached student roster and pending offline logs
-  Serial.println(F("[BOOT]     Persistent ROM Inspection (NVS):"));
-  std::vector<String> romUIDs = getAllROMUIDs();
-  Serial.print(F("           - Cached Students in ROM: "));
-  Serial.println(romUIDs.size());
-  for (size_t i = 0; i < romUIDs.size(); i++) {
-    StudentRecord rec;
-    if (getStudentFromROM(romUIDs[i].c_str(), rec)) {
-      Serial.print(F("             ["));
-      Serial.print(i + 1);
-      Serial.print(F("] \""));
-      Serial.print(rec.name);
-      Serial.print(F("\" (UID: "));
-      Serial.print(romUIDs[i]);
-      Serial.print(F(" | Status: "));
-      Serial.print(rec.active ? F("ACTIVE") : F("SUSPENDED"));
-      Serial.println(F(")"));
-    }
-  }
-  uint16_t offLogs = offlineLogsPrefs.getUShort("count", 0);
-  Serial.print(F("           - Pending Offline Logs in ROM: "));
-  Serial.println(offLogs);
-
   Serial.println(F("==================================================="));
   Serial.println(F("[BOOT]     Hardware Diagnostics Complete."));
   Serial.println(F("==================================================="));
@@ -1935,6 +1917,9 @@ void setup() {
   studentPrefs.begin("students", false);
   offlineLogsPrefs.begin("off_logs", false);
   Serial.println(F("[NVS]      Preferences namespaces \"students\" & \"off_logs\" initialized"));
+
+  // Check and display what is currently stored in persistent ROM at boot
+  printROMCacheSummary();
 
   // Create FreeRTOS Queue for non-blocking Firestore document synchronization (up to 10 events)
   firestoreQueue = xQueueCreate(10, sizeof(FirestoreLogEvent));
