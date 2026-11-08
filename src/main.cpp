@@ -85,8 +85,11 @@ inline esp_err_t esp_task_wdt_init(uint32_t timeout_sec, bool panic) {
 #endif
 
 // Compatibility alias for Mobizt Firebase library Firestore collection listing
+#define GET_DOCS_4(fb, proj, db, col) listDocuments((fb), (proj), (db), (col), 100, "", "", "", false)
+#define GET_DOCS_9(fb, proj, db, col, sz, tok, ord, mask, missing) listDocuments((fb), (proj), (db), (col), (sz), (tok), (ord), (mask), (missing))
+#define GET_DOCS_CHOOSER(_1, _2, _3, _4, _5, _6, _7, _8, _9, NAME, ...) NAME
 #ifndef getDocuments
-#define getDocuments listDocuments
+#define getDocuments(...) GET_DOCS_CHOOSER(__VA_ARGS__, GET_DOCS_9, _8, _7, _6, _5, GET_DOCS_4)(__VA_ARGS__)
 #endif
 
 // =========================================================================================
@@ -123,7 +126,8 @@ inline esp_err_t esp_task_wdt_init(uint32_t timeout_sec, bool panic) {
 #define FIREBASE_USER_EMAIL           "esp32@shelfsense.local"
 #define FIREBASE_USER_PASSWORD        "ShelfSense@2026"
 #define FIRESTORE_COLLECTION          "library_logs"
-#define FIRESTORE_STUDENTS_COLLECTION "student_names"
+#define FIRESTORE_STUDENTS            "student_names"
+#define FIRESTORE_STUDENTS_COLLECTION FIRESTORE_STUDENTS
 
 // NTP Time Synchronization Configuration (IST: UTC + 5:30 = 19800 seconds)
 #define NTP_SERVER_1        "pool.ntp.org"
@@ -141,19 +145,17 @@ MFRC522 mfrc522(SS_PIN, RST_PIN);
 // LiquidCrystal_I2C instance communicating over standard I2C (SDA=21, SCL=22)
 LiquidCrystal_I2C lcd(LCD_I2C_ADDR, LCD_COLUMNS, LCD_ROWS);
 
-// Mobizt Firebase Data Objects
-FirebaseData fbdo;     // Dedicated to background transaction logging (Core 0)
-FirebaseData fbdoAuth; // Dedicated to live student verification & boot sync (Core 1)
+// Mobizt Firebase Data Objects (Single global instance across firmware)
+FirebaseData fbdo;
 FirebaseAuth auth;
 FirebaseConfig config;
 
 // ESP32 Non-Volatile Storage (Preferences) for offline-first student roster caching
 Preferences studentPrefs;
 
-// FreeRTOS Queue, Task & Mutex handles
+// FreeRTOS Queue & Task handles for background Firestore sync
 QueueHandle_t firestoreQueue = NULL;
 TaskHandle_t firestoreTaskHandle = NULL;
-SemaphoreHandle_t authMutex = NULL;
 
 // =========================================================================================
 // SECTION 3: SYSTEM STATES & IN-MEMORY DATABASES
@@ -381,9 +383,7 @@ void firestoreSyncTask(void* pvParameters) {
   config.token_status_callback = tokenStatusCallback;
   Firebase.reconnectNetwork(true);
   fbdo.setBSSLBufferSize(4096 /* Rx buffer */, 1024 /* Tx buffer */);
-  fbdo.setResponseSize(2048);
-  fbdoAuth.setBSSLBufferSize(4096 /* Rx buffer */, 1024 /* Tx buffer */);
-  fbdoAuth.setResponseSize(8192);
+  fbdo.setResponseSize(8192);
 
   Firebase.begin(&config, &auth);
   Serial.print(F("[FIREBASE] Client library initialized for: "));
@@ -891,22 +891,17 @@ bool syncStudentsFromCloud() {
     return false;
   }
 
-  if (authMutex != NULL && xSemaphoreTake(authMutex, pdMS_TO_TICKS(5000)) != pdTRUE) {
-    Serial.println(F("[AUTH-SYNC] Auth mutex busy! Aborting sync; retaining existing local NVS cache."));
-    return false;
-  }
-
   bool syncSuccess = false;
   Serial.print(F("[AUTH-SYNC] Fetching collection '"));
-  Serial.print(FIRESTORE_STUDENTS_COLLECTION);
+  Serial.print(FIRESTORE_STUDENTS);
   Serial.println(F("'..."));
 
-  // Fetch all documents from student_names collection (up to 100 entries)
-  if (Firebase.Firestore.getDocuments(&fbdoAuth, FIREBASE_PROJECT_ID, "", FIRESTORE_STUDENTS_COLLECTION, 100, "", "", "", false)) {
-    int httpCode = fbdoAuth.httpCode();
+  // Fetch all documents from student_names collection using the single global fbdo
+  if (Firebase.Firestore.getDocuments(&fbdo, FIREBASE_PROJECT_ID, "(default)", FIRESTORE_STUDENTS)) {
+    int httpCode = fbdo.httpCode();
     if (httpCode == 200) {
       FirebaseJson json;
-      json.setJsonData(fbdoAuth.payload());
+      json.setJsonData(fbdo.payload());
 
       FirebaseJsonData docsData;
       json.get(docsData, "documents");
@@ -932,7 +927,7 @@ bool syncStudentsFromCloud() {
             docJson.get(nameData, "fields/name/stringValue");
             docJson.get(activeData, "fields/active/booleanValue");
 
-            bool isActive = false;
+            bool isActive = true;
             if (activeData.success) {
               isActive = (activeData.boolValue || activeData.stringValue == "true");
             }
@@ -976,18 +971,14 @@ bool syncStudentsFromCloud() {
     }
   } else {
     Serial.print(F("[AUTH-SYNC] Sync request failed: "));
-    Serial.println(fbdoAuth.errorReason());
+    Serial.println(fbdo.errorReason());
     Serial.println(F("[AUTH-SYNC] Retaining existing local NVS cache."));
-  }
-
-  if (authMutex != NULL) {
-    xSemaphoreGive(authMutex);
   }
 
   return syncSuccess;
 }
 
-// Live Student Verification: Online Firestore query with offline NVS Flash cache fallback
+// Student Verification: Read student name directly from the NVS namespace "students" populated during boot sync
 bool verifyStudentWithCache(const char* uid, char* outName, size_t maxLen) {
   if (uid == nullptr || uid[0] == '\0') {
     return false;
@@ -999,89 +990,17 @@ bool verifyStudentWithCache(const char* uid, char* outName, size_t maxLen) {
   uidStr.toUpperCase();
   const char* cleanUID = uidStr.c_str();
 
-  // 1. Online Path: Wi-Fi connected & Firebase.ready()
-  if (WiFi.status() == WL_CONNECTED && Firebase.ready()) {
-    bool acquiredMutex = (authMutex == NULL) || (xSemaphoreTake(authMutex, pdMS_TO_TICKS(1500)) == pdTRUE);
-    if (acquiredMutex) {
-      Serial.print(F("[AUTH-ONLINE] Querying Firestore for student UID ["));
-      Serial.print(cleanUID);
-      Serial.println(F("]..."));
-
-      String docPath = String(FIRESTORE_STUDENTS_COLLECTION) + "/" + cleanUID;
-      bool reqSuccess = Firebase.Firestore.getDocument(&fbdoAuth, FIREBASE_PROJECT_ID, "", docPath.c_str());
-      int httpCode = fbdoAuth.httpCode();
-
-      if (reqSuccess && httpCode == 200) {
-        FirebaseJson docJson;
-        docJson.setJsonData(fbdoAuth.payload());
-        FirebaseJsonData nameData, activeData;
-        docJson.get(nameData, "fields/name/stringValue");
-        docJson.get(activeData, "fields/active/booleanValue");
-
-        bool isActive = false;
-        if (activeData.success) {
-          isActive = (activeData.boolValue || activeData.stringValue == "true");
-        }
-
-        if (isActive && nameData.success && nameData.stringValue.length() > 0) {
-          strncpy(outName, nameData.stringValue.c_str(), maxLen - 1);
-          outName[maxLen - 1] = '\0';
-
-          // Update/cache the key-value pair in NVS flash
-          studentPrefs.putString(cleanUID, outName);
-
-          Serial.print(F("[AUTH-ONLINE] Verified student: \""));
-          Serial.print(outName);
-          Serial.print(F("\" [UID: "));
-          Serial.print(cleanUID);
-          Serial.println(F("] (Updated NVS Cache)"));
-
-          if (authMutex != NULL) xSemaphoreGive(authMutex);
-          return true;
-        } else {
-          // Document exists but active == false: remove from NVS and deny access
-          studentPrefs.remove(cleanUID);
-          Serial.print(F("[AUTH-ONLINE] Student UID ["));
-          Serial.print(cleanUID);
-          Serial.println(F("] is marked INACTIVE in Firestore! Removed from NVS. Access Denied."));
-
-          if (authMutex != NULL) xSemaphoreGive(authMutex);
-          return false;
-        }
-      } else if (httpCode == 404) {
-        // Document deleted by admin (HTTP 404): remove from NVS and deny access
-        studentPrefs.remove(cleanUID);
-        Serial.print(F("[AUTH-ONLINE] Student UID ["));
-        Serial.print(cleanUID);
-        Serial.println(F("] NOT FOUND in Firestore (HTTP 404)! Removed from NVS. Access Denied."));
-
-        if (authMutex != NULL) xSemaphoreGive(authMutex);
-        return false;
-      } else {
-        // Network timeout or server error (e.g. 500, -1): drop down to offline fallback
-        Serial.print(F("[AUTH] Firestore getDocument failed (HTTP "));
-        Serial.print(httpCode);
-        Serial.print(F(", Reason: "));
-        Serial.print(fbdoAuth.errorReason());
-        Serial.println(F("). Falling back to offline NVS cache..."));
-      }
-
-      if (authMutex != NULL) xSemaphoreGive(authMutex);
-    } else {
-      Serial.println(F("[AUTH] Auth socket busy, falling back to offline NVS cache..."));
-    }
-  } else {
-    Serial.println(F("[AUTH] Wi-Fi or Firebase offline. Using offline NVS flash cache..."));
-  }
-
-  // 2. Offline Fallback (Wi-Fi disconnected or request error)
+  // Avoid executing conflicting network requests on Core 1 while Core 0 runs background logging.
+  // Read student name directly from NVS namespace "students" populated during boot sync.
   if (studentPrefs.isKey(cleanUID)) {
     String cachedName = studentPrefs.getString(cleanUID, "");
     if (cachedName.length() > 0) {
-      strncpy(outName, cachedName.c_str(), maxLen - 1);
-      outName[maxLen - 1] = '\0';
-      Serial.print(F("[AUTH-OFFLINE] Verified student from NVS Flash Cache: \""));
-      Serial.print(outName);
+      if (outName != nullptr && maxLen > 0) {
+        strncpy(outName, cachedName.c_str(), maxLen - 1);
+        outName[maxLen - 1] = '\0';
+      }
+      Serial.print(F("[AUTH]     Verified student from NVS cache: \""));
+      Serial.print(outName ? outName : "");
       Serial.print(F("\" [UID: "));
       Serial.print(cleanUID);
       Serial.println(F("]"));
@@ -1089,9 +1008,9 @@ bool verifyStudentWithCache(const char* uid, char* outName, size_t maxLen) {
     }
   }
 
-  Serial.print(F("[AUTH] Student UID ["));
+  Serial.print(F("[AUTH]     Student UID ["));
   Serial.print(cleanUID);
-  Serial.println(F("] NOT recognized in Cloud or NVS Flash Cache!"));
+  Serial.println(F("] not found in local cache!"));
   return false;
 }
 
@@ -1437,9 +1356,6 @@ void setup() {
   // Initialize NVS Preferences for offline-first student roster caching
   studentPrefs.begin("students", false);
   Serial.println(F("[NVS]      Preferences namespace \"students\" initialized"));
-
-  // Create Mutex for thread-safe access to auth FirebaseData object
-  authMutex = xSemaphoreCreateMutex();
 
   // Perform full hardware diagnostics & welcome display sequence
   runHardwareDiagnostics();
