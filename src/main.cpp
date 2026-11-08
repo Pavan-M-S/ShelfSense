@@ -111,7 +111,7 @@ inline esp_err_t esp_task_wdt_init(uint32_t timeout_sec, bool panic) {
 #define LCD_ROWS            2       // 2 lines high
 
 // Session Timeout Configuration
-#define SESSION_TIMEOUT_MS  20000   // 20-second non-blocking inactivity window for book scanning
+#define SESSION_TIMEOUT_MS  18000   // 18-second non-blocking inactivity window for book scanning
 
 // Baud Rate for USB Serial Debugging
 #define SERIAL_BAUD         115200
