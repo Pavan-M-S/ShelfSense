@@ -264,9 +264,11 @@ platform = espressif32
 board = esp32dev
 framework = arduino
 monitor_speed = 115200
+board_build.partitions = huge_app.csv
 lib_deps = 
     marcoschwartz/LiquidCrystal_I2C@^1.1.4
     miguelbalboa/MFRC522@^1.4.12
+    mobizt/Firebase Arduino Client Library for ESP8266 and ESP32@^4.4.17
 ```
 
 ### CLI Commands
@@ -294,10 +296,13 @@ ShelfSense produces categorized, human-readable serial logs for observability an
 | Tag | Meaning | Example Output |
 | :--- | :--- | :--- |
 | `[BOOT]` | Startup diagnostics, heap memory, and peripheral discovery | `[BOOT] RC522 Firmware Version Register: 0x92` |
+| `[WIFI]` | Wi-Fi connection lifecycle, IP acquisition, RSSI, auto-reconnects | `[WIFI] IP Address obtained: 192.168.1.105 \| RSSI: -54 dBm` |
+| `[TIME]` | NTP time synchronization status and formatted timestamps | `[TIME] NTP synchronization started (pool.ntp.org, IST GMT+5:30)` |
 | `[RFID]` | Low-level tag detection, UID extraction, and PICC classification | `[RFID] Card Detected! UID: F10F7E05 \| Size: 4 bytes` |
 | `[AUTH]` | Student identification and credential checks | `[AUTH] Match found! Student: "Pavan" at index [0]` |
 | `[LOOKUP]` | Book catalog searches and coordinate retrieval | `[LOOKUP] Match found! Book: "..." -> Shelf 2, Rack 1` |
 | `[STATE]` | State machine transitions | `[STATE] Transition: WAITING_FOR_STUDENT -> WAITING_FOR_BOOK` |
+| `[FIREBASE]` | Asynchronous background Firestore sync payloads, HTTP codes, and results | `[FIREBASE] Document sync SUCCESS! HTTP Code: 200` |
 | `[FEEDBACK]` | Buzzer, Red LED, and Green LED hardware invocations | `[FEEDBACK] SUCCESS -> Green LED + Buzzer (1 beep @ 150 ms)` |
 | `[LCD]` | Display screen updates and scroll frame activity | `[LCD] Line 2 revealed (4 chars before end): "Shelf:2 Rack:1"` |
 | `[TIMER]` | Second-by-second countdown logs for guidance holds | `[TIMER] Hold elapsed: 4s / 8s [View: Title + Shelf & Rack]` |
