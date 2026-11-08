@@ -146,8 +146,9 @@ MFRC522 mfrc522(SS_PIN, RST_PIN);
 // LiquidCrystal_I2C instance communicating over standard I2C (SDA=21, SCL=22)
 LiquidCrystal_I2C lcd(LCD_I2C_ADDR, LCD_COLUMNS, LCD_ROWS);
 
-// Mobizt Firebase Data Objects (Single global instance across firmware)
-FirebaseData fbdo;
+// Mobizt Firebase Data Objects (Dedicated per core to eliminate mutex contention and latency)
+FirebaseData fbdo;     // Core 0: Background Firestore worker (20s roster sync, log queue, offline flush)
+FirebaseData fbdoAuth; // Core 1: Real-time student RFID card authentication
 FirebaseAuth auth;
 FirebaseConfig config;
 
@@ -159,8 +160,7 @@ Preferences offlineLogsPrefs;
 QueueHandle_t firestoreQueue = NULL;
 TaskHandle_t firestoreTaskHandle = NULL;
 
-// Multi-Core & Hardware Synchronization Mutex & Restart Flag
-SemaphoreHandle_t firebaseMutex = NULL;
+// System Restart Flag for automatic restart when cloud roster diff is detected
 volatile bool pendingRestart = false;
 
 // =========================================================================================
@@ -481,17 +481,9 @@ void flushOfflineLogsFromROM() {
     Serial.print(offEvent.docId);
     Serial.println(F("')..."));
 
-    bool success = false;
-    int httpCode = 0;
-    String errorReason = "";
-    if (firebaseMutex != NULL && xSemaphoreTake(firebaseMutex, pdMS_TO_TICKS(5000)) == pdTRUE) {
-      success = Firebase.Firestore.createDocument(&fbdo, FIREBASE_PROJECT_ID, "", FIRESTORE_COLLECTION, offEvent.docId, content.raw(), "");
-      httpCode = fbdo.httpCode();
-      if (!success || httpCode != 200) {
-        errorReason = fbdo.errorReason();
-      }
-      xSemaphoreGive(firebaseMutex);
-    }
+    bool success = Firebase.Firestore.createDocument(&fbdo, FIREBASE_PROJECT_ID, "", FIRESTORE_COLLECTION, offEvent.docId, content.raw(), "");
+    int httpCode = fbdo.httpCode();
+    String errorReason = (!success || httpCode != 200) ? fbdo.errorReason() : "";
 
     if (success && httpCode == 200) {
       Serial.print(F("[OFFLINE-ROM] Document sync SUCCESS! Doc ID: '"));
@@ -586,6 +578,9 @@ void firestoreSyncTask(void* pvParameters) {
   Firebase.reconnectNetwork(true);
   fbdo.setBSSLBufferSize(4096 /* Rx buffer */, 1024 /* Tx buffer */);
   fbdo.setResponseSize(8192);
+
+  fbdoAuth.setBSSLBufferSize(2048 /* Rx buffer */, 512 /* Tx buffer */);
+  fbdoAuth.setResponseSize(2048);
 
   Firebase.begin(&config, &auth);
   Serial.print(F("[FIREBASE] Client library initialized for: "));
@@ -696,23 +691,20 @@ void firestoreSyncTask(void* pvParameters) {
         Serial.print(F("[FIREBASE] Document JSON Payload: "));
         Serial.println(content.raw());
 
-        if (firebaseMutex != NULL && xSemaphoreTake(firebaseMutex, pdMS_TO_TICKS(5000)) == pdTRUE) {
-          if (Firebase.Firestore.createDocument(&fbdo, FIREBASE_PROJECT_ID, "", FIRESTORE_COLLECTION, event.docId, content.raw(), "")) {
-            if (fbdo.httpCode() == 200) {
-              sent = true;
-              Serial.print(F("[FIREBASE] Document sync SUCCESS! HTTP Code: "));
-              Serial.println(fbdo.httpCode());
-              Serial.print(F("[FIREBASE] Server Response: "));
-              Serial.println(fbdo.payload());
-            }
+        if (Firebase.Firestore.createDocument(&fbdo, FIREBASE_PROJECT_ID, "", FIRESTORE_COLLECTION, event.docId, content.raw(), "")) {
+          if (fbdo.httpCode() == 200) {
+            sent = true;
+            Serial.print(F("[FIREBASE] Document sync SUCCESS! HTTP Code: "));
+            Serial.println(fbdo.httpCode());
+            Serial.print(F("[FIREBASE] Server Response: "));
+            Serial.println(fbdo.payload());
           }
-          if (!sent) {
-            Serial.print(F("[FIREBASE] Document sync FAILED! HTTP Code: "));
-            Serial.print(fbdo.httpCode());
-            Serial.print(F(" | Reason: "));
-            Serial.println(fbdo.errorReason());
-          }
-          xSemaphoreGive(firebaseMutex);
+        }
+        if (!sent) {
+          Serial.print(F("[FIREBASE] Document sync FAILED! HTTP Code: "));
+          Serial.print(fbdo.httpCode());
+          Serial.print(F(" | Reason: "));
+          Serial.println(fbdo.errorReason());
         }
       } else {
         Serial.println(F("[FIREBASE] Network offline or Firebase not ready."));
@@ -1293,27 +1285,20 @@ bool compareAndSyncRoster(bool isBoot, bool &outDiffDetected) {
     }
   }
 
-  // 2. Fetch Firestore student_names collection using thread-safe mutex
-  bool getOk = false;
-  int httpCode = 0;
+  // 2. Fetch Firestore student_names collection on Core 0
+  Serial.println(F("[AUTH-SYNC] Sending GET collection request to Firestore..."));
+  bool getOk = Firebase.Firestore.getDocuments(&fbdo, FIREBASE_PROJECT_ID, "(default)", FIRESTORE_STUDENTS);
+  int httpCode = fbdo.httpCode();
   String payload = "";
   String errorReason = "";
 
-  if (firebaseMutex != NULL && xSemaphoreTake(firebaseMutex, pdMS_TO_TICKS(6000)) == pdTRUE) {
-    getOk = Firebase.Firestore.getDocuments(&fbdo, FIREBASE_PROJECT_ID, "(default)", FIRESTORE_STUDENTS);
-    httpCode = fbdo.httpCode();
-    if (getOk && httpCode == 200) {
-      payload = fbdo.payload();
-    } else {
-      errorReason = fbdo.errorReason();
-    }
-    xSemaphoreGive(firebaseMutex);
+  if (getOk && httpCode == 200) {
+    payload = fbdo.payload();
+    Serial.print(F("[AUTH-SYNC] Received collection response (HTTP 200). Size: "));
+    Serial.print(payload.length());
+    Serial.println(F(" bytes. Comparing with ROM cache..."));
   } else {
-    Serial.println(F("[AUTH-SYNC] Mutex acquisition timed out while attempting to fetch Firestore roster."));
-    return false;
-  }
-
-  if (!getOk || httpCode != 200) {
+    errorReason = fbdo.errorReason();
     Serial.print(F("[AUTH-SYNC] Failed to fetch documents from Firestore. HTTP: "));
     Serial.print(httpCode);
     Serial.print(F(" | Error: "));
@@ -1491,62 +1476,57 @@ bool verifyStudentDual(const char* uid, char* outName, size_t maxLen, StudentAut
   bool isReady = Firebase.ready();
 
   if (isConnected && isReady) {
-    if (firebaseMutex != NULL && xSemaphoreTake(firebaseMutex, pdMS_TO_TICKS(4000)) == pdTRUE) {
-      String docPath = String(FIRESTORE_STUDENTS) + "/" + cleanUID;
-      Serial.print(F("[AUTH] Querying Firestore for student UID ["));
-      Serial.print(cleanUID);
-      Serial.println(F("]..."));
+    String docPath = String(FIRESTORE_STUDENTS) + "/" + cleanUID;
+    Serial.print(F("[AUTH] Live Firestore query for student UID ["));
+    Serial.print(cleanUID);
+    Serial.println(F("]..."));
 
-      bool getOk = Firebase.Firestore.getDocument(&fbdo, FIREBASE_PROJECT_ID, "(default)", docPath.c_str());
-      int httpCode = fbdo.httpCode();
-      String payload = "";
-      String errorReason = "";
-      if (getOk && httpCode == 200) {
-        payload = fbdo.payload();
-      } else {
-        errorReason = fbdo.errorReason();
-      }
-      xSemaphoreGive(firebaseMutex);
-
-      if (getOk && httpCode == 200) {
-        FirebaseJson json;
-        json.setJsonData(payload);
-        FirebaseJsonData nameData;
-        json.get(nameData, "fields/name/stringValue");
-
-        // Parse active status supporting booleanValue, stringValue ("true"/"false"), and integerValue (1/0)
-        cloudActive = true;
-        FirebaseJsonData bVal, sVal, iVal;
-        if (json.get(bVal, "fields/active/booleanValue") && bVal.success) {
-          cloudActive = bVal.boolValue;
-        } else if (json.get(sVal, "fields/active/stringValue") && sVal.success) {
-          String s = sVal.stringValue;
-          s.trim();
-          s.toLowerCase();
-          cloudActive = (s == "true" || s == "1");
-        } else if (json.get(iVal, "fields/active/integerValue") && iVal.success) {
-          cloudActive = (iVal.intValue != 0);
-        }
-
-        cloudName = nameData.success ? nameData.stringValue : "";
-        cloudName.trim();
-
-        if (cloudName.length() > 0) {
-          cloudChecked = true;
-          inCloud = true;
-        }
-      } else if (httpCode == 404) {
-        cloudChecked = true;
-        inCloud = false;
-      } else {
-        Serial.print(F("[AUTH] Firestore getDocument returned HTTP "));
-        Serial.print(httpCode);
-        Serial.print(F(" | Error: "));
-        Serial.print(errorReason);
-        Serial.println(F(". Falling back to ROM cache."));
-      }
+    bool getOk = Firebase.Firestore.getDocument(&fbdoAuth, FIREBASE_PROJECT_ID, "(default)", docPath.c_str());
+    int httpCode = fbdoAuth.httpCode();
+    String payload = "";
+    String errorReason = "";
+    if (getOk && httpCode == 200) {
+      payload = fbdoAuth.payload();
     } else {
-      Serial.println(F("[AUTH] Firebase mutex busy. Falling back to ROM cache."));
+      errorReason = fbdoAuth.errorReason();
+    }
+
+    if (getOk && httpCode == 200) {
+      FirebaseJson json;
+      json.setJsonData(payload);
+      FirebaseJsonData nameData;
+      json.get(nameData, "fields/name/stringValue");
+
+      // Parse active status supporting booleanValue, stringValue ("true"/"false"), and integerValue (1/0)
+      cloudActive = true;
+      FirebaseJsonData bVal, sVal, iVal;
+      if (json.get(bVal, "fields/active/booleanValue") && bVal.success) {
+        cloudActive = bVal.boolValue;
+      } else if (json.get(sVal, "fields/active/stringValue") && sVal.success) {
+        String s = sVal.stringValue;
+        s.trim();
+        s.toLowerCase();
+        cloudActive = (s == "true" || s == "1");
+      } else if (json.get(iVal, "fields/active/integerValue") && iVal.success) {
+        cloudActive = (iVal.intValue != 0);
+      }
+
+      cloudName = nameData.success ? nameData.stringValue : "";
+      cloudName.trim();
+
+      if (cloudName.length() > 0) {
+        cloudChecked = true;
+        inCloud = true;
+      }
+    } else if (httpCode == 404) {
+      cloudChecked = true;
+      inCloud = false;
+    } else {
+      Serial.print(F("[AUTH] Firestore getDocument returned HTTP "));
+      Serial.print(httpCode);
+      Serial.print(F(" | Error: "));
+      Serial.print(errorReason);
+      Serial.println(F(". Falling back to ROM cache."));
     }
   } else {
     Serial.print(F("[AUTH] Live check skipped (WiFi: "));
@@ -2031,9 +2011,6 @@ void setup() {
   studentPrefs.begin("students", false);
   offlineLogsPrefs.begin("off_logs", false);
   Serial.println(F("[NVS]      Preferences namespaces \"students\" & \"off_logs\" initialized"));
-
-  // Initialize FreeRTOS mutex for safe multi-core Firebase access
-  firebaseMutex = xSemaphoreCreateMutex();
 
   // Create FreeRTOS Queue for non-blocking Firestore document synchronization (up to 10 events)
   firestoreQueue = xQueueCreate(10, sizeof(FirestoreLogEvent));
