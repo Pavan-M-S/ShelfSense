@@ -1462,11 +1462,18 @@ bool compareAndSyncRoster(bool isBoot, bool &outDiffDetected) {
         docJson.get(resNameData, "name");
         docJson.get(nameData, "fields/name/stringValue");
 
-        // Parse active status supporting booleanValue, stringValue ("true"/"false"), and integerValue (1/0)
+        // Parse active status supporting booleanValue, stringValue ("true"/"false"), integerValue (1/0), and raw active object
         bool isActive = true;
-        FirebaseJsonData bVal, sVal, iVal;
+        FirebaseJsonData bVal, sVal, iVal, rawActive;
         if (docJson.get(bVal, "fields/active/booleanValue") && bVal.success) {
-          isActive = bVal.boolValue;
+          String bStr = bVal.stringValue;
+          bStr.trim();
+          bStr.toLowerCase();
+          if (bStr == "false" || bStr == "0") {
+            isActive = false;
+          } else {
+            isActive = bVal.boolValue;
+          }
         } else if (docJson.get(sVal, "fields/active/stringValue") && sVal.success) {
           String s = sVal.stringValue;
           s.trim();
@@ -1474,6 +1481,13 @@ bool compareAndSyncRoster(bool isBoot, bool &outDiffDetected) {
           isActive = (s == "true" || s == "1");
         } else if (docJson.get(iVal, "fields/active/integerValue") && iVal.success) {
           isActive = (iVal.intValue != 0);
+        } else if (docJson.get(rawActive, "fields/active") && rawActive.success) {
+          String raw = rawActive.stringValue;
+          raw.trim();
+          raw.toLowerCase();
+          if (raw == "false" || raw == "0" || raw.indexOf("false") >= 0) {
+            isActive = false;
+          }
         }
 
         if (resNameData.success && nameData.success) {
