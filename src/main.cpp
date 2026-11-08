@@ -89,8 +89,8 @@
 #define SERIAL_BAUD         115200
 
 // Wi-Fi Configuration
-#define WIFI_SSID           "Wokwi-GUEST"   // Replace with your local Wi-Fi SSID
-#define WIFI_PASSWORD       ""              // Replace with your Wi-Fi password
+#define WIFI_SSID           "narzo 50A"   // Replace with your local Wi-Fi SSID
+#define WIFI_PASSWORD       "MSPP9347"              // Replace with your Wi-Fi password
 
 // Firebase & Google Cloud Firestore Configuration
 #define FIREBASE_PROJECT_ID    "shelf-sense-f86ba"
