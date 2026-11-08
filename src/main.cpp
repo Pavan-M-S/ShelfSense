@@ -157,6 +157,7 @@ SystemState currentState = WAITING_FOR_STUDENT;
 
 // Session timer tracking (inactivity detection in WAITING_FOR_BOOK)
 unsigned long sessionStartTime = 0;
+unsigned long lastSessionSecondLogged = 0;
 
 // Authenticated student session variables
 char activeStudentName[32] = "";
@@ -744,6 +745,7 @@ void resetSystem() {
   SystemState previousState = currentState;
   currentState = WAITING_FOR_STUDENT;
   sessionStartTime = 0; // Reset session inactivity timer
+  lastSessionSecondLogged = 0;
 
   // Clear active authenticated student session credentials
   activeStudentName[0] = '\0';
@@ -945,16 +947,17 @@ void handleStudentScan(const char* uid) {
     logStateTransition(WAITING_FOR_STUDENT, WAITING_FOR_BOOK);
     currentState = WAITING_FOR_BOOK;
 
-    // Start 20-second non-blocking session timer
-    sessionStartTime = millis();
-    Serial.print(F("[INFO]     Session timer started ("));
-    Serial.print(SESSION_TIMEOUT_MS / 1000);
-    Serial.println(F("s window for book scan)"));
-
     // Display student greeting: smoothly scroll if name > 16 characters
     char studentLine[48];
     snprintf(studentLine, sizeof(studentLine), "Hi %s", student.name);
     showMessageWithScroll(studentLine, "Tap Book Tag...", 260, 2500);
+
+    // Start 20-second non-blocking session timer after greeting display
+    sessionStartTime = millis();
+    lastSessionSecondLogged = 0;
+    Serial.print(F("[INFO]     Session timer started ("));
+    Serial.print(SESSION_TIMEOUT_MS / 1000);
+    Serial.println(F("s window for book scan)"));
 
     Serial.println(F("[INFO]     Ready for book tag. Waiting for book scan..."));
     return;
@@ -1010,6 +1013,7 @@ void handleBookScan(const char* uid) {
 
     // Stop session timer
     sessionStartTime = 0;
+    lastSessionSecondLogged = 0;
 
     // Silent Background Cloud Sync: Dispatch ONE COMBINED document to Firestore (both login and processed data)
     char note[96];
@@ -1040,6 +1044,7 @@ void handleBookScan(const char* uid) {
 
     // Renew session timer (+20s)
     sessionStartTime = millis();
+    lastSessionSecondLogged = 0;
     Serial.println(F("[INFO]     Session timer renewed (+20s). Ready for book tag retry..."));
     showMessage("Tap Your Book...");
     return;
@@ -1060,6 +1065,7 @@ void handleBookScan(const char* uid) {
 
   // Renew session timer (+20s) and restore book prompt
   sessionStartTime = millis();
+  lastSessionSecondLogged = 0;
   Serial.println(F("[INFO]     Session timer renewed (+20s). Ready for book tag retry..."));
   showMessage("Tap Your Book...");
 }
@@ -1259,33 +1265,48 @@ void setup() {
 
 void loop() {
   // Non-blocking inactivity detection in WAITING_FOR_BOOK (20-second timeout)
-  if (currentState == WAITING_FOR_BOOK && (millis() - sessionStartTime >= SESSION_TIMEOUT_MS)) {
-    Serial.print(F("[WARN]     Session timed out: No book scan received within "));
-    Serial.print(SESSION_TIMEOUT_MS / 1000);
-    Serial.println(F(" seconds."));
+  if (currentState == WAITING_FOR_BOOK) {
+    unsigned long elapsedMs = millis() - sessionStartTime;
+    unsigned long elapsedSec = elapsedMs / 1000;
 
-    // Silent Background Cloud Sync: Dispatch SESSION_TIMEOUT document to Firestore
-    queueFirestoreLog("SESSION_TIMEOUT", activeStudentName, activeStudentUID, activeLoginTime, "", "", 0, 0, "Session expired after 20 seconds of inactivity");
-
-    // Auditory and visual timeout notification on LCD and status peripherals
-    showMessage("Session Expired ", "Please Try Again");
-
-    // 2 warning beeps on the buzzer and Red LED flashes
-    for (int i = 0; i < 2; i++) {
-      digitalWrite(RED_LED_PIN, HIGH);
-      digitalWrite(BUZZER_PIN, HIGH);
-      delay(150);
-      digitalWrite(RED_LED_PIN, LOW);
-      digitalWrite(BUZZER_PIN, LOW);
-      if (i < 1) {
-        delay(150);
-      }
+    // Log second-by-second countdown in Serial Monitor while waiting for book scan
+    if (elapsedSec > lastSessionSecondLogged && elapsedSec <= (SESSION_TIMEOUT_MS / 1000)) {
+      lastSessionSecondLogged = elapsedSec;
+      Serial.print(F("[TIMER]    Waiting for book scan: Second "));
+      Serial.print(elapsedSec);
+      Serial.print(F(" of "));
+      Serial.print(SESSION_TIMEOUT_MS / 1000);
+      Serial.println(F("s"));
     }
-    delay(1000); // Brief pause so student can read notification
 
-    // Revert to WAITING_FOR_STUDENT, clear active session, and restore standby display
-    resetSystem();
-    return;
+    if (elapsedMs >= SESSION_TIMEOUT_MS) {
+      Serial.print(F("[WARN]     Session timed out: No book scan received within "));
+      Serial.print(SESSION_TIMEOUT_MS / 1000);
+      Serial.println(F(" seconds."));
+
+      // Silent Background Cloud Sync: Dispatch SESSION_TIMEOUT document to Firestore
+      queueFirestoreLog("SESSION_TIMEOUT", activeStudentName, activeStudentUID, activeLoginTime, "", "", 0, 0, "Session expired after 20 seconds of inactivity");
+
+      // Auditory and visual timeout notification on LCD and status peripherals
+      showMessage("Session Expired ", "Please Try Again");
+
+      // 2 warning beeps on the buzzer and Red LED flashes
+      for (int i = 0; i < 2; i++) {
+        digitalWrite(RED_LED_PIN, HIGH);
+        digitalWrite(BUZZER_PIN, HIGH);
+        delay(150);
+        digitalWrite(RED_LED_PIN, LOW);
+        digitalWrite(BUZZER_PIN, LOW);
+        if (i < 1) {
+          delay(150);
+        }
+      }
+      delay(1000); // Brief pause so student can read notification
+
+      // Revert to WAITING_FOR_STUDENT, clear active session, and restore standby display
+      resetSystem();
+      return;
+    }
   }
 
   // Check if a new RFID card is present on the reader
