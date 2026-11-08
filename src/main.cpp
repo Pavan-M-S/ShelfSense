@@ -63,6 +63,8 @@
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 #include <freertos/queue.h>
+#include <freertos/semphr.h>
+#include <Preferences.h>
 #include <esp_task_wdt.h>
 #include <esp_idf_version.h>
 
@@ -80,6 +82,11 @@ inline esp_err_t esp_task_wdt_init(uint32_t timeout_sec, bool panic) {
   }
   return err;
 }
+#endif
+
+// Compatibility alias for Mobizt Firebase library Firestore collection listing
+#ifndef getDocuments
+#define getDocuments listDocuments
 #endif
 
 // =========================================================================================
@@ -111,11 +118,12 @@ inline esp_err_t esp_task_wdt_init(uint32_t timeout_sec, bool panic) {
 #define WIFI_PASSWORD       "MSPP9347"              // Replace with your Wi-Fi password
 
 // Firebase & Google Cloud Firestore Configuration
-#define FIREBASE_PROJECT_ID    "shelf-sense-f86ba"
-#define FIREBASE_API_KEY       "AIzaSyDHboFG0dyoMTLCH0bkZ85OkWk2yxBXVRQ"
-#define FIREBASE_USER_EMAIL    "esp32@shelfsense.local"
-#define FIREBASE_USER_PASSWORD "ShelfSense@2026"
-#define FIRESTORE_COLLECTION   "library_logs"
+#define FIREBASE_PROJECT_ID           "shelf-sense-f86ba"
+#define FIREBASE_API_KEY              "AIzaSyDHboFG0dyoMTLCH0bkZ85OkWk2yxBXVRQ"
+#define FIREBASE_USER_EMAIL           "esp32@shelfsense.local"
+#define FIREBASE_USER_PASSWORD        "ShelfSense@2026"
+#define FIRESTORE_COLLECTION          "library_logs"
+#define FIRESTORE_STUDENTS_COLLECTION "student_names"
 
 // NTP Time Synchronization Configuration (IST: UTC + 5:30 = 19800 seconds)
 #define NTP_SERVER_1        "pool.ntp.org"
@@ -134,13 +142,18 @@ MFRC522 mfrc522(SS_PIN, RST_PIN);
 LiquidCrystal_I2C lcd(LCD_I2C_ADDR, LCD_COLUMNS, LCD_ROWS);
 
 // Mobizt Firebase Data Objects
-FirebaseData fbdo;
+FirebaseData fbdo;     // Dedicated to background transaction logging (Core 0)
+FirebaseData fbdoAuth; // Dedicated to live student verification & boot sync (Core 1)
 FirebaseAuth auth;
 FirebaseConfig config;
 
-// FreeRTOS Queue & Task handles for non-blocking background Firestore sync
+// ESP32 Non-Volatile Storage (Preferences) for offline-first student roster caching
+Preferences studentPrefs;
+
+// FreeRTOS Queue, Task & Mutex handles
 QueueHandle_t firestoreQueue = NULL;
 TaskHandle_t firestoreTaskHandle = NULL;
+SemaphoreHandle_t authMutex = NULL;
 
 // =========================================================================================
 // SECTION 3: SYSTEM STATES & IN-MEMORY DATABASES
@@ -164,12 +177,6 @@ char activeStudentName[32] = "";
 char activeStudentUID[32]  = "";
 char activeLoginTime[25]   = "";
 
-// Structure modeling a registered student
-struct Student {
-  const char* name;     // Student's full name (e.g. "Pavan")
-  const char* uid;      // RFID tag UID in uppercase HEX without spaces (e.g. "37E09604")
-};
-
 // Structure modeling a registered library book
 struct Book {
   const char* title;    // Book title
@@ -181,7 +188,7 @@ struct Book {
 // Structure modeling a Firestore log event for background asynchronous queueing
 struct FirestoreLogEvent {
   char docId[32];       // Formatted Document ID without spaces or colons: "YYYY-MM-DD_HHMMSS"
-  char eventType[20];   // BOOK_PROCESSED, SESSION_TIMEOUT, SECURITY_ALERT
+  char eventType[20];   // BOOK_PROCESSED, SESSION_TIMEOUT, SECURITY_ALERT, STUDENT_LOGIN
   char studentName[32]; // Authenticated student name
   char studentUID[32];  // Authenticated student UID
   char loginTime[25];   // Login timestamp "YYYY-MM-DD HH:MM:SS"
@@ -194,16 +201,10 @@ struct FirestoreLogEvent {
 };
 
 // -----------------------------------------------------------------------------------------
-// DATABASE ENTRIES: Students & Books
+// DATABASE ENTRIES: Registered Library Books
+// Note: Student roster is dynamically loaded via Offline-First Cloud Cache Architecture
+// (Firestore collection 'student_names' synchronized to ESP32 NVS namespace "students")
 // -----------------------------------------------------------------------------------------
-
-// List of authorized students: { "Student Name", "RFID UID" }
-const Student registeredStudents[] = {
-  { "Pavan",   "37E09604"       },
-  { "Rehan",   "A97AF8B2"       },
-  { "DVS",     "0203448B258000" },
-  { "Pruthvi", "C94B8554"       }
-};
 
 // Database of registered books: { "Book Title", "RFID UID", Shelf Number, Rack Number }
 const Book registeredBooks[] = {
@@ -211,9 +212,8 @@ const Book registeredBooks[] = {
   { "Harry Potter",                                          "8DC0FA6B", 4, 3 }  // Shelf 4, Rack 3
 };
 
-// Constants for database sizing
-const size_t NUM_STUDENTS = sizeof(registeredStudents) / sizeof(registeredStudents[0]);
-const size_t NUM_BOOKS    = sizeof(registeredBooks) / sizeof(registeredBooks[0]);
+// Constant for book database sizing
+const size_t NUM_BOOKS = sizeof(registeredBooks) / sizeof(registeredBooks[0]);
 
 // =========================================================================================
 // SECTION 4: SERIAL LOGGING & DIAGNOSTIC HELPERS
@@ -361,6 +361,10 @@ void queueFirestoreLog(const char* eventType,
   }
 }
 
+// Forward declarations for offline-first student roster caching
+bool syncStudentsFromCloud();
+bool verifyStudentWithCache(const char* uid, char* outName, size_t maxLen);
+
 // FreeRTOS Background Task running on Core 0 to handle Wi-Fi & Firestore synchronization
 void firestoreSyncTask(void* pvParameters) {
   Serial.println(F("[FIREBASE] Background Firestore sync worker task started on Core 0"));
@@ -378,12 +382,15 @@ void firestoreSyncTask(void* pvParameters) {
   Firebase.reconnectNetwork(true);
   fbdo.setBSSLBufferSize(4096 /* Rx buffer */, 1024 /* Tx buffer */);
   fbdo.setResponseSize(2048);
+  fbdoAuth.setBSSLBufferSize(4096 /* Rx buffer */, 1024 /* Tx buffer */);
+  fbdoAuth.setResponseSize(8192);
 
   Firebase.begin(&config, &auth);
   Serial.print(F("[FIREBASE] Client library initialized for: "));
   Serial.println(FIREBASE_USER_EMAIL);
 
   FirestoreLogEvent event;
+  bool initialSyncDone = false;
 
   // Infinite processing loop on Core 0
   for (;;) {
@@ -397,6 +404,11 @@ void firestoreSyncTask(void* pvParameters) {
     if (!Firebase.ready()) {
       vTaskDelay(pdMS_TO_TICKS(100));
       continue;
+    }
+
+    // Boot-Time Roster Synchronization (executed once Wi-Fi connects and Firebase.ready() is verified)
+    if (!initialSyncDone) {
+      initialSyncDone = syncStudentsFromCloud();
     }
 
     // 3. Dequeue and process incoming log events (waiting up to 100ms)
@@ -866,25 +878,221 @@ void readCardUID(char* outBuffer, size_t maxLen) {
   mfrc522.PICC_HaltA();
 }
 
-// Searches registered students for UID. Returns index if found, -1 if not found
-int findStudentIndex(const char* uid) {
-  Serial.print(F("[AUTH]     Checking student database for UID ["));
-  Serial.print(uid);
-  Serial.println(F("]..."));
+// =========================================================================================
+// SECTION 8: OFFLINE-FIRST ROSTER SYNC & VERIFICATION (FIRESTORE & NVS FLASH)
+// =========================================================================================
 
-  for (size_t i = 0; i < NUM_STUDENTS; i++) {
-    if (strcmp(registeredStudents[i].uid, uid) == 0) {
-      Serial.print(F("[AUTH]     Match found! Student: \""));
-      Serial.print(registeredStudents[i].name);
-      Serial.print(F("\" at index ["));
-      Serial.print(i);
+// Boot-Time Roster Synchronization: Fetches all active students from Firestore and caches in NVS
+bool syncStudentsFromCloud() {
+  Serial.println(F("[AUTH-SYNC] Starting boot-time student roster synchronization from Firestore..."));
+
+  if (WiFi.status() != WL_CONNECTED || !Firebase.ready()) {
+    Serial.println(F("[AUTH-SYNC] Wi-Fi or Firebase offline! Aborting sync; retaining existing local NVS cache."));
+    return false;
+  }
+
+  if (authMutex != NULL && xSemaphoreTake(authMutex, pdMS_TO_TICKS(5000)) != pdTRUE) {
+    Serial.println(F("[AUTH-SYNC] Auth mutex busy! Aborting sync; retaining existing local NVS cache."));
+    return false;
+  }
+
+  bool syncSuccess = false;
+  Serial.print(F("[AUTH-SYNC] Fetching collection '"));
+  Serial.print(FIRESTORE_STUDENTS_COLLECTION);
+  Serial.println(F("'..."));
+
+  // Fetch all documents from student_names collection (up to 100 entries)
+  if (Firebase.Firestore.getDocuments(&fbdoAuth, FIREBASE_PROJECT_ID, "", FIRESTORE_STUDENTS_COLLECTION, 100, "", "", "", false)) {
+    int httpCode = fbdoAuth.httpCode();
+    if (httpCode == 200) {
+      FirebaseJson json;
+      json.setJsonData(fbdoAuth.payload());
+
+      FirebaseJsonData docsData;
+      json.get(docsData, "documents");
+
+      if (docsData.success && docsData.type == "array") {
+        FirebaseJsonArray arr;
+        docsData.getArray(arr);
+        size_t numDocs = arr.size();
+
+        // Clear local NVS "students" namespace before populating fresh cloud roster
+        studentPrefs.clear();
+        size_t activeCount = 0;
+
+        for (size_t i = 0; i < numDocs; i++) {
+          FirebaseJsonData itemData;
+          arr.get(itemData, i);
+          if (itemData.success) {
+            FirebaseJson docJson;
+            itemData.getJSON(docJson);
+
+            FirebaseJsonData resNameData, nameData, activeData;
+            docJson.get(resNameData, "name");
+            docJson.get(nameData, "fields/name/stringValue");
+            docJson.get(activeData, "fields/active/booleanValue");
+
+            bool isActive = false;
+            if (activeData.success) {
+              isActive = (activeData.boolValue || activeData.stringValue == "true");
+            }
+
+            if (isActive && resNameData.success && nameData.success) {
+              // Extract document ID (the RFID UID) from resource path (everything after last '/')
+              String fullPath = resNameData.stringValue;
+              int lastSlash = fullPath.lastIndexOf('/');
+              String uid = (lastSlash >= 0) ? fullPath.substring(lastSlash + 1) : fullPath;
+              uid.trim();
+              uid.toUpperCase();
+
+              String studentName = nameData.stringValue;
+              studentName.trim();
+
+              if (uid.length() > 0 && studentName.length() > 0) {
+                studentPrefs.putString(uid.c_str(), studentName.c_str());
+                activeCount++;
+                Serial.print(F("[AUTH-SYNC] Cached student: \""));
+                Serial.print(studentName);
+                Serial.print(F("\" [UID: "));
+                Serial.print(uid);
+                Serial.println(F("]"));
+              }
+            }
+          }
+        }
+        Serial.print(F("[AUTH-SYNC] Sync SUCCESS! Total active students cached in NVS: "));
+        Serial.println(activeCount);
+        syncSuccess = true;
+      } else {
+        // Collection returned empty or no documents array
+        studentPrefs.clear();
+        Serial.println(F("[AUTH-SYNC] Collection 'student_names' is empty. Local NVS cache cleared."));
+        syncSuccess = true;
+      }
+    } else {
+      Serial.print(F("[AUTH-SYNC] Sync request failed! HTTP Code: "));
+      Serial.print(httpCode);
+      Serial.println(F(". Retaining existing local NVS cache."));
+    }
+  } else {
+    Serial.print(F("[AUTH-SYNC] Sync request failed: "));
+    Serial.println(fbdoAuth.errorReason());
+    Serial.println(F("[AUTH-SYNC] Retaining existing local NVS cache."));
+  }
+
+  if (authMutex != NULL) {
+    xSemaphoreGive(authMutex);
+  }
+
+  return syncSuccess;
+}
+
+// Live Student Verification: Online Firestore query with offline NVS Flash cache fallback
+bool verifyStudentWithCache(const char* uid, char* outName, size_t maxLen) {
+  if (uid == nullptr || uid[0] == '\0') {
+    return false;
+  }
+
+  // Ensure UID is formatted as uppercase hex
+  String uidStr = String(uid);
+  uidStr.trim();
+  uidStr.toUpperCase();
+  const char* cleanUID = uidStr.c_str();
+
+  // 1. Online Path: Wi-Fi connected & Firebase.ready()
+  if (WiFi.status() == WL_CONNECTED && Firebase.ready()) {
+    bool acquiredMutex = (authMutex == NULL) || (xSemaphoreTake(authMutex, pdMS_TO_TICKS(1500)) == pdTRUE);
+    if (acquiredMutex) {
+      Serial.print(F("[AUTH-ONLINE] Querying Firestore for student UID ["));
+      Serial.print(cleanUID);
+      Serial.println(F("]..."));
+
+      String docPath = String(FIRESTORE_STUDENTS_COLLECTION) + "/" + cleanUID;
+      bool reqSuccess = Firebase.Firestore.getDocument(&fbdoAuth, FIREBASE_PROJECT_ID, "", docPath.c_str());
+      int httpCode = fbdoAuth.httpCode();
+
+      if (reqSuccess && httpCode == 200) {
+        FirebaseJson docJson;
+        docJson.setJsonData(fbdoAuth.payload());
+        FirebaseJsonData nameData, activeData;
+        docJson.get(nameData, "fields/name/stringValue");
+        docJson.get(activeData, "fields/active/booleanValue");
+
+        bool isActive = false;
+        if (activeData.success) {
+          isActive = (activeData.boolValue || activeData.stringValue == "true");
+        }
+
+        if (isActive && nameData.success && nameData.stringValue.length() > 0) {
+          strncpy(outName, nameData.stringValue.c_str(), maxLen - 1);
+          outName[maxLen - 1] = '\0';
+
+          // Update/cache the key-value pair in NVS flash
+          studentPrefs.putString(cleanUID, outName);
+
+          Serial.print(F("[AUTH-ONLINE] Verified student: \""));
+          Serial.print(outName);
+          Serial.print(F("\" [UID: "));
+          Serial.print(cleanUID);
+          Serial.println(F("] (Updated NVS Cache)"));
+
+          if (authMutex != NULL) xSemaphoreGive(authMutex);
+          return true;
+        } else {
+          // Document exists but active == false: remove from NVS and deny access
+          studentPrefs.remove(cleanUID);
+          Serial.print(F("[AUTH-ONLINE] Student UID ["));
+          Serial.print(cleanUID);
+          Serial.println(F("] is marked INACTIVE in Firestore! Removed from NVS. Access Denied."));
+
+          if (authMutex != NULL) xSemaphoreGive(authMutex);
+          return false;
+        }
+      } else if (httpCode == 404) {
+        // Document deleted by admin (HTTP 404): remove from NVS and deny access
+        studentPrefs.remove(cleanUID);
+        Serial.print(F("[AUTH-ONLINE] Student UID ["));
+        Serial.print(cleanUID);
+        Serial.println(F("] NOT FOUND in Firestore (HTTP 404)! Removed from NVS. Access Denied."));
+
+        if (authMutex != NULL) xSemaphoreGive(authMutex);
+        return false;
+      } else {
+        // Network timeout or server error (e.g. 500, -1): drop down to offline fallback
+        Serial.print(F("[AUTH] Firestore getDocument failed (HTTP "));
+        Serial.print(httpCode);
+        Serial.print(F(", Reason: "));
+        Serial.print(fbdoAuth.errorReason());
+        Serial.println(F("). Falling back to offline NVS cache..."));
+      }
+
+      if (authMutex != NULL) xSemaphoreGive(authMutex);
+    } else {
+      Serial.println(F("[AUTH] Auth socket busy, falling back to offline NVS cache..."));
+    }
+  } else {
+    Serial.println(F("[AUTH] Wi-Fi or Firebase offline. Using offline NVS flash cache..."));
+  }
+
+  // 2. Offline Fallback (Wi-Fi disconnected or request error)
+  if (studentPrefs.isKey(cleanUID)) {
+    String cachedName = studentPrefs.getString(cleanUID, "");
+    if (cachedName.length() > 0) {
+      strncpy(outName, cachedName.c_str(), maxLen - 1);
+      outName[maxLen - 1] = '\0';
+      Serial.print(F("[AUTH-OFFLINE] Verified student from NVS Flash Cache: \""));
+      Serial.print(outName);
+      Serial.print(F("\" [UID: "));
+      Serial.print(cleanUID);
       Serial.println(F("]"));
-      return (int)i;
+      return true;
     }
   }
 
-  Serial.println(F("[AUTH]     No match found in student database!"));
-  return -1;
+  Serial.print(F("[AUTH] Student UID ["));
+  Serial.print(cleanUID);
+  Serial.println(F("] NOT recognized in Cloud or NVS Flash Cache!"));
+  return false;
 }
 
 // Searches registered books for UID. Returns index if found, -1 if not found
@@ -915,23 +1123,23 @@ int findBookIndex(const char* uid) {
 
 // Handles Student Check-In (State 1: WAITING_FOR_STUDENT)
 void handleStudentScan(const char* uid) {
-  int studentIdx = findStudentIndex(uid);
-  if (studentIdx != -1) {
-    // 1. Authorized Student scanned
-    const Student& student = registeredStudents[studentIdx];
+  char verifiedName[32] = "";
+
+  if (verifyStudentWithCache(uid, verifiedName, sizeof(verifiedName))) {
+    // 1. Authorized Student authenticated
     Serial.print(F("[SUCCESS]  Student authenticated: "));
-    Serial.print(student.name);
+    Serial.print(verifiedName);
     Serial.print(F(" ("));
-    Serial.print(student.uid);
+    Serial.print(uid);
     Serial.println(F(")"));
 
     // Immediate local feedback: short green LED flash + simultaneous buzzer beep
     indicateSuccess(1, 100);
 
     // Store authenticated student credentials & login time in session memory
-    strncpy(activeStudentName, student.name, sizeof(activeStudentName) - 1);
+    strncpy(activeStudentName, verifiedName, sizeof(activeStudentName) - 1);
     activeStudentName[sizeof(activeStudentName) - 1] = '\0';
-    strncpy(activeStudentUID, student.uid, sizeof(activeStudentUID) - 1);
+    strncpy(activeStudentUID, uid, sizeof(activeStudentUID) - 1);
     activeStudentUID[sizeof(activeStudentUID) - 1] = '\0';
     getCurrentTimestamp(activeLoginTime, sizeof(activeLoginTime));
 
@@ -941,7 +1149,17 @@ void handleStudentScan(const char* uid) {
     Serial.print(activeStudentUID);
     Serial.print(F(") at "));
     Serial.println(activeLoginTime);
-    Serial.println(F("[SESSION]  Login data will be combined into single Firestore document when book is processed."));
+
+    // Push STUDENT_LOGIN event to firestoreQueue (processed asynchronously in background)
+    queueFirestoreLog("STUDENT_LOGIN",
+                      activeStudentName,
+                      activeStudentUID,
+                      activeLoginTime,
+                      "",
+                      "",
+                      0,
+                      0,
+                      "Student check-in authenticated");
 
     // Transition state
     logStateTransition(WAITING_FOR_STUDENT, WAITING_FOR_BOOK);
@@ -949,7 +1167,7 @@ void handleStudentScan(const char* uid) {
 
     // Display student greeting: smoothly scroll if name > 16 characters
     char studentLine[48];
-    snprintf(studentLine, sizeof(studentLine), "Hi %s", student.name);
+    snprintf(studentLine, sizeof(studentLine), "Hi %s", activeStudentName);
     showMessageWithScroll(studentLine, "Tap Book Tag...", 260, 2500);
 
     // Start 20-second non-blocking session timer after greeting display
@@ -1037,9 +1255,11 @@ void handleBookScan(const char* uid) {
   }
 
   // 2. Student card scanned again instead of book tag
-  int studentIdx = findStudentIndex(uid);
-  if (studentIdx != -1) {
-    Serial.println(F("[WARN]     Student ID scanned again instead of a book! Prompting for book tag..."));
+  char checkName[32] = "";
+  if (verifyStudentWithCache(uid, checkName, sizeof(checkName))) {
+    Serial.print(F("[WARN]     Student ID (\""));
+    Serial.print(checkName);
+    Serial.println(F("\") scanned again instead of a book! Prompting for book tag..."));
     showError("Please Tap Book ", "Tag (Not ID)    ", "Student ID card tapped during book scan step");
 
     // Renew session timer (+20s)
@@ -1176,20 +1396,9 @@ void runHardwareDiagnostics() {
 
   logSuccess(F("Buzzer and Dual-LED hardware diagnostic test passed"));
 
-  // 4. Print In-Memory Database Summary
+  // 4. Print Database Configuration Summary
   Serial.println(F("[BOOT]     Database Configuration:"));
-  Serial.print(F("           - Registered Students: "));
-  Serial.println(NUM_STUDENTS);
-  for (size_t i = 0; i < NUM_STUDENTS; i++) {
-    Serial.print(F("             ["));
-    Serial.print(i + 1);
-    Serial.print(F("] \""));
-    Serial.print(registeredStudents[i].name);
-    Serial.print(F("\" (UID: "));
-    Serial.print(registeredStudents[i].uid);
-    Serial.println(F(")"));
-  }
-
+  Serial.println(F("           - Student Roster: Offline-First Cloud Cache (Firestore: student_names / NVS: \"students\")"));
   Serial.print(F("           - Registered Books:    "));
   Serial.println(NUM_BOOKS);
   for (size_t i = 0; i < NUM_BOOKS; i++) {
@@ -1224,6 +1433,13 @@ void setup() {
   // Initialize Task Watchdog with an extended 30-second window and disable panic reset during cryptographic operations
   esp_task_wdt_init(30, false);
   esp_task_wdt_delete(xTaskGetIdleTaskHandleForCPU(0));
+
+  // Initialize NVS Preferences for offline-first student roster caching
+  studentPrefs.begin("students", false);
+  Serial.println(F("[NVS]      Preferences namespace \"students\" initialized"));
+
+  // Create Mutex for thread-safe access to auth FirebaseData object
+  authMutex = xSemaphoreCreateMutex();
 
   // Perform full hardware diagnostics & welcome display sequence
   runHardwareDiagnostics();
