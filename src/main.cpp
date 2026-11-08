@@ -408,7 +408,17 @@ void firestoreSyncTask(void* pvParameters) {
 
     // Boot-Time Roster Synchronization (executed once Wi-Fi connects and Firebase.ready() is verified)
     if (!initialSyncDone) {
+      static int syncAttempts = 0;
       initialSyncDone = syncStudentsFromCloud();
+      if (!initialSyncDone) {
+        syncAttempts++;
+        if (syncAttempts >= 3) {
+          Serial.println(F("[AUTH-SYNC] Max initial sync attempts reached. Retaining existing local NVS cache."));
+          initialSyncDone = true; // Fallback to local NVS cache so event queue processing is not blocked
+        } else {
+          vTaskDelay(pdMS_TO_TICKS(2000));
+        }
+      }
     }
 
     // 3. Dequeue and process incoming log events (waiting up to 100ms)
@@ -1069,16 +1079,8 @@ void handleStudentScan(const char* uid) {
     Serial.print(F(") at "));
     Serial.println(activeLoginTime);
 
-    // Push STUDENT_LOGIN event to firestoreQueue (processed asynchronously in background)
-    queueFirestoreLog("STUDENT_LOGIN",
-                      activeStudentName,
-                      activeStudentUID,
-                      activeLoginTime,
-                      "",
-                      "",
-                      0,
-                      0,
-                      "Student check-in authenticated");
+    // Note: Do not sync to Firestore on student login alone.
+    // Cloud sync occurs only when book scan succeeds (BOOK_PROCESSED) or if session times out (SESSION_TIMEOUT).
 
     // Transition state
     logStateTransition(WAITING_FOR_STUDENT, WAITING_FOR_BOOK);
@@ -1089,7 +1091,7 @@ void handleStudentScan(const char* uid) {
     snprintf(studentLine, sizeof(studentLine), "Hi %s", activeStudentName);
     showMessageWithScroll(studentLine, "Tap Book Tag...", 260, 2500);
 
-    // Start 20-second non-blocking session timer after greeting display
+    // Start 18-second non-blocking session timer after greeting display
     sessionStartTime = millis();
     lastSessionSecondLogged = 0;
     Serial.print(F("[INFO]     Session timer started ("));
@@ -1181,10 +1183,10 @@ void handleBookScan(const char* uid) {
     Serial.println(F("\") scanned again instead of a book! Prompting for book tag..."));
     showError("Please Tap Book ", "Tag (Not ID)    ", "Student ID card tapped during book scan step");
 
-    // Renew session timer (+20s)
+    // Renew session timer (+18s)
     sessionStartTime = millis();
     lastSessionSecondLogged = 0;
-    Serial.println(F("[INFO]     Session timer renewed (+20s). Ready for book tag retry..."));
+    Serial.println(F("[INFO]     Session timer renewed (+18s). Ready for book tag retry..."));
     showMessage("Tap Your Book...");
     return;
   }
@@ -1202,10 +1204,10 @@ void handleBookScan(const char* uid) {
   // Emergency Alarm: 10 rapid pulses of Red LED + Buzzer across 2 seconds
   showEmergencyAlarm("Unrecognized ID ", "Unknown Book Tag", reason);
 
-  // Renew session timer (+20s) and restore book prompt
+  // Renew session timer (+18s) and restore book prompt
   sessionStartTime = millis();
   lastSessionSecondLogged = 0;
-  Serial.println(F("[INFO]     Session timer renewed (+20s). Ready for book tag retry..."));
+  Serial.println(F("[INFO]     Session timer renewed (+18s). Ready for book tag retry..."));
   showMessage("Tap Your Book...");
 }
 
@@ -1357,9 +1359,6 @@ void setup() {
   studentPrefs.begin("students", false);
   Serial.println(F("[NVS]      Preferences namespace \"students\" initialized"));
 
-  // Perform full hardware diagnostics & welcome display sequence
-  runHardwareDiagnostics();
-
   // Create FreeRTOS Queue for non-blocking Firestore document synchronization (up to 10 events)
   firestoreQueue = xQueueCreate(10, sizeof(FirestoreLogEvent));
   if (firestoreQueue == NULL) {
@@ -1369,18 +1368,19 @@ void setup() {
   // Register Wi-Fi Event Handler for diagnostic monitoring
   WiFi.onEvent(onWiFiEvent);
 
-  // Enable automatic reconnection before calling WiFi.begin()
+  // Enable automatic reconnection and start connecting to Wi-Fi immediately at boot
   Serial.print(F("[WIFI]     Connecting to network: "));
   Serial.println(WIFI_SSID);
   WiFi.mode(WIFI_STA);
   WiFi.setAutoReconnect(true);
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
 
-  // Start NTP synchronization safely in setup()
+  // Start NTP synchronization safely at boot
   configTime(GMT_OFFSET_SEC, DAYLIGHT_OFFSET_SEC, NTP_SERVER_1, NTP_SERVER_2);
   Serial.println(F("[TIME]     NTP synchronization started (pool.ntp.org, IST GMT+5:30)"));
 
-  // Increase the FreeRTOS worker task stack size from 10240 to 12288 bytes to provide adequate headroom for TLS certificates
+  // Launch background Firestore sync task immediately on Core 0 so student roster sync starts at boot
+  // concurrently with hardware diagnostics and welcome splash screens (no waiting for splash screens or ready prompt)
   xTaskCreatePinnedToCore(
     firestoreSyncTask,
     "FirestoreSyncTask",
@@ -1391,12 +1391,15 @@ void setup() {
     0
   );
 
+  // Perform full hardware diagnostics & welcome display sequence
+  runHardwareDiagnostics();
+
   // Reset system to ready state (Line 1: "Please Tap Your ", Line 2: "Student ID Card ")
   resetSystem();
 }
 
 void loop() {
-  // Non-blocking inactivity detection in WAITING_FOR_BOOK (20-second timeout)
+  // Non-blocking inactivity detection in WAITING_FOR_BOOK (18-second timeout)
   if (currentState == WAITING_FOR_BOOK) {
     unsigned long elapsedMs = millis() - sessionStartTime;
     unsigned long elapsedSec = elapsedMs / 1000;
@@ -1417,7 +1420,9 @@ void loop() {
       Serial.println(F(" seconds."));
 
       // Silent Background Cloud Sync: Dispatch SESSION_TIMEOUT document to Firestore
-      queueFirestoreLog("SESSION_TIMEOUT", activeStudentName, activeStudentUID, activeLoginTime, "", "", 0, 0, "Session expired after 20 seconds of inactivity");
+      char timeoutReason[64];
+      snprintf(timeoutReason, sizeof(timeoutReason), "Session expired after %u seconds of inactivity", (unsigned int)(SESSION_TIMEOUT_MS / 1000));
+      queueFirestoreLog("SESSION_TIMEOUT", activeStudentName, activeStudentUID, activeLoginTime, "", "", 0, 0, timeoutReason);
 
       // Auditory and visual timeout notification on LCD and status peripherals
       showMessage("Session Expired ", "Please Try Again");
