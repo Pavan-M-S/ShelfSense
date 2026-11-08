@@ -482,12 +482,18 @@ void flushOfflineLogsFromROM() {
     Serial.println(F("')..."));
 
     bool success = false;
+    int httpCode = 0;
+    String errorReason = "";
     if (firebaseMutex != NULL && xSemaphoreTake(firebaseMutex, pdMS_TO_TICKS(5000)) == pdTRUE) {
       success = Firebase.Firestore.createDocument(&fbdo, FIREBASE_PROJECT_ID, "", FIRESTORE_COLLECTION, offEvent.docId, content.raw(), "");
+      httpCode = fbdo.httpCode();
+      if (!success || httpCode != 200) {
+        errorReason = fbdo.errorReason();
+      }
       xSemaphoreGive(firebaseMutex);
     }
 
-    if (success && fbdo.httpCode() == 200) {
+    if (success && httpCode == 200) {
       Serial.print(F("[OFFLINE-ROM] Document sync SUCCESS! Doc ID: '"));
       Serial.print(offEvent.docId);
       Serial.println(F("'. Deleted from ROM."));
@@ -495,7 +501,9 @@ void flushOfflineLogsFromROM() {
       syncedCount++;
     } else {
       Serial.print(F("[OFFLINE-ROM] Document sync FAILED! HTTP: "));
-      Serial.print(fbdo.httpCode());
+      Serial.print(httpCode);
+      Serial.print(F(" | Reason: "));
+      Serial.println(errorReason);
       Serial.println(F(". Stopping flush for next retry."));
       break;
     }
@@ -530,12 +538,47 @@ void flushOfflineLogsFromROM() {
 void firestoreSyncTask(void* pvParameters) {
   Serial.println(F("[FIREBASE] Background Firestore sync worker task started on Core 0"));
 
-  // Wait for initial Wi-Fi connection
-  while (WiFi.status() != WL_CONNECTED) {
-    vTaskDelay(pdMS_TO_TICKS(100));
+  // 1. Proactive Wi-Fi connection loop
+  unsigned long startWifiWait = millis();
+  while (WiFi.status() != WL_CONNECTED || WiFi.localIP() == IPAddress(0, 0, 0, 0)) {
+    vTaskDelay(pdMS_TO_TICKS(200));
+    if (millis() - startWifiWait > 6000) {
+      Serial.println(F("[WIFI]     Still connecting to Wi-Fi... Re-issuing connect command"));
+      WiFi.disconnect();
+      WiFi.reconnect();
+      startWifiWait = millis();
+    }
   }
 
-  Serial.println(F("[FIREBASE] Wi-Fi link ready. Configuring Email/Password Authentication..."));
+  Serial.print(F("[WIFI]     Connected! IP: "));
+  Serial.print(WiFi.localIP());
+  Serial.print(F(" | RSSI: "));
+  Serial.print(WiFi.RSSI());
+  Serial.println(F(" dBm"));
+
+  // 2. Ensure NTP system clock is valid before authenticating with Google/Firebase
+  // (BearSSL requires valid system time to verify SSL certificates, otherwise auth fails)
+  Serial.println(F("[TIME]     Waiting for NTP system clock synchronization..."));
+  time_t now = time(nullptr);
+  unsigned long ntpStart = millis();
+  while (now < 1700000000 && (millis() - ntpStart < 8000)) {
+    vTaskDelay(pdMS_TO_TICKS(200));
+    now = time(nullptr);
+  }
+
+  if (now >= 1700000000) {
+    char timeStr[32];
+    struct tm timeinfo;
+    localtime_r(&now, &timeinfo);
+    strftime(timeStr, sizeof(timeStr), "%Y-%m-%d %H:%M:%S", &timeinfo);
+    Serial.print(F("[TIME]     NTP Clock synchronized successfully: "));
+    Serial.println(timeStr);
+  } else {
+    Serial.println(F("[TIME]     WARN: NTP sync timed out. Proceeding with caution."));
+  }
+
+  // 3. Configure and initialize Firebase Authentication
+  Serial.println(F("[FIREBASE] Configuring Email/Password Authentication..."));
   config.api_key = FIREBASE_API_KEY;
   auth.user.email = FIREBASE_USER_EMAIL;
   auth.user.password = FIREBASE_USER_PASSWORD;
@@ -548,38 +591,74 @@ void firestoreSyncTask(void* pvParameters) {
   Serial.print(F("[FIREBASE] Client library initialized for: "));
   Serial.println(FIREBASE_USER_EMAIL);
 
+  // 4. Wait up to 10 seconds for initial Firebase token ready state
+  Serial.println(F("[FIREBASE] Waiting for authentication token to become ready..."));
+  unsigned long authStart = millis();
+  while (!Firebase.ready() && (millis() - authStart < 10000)) {
+    vTaskDelay(pdMS_TO_TICKS(200));
+  }
+  if (Firebase.ready()) {
+    Serial.println(F("[FIREBASE] Authentication SUCCESS! Client is ready for Firestore operations."));
+  } else {
+    Serial.println(F("[FIREBASE] WARN: Firebase not ready yet after initial window. Will keep refreshing in loop."));
+  }
+
   FirestoreLogEvent event;
   bool initialSyncDone = false;
   unsigned long lastRosterCheckTime = 0;
-  const unsigned long ROSTER_CHECK_INTERVAL_MS = 20000; // 20-second repeat roster sync
+  unsigned long lastOfflineFlushTime = 0;
+  const unsigned long ROSTER_CHECK_INTERVAL_MS = 20000;   // 20-second repeat roster sync
+  const unsigned long OFFLINE_FLUSH_INTERVAL_MS = 15000;  // Flush offline ROM logs every 15 seconds
 
   // Infinite processing loop on Core 0
   for (;;) {
-    // 1. Maintain Wi-Fi and Firebase synchronization
-    if (WiFi.status() == WL_CONNECTED && Firebase.ready()) {
+    // A. Proactive Wi-Fi connection supervisor
+    if (WiFi.status() != WL_CONNECTED) {
+      static unsigned long lastWifiReconnect = 0;
+      if (millis() - lastWifiReconnect > 4000) {
+        lastWifiReconnect = millis();
+        Serial.println(F("[WIFI]     Link disconnected! Auto-reconnecting..."));
+        WiFi.disconnect();
+        WiFi.reconnect();
+      }
+      vTaskDelay(pdMS_TO_TICKS(200));
+      continue;
+    }
+
+    // B. Check if Firebase is ready
+    bool fbReady = Firebase.ready();
+
+    if (fbReady) {
       // Boot-Time Roster Synchronization (executed once upon boot)
       if (!initialSyncDone) {
-        static int syncAttempts = 0;
+        Serial.println(F("[AUTH-SYNC] Executing Boot-Time Roster Synchronization..."));
         initialSyncDone = syncStudentsFromCloud();
-        if (!initialSyncDone) {
+        if (initialSyncDone) {
+          lastRosterCheckTime = millis();
+          Serial.println(F("[AUTH-SYNC] Boot-Time Roster Synchronization completed successfully."));
+        } else {
+          static int syncAttempts = 0;
           syncAttempts++;
           if (syncAttempts >= 3) {
             Serial.println(F("[AUTH-SYNC] Max initial sync attempts reached. Retaining existing local NVS cache."));
-            initialSyncDone = true; // Fallback to local NVS cache so event queue processing is not blocked
+            initialSyncDone = true; // Fallback to local NVS cache so normal operation is not blocked
+            lastRosterCheckTime = millis();
           } else {
             vTaskDelay(pdMS_TO_TICKS(2000));
           }
-        } else {
-          lastRosterCheckTime = millis();
         }
       }
 
-      // Flush any offline logs buffered in ROM
-      flushOfflineLogsFromROM();
+      // Flush any offline logs buffered in ROM (throttled to every 15 seconds)
+      if (millis() - lastOfflineFlushTime >= OFFLINE_FLUSH_INTERVAL_MS) {
+        lastOfflineFlushTime = millis();
+        flushOfflineLogsFromROM();
+      }
 
       // Periodic 20-second Roster check and diff sync (Requirement 3)
       if (initialSyncDone && (millis() - lastRosterCheckTime >= ROSTER_CHECK_INTERVAL_MS)) {
         lastRosterCheckTime = millis();
+        Serial.println(F("[AUTH-SYNC] 20s interval elapsed. Checking Firestore 'student_names' vs ROM..."));
         bool diffDetected = false;
         compareAndSyncRoster(false /* periodic */, diffDetected);
         if (diffDetected) {
@@ -1216,19 +1295,34 @@ bool compareAndSyncRoster(bool isBoot, bool &outDiffDetected) {
 
   // 2. Fetch Firestore student_names collection using thread-safe mutex
   bool getOk = false;
-  if (firebaseMutex != NULL && xSemaphoreTake(firebaseMutex, pdMS_TO_TICKS(5000)) == pdTRUE) {
+  int httpCode = 0;
+  String payload = "";
+  String errorReason = "";
+
+  if (firebaseMutex != NULL && xSemaphoreTake(firebaseMutex, pdMS_TO_TICKS(6000)) == pdTRUE) {
     getOk = Firebase.Firestore.getDocuments(&fbdo, FIREBASE_PROJECT_ID, "(default)", FIRESTORE_STUDENTS);
+    httpCode = fbdo.httpCode();
+    if (getOk && httpCode == 200) {
+      payload = fbdo.payload();
+    } else {
+      errorReason = fbdo.errorReason();
+    }
     xSemaphoreGive(firebaseMutex);
+  } else {
+    Serial.println(F("[AUTH-SYNC] Mutex acquisition timed out while attempting to fetch Firestore roster."));
+    return false;
   }
 
-  if (!getOk || fbdo.httpCode() != 200) {
+  if (!getOk || httpCode != 200) {
     Serial.print(F("[AUTH-SYNC] Failed to fetch documents from Firestore. HTTP: "));
-    Serial.println(fbdo.httpCode());
+    Serial.print(httpCode);
+    Serial.print(F(" | Error: "));
+    Serial.println(errorReason);
     return false;
   }
 
   FirebaseJson json;
-  json.setJsonData(fbdo.payload());
+  json.setJsonData(payload);
   FirebaseJsonData docsData;
   json.get(docsData, "documents");
 
@@ -1245,14 +1339,22 @@ bool compareAndSyncRoster(bool isBoot, bool &outDiffDetected) {
         FirebaseJson docJson;
         itemData.getJSON(docJson);
 
-        FirebaseJsonData resNameData, nameData, activeData;
+        FirebaseJsonData resNameData, nameData;
         docJson.get(resNameData, "name");
         docJson.get(nameData, "fields/name/stringValue");
-        docJson.get(activeData, "fields/active/booleanValue");
 
+        // Parse active status supporting booleanValue, stringValue ("true"/"false"), and integerValue (1/0)
         bool isActive = true;
-        if (activeData.success) {
-          isActive = (activeData.boolValue || activeData.stringValue == "true");
+        FirebaseJsonData bVal, sVal, iVal;
+        if (docJson.get(bVal, "fields/active/booleanValue") && bVal.success) {
+          isActive = bVal.boolValue;
+        } else if (docJson.get(sVal, "fields/active/stringValue") && sVal.success) {
+          String s = sVal.stringValue;
+          s.trim();
+          s.toLowerCase();
+          isActive = (s == "true" || s == "1");
+        } else if (docJson.get(iVal, "fields/active/integerValue") && iVal.success) {
+          isActive = (iVal.intValue != 0);
         }
 
         if (resNameData.success && nameData.success) {
@@ -1385,53 +1487,73 @@ bool verifyStudentDual(const char* uid, char* outName, size_t maxLen, StudentAut
   String cloudName = "";
   bool cloudActive = true;
 
-  if (WiFi.status() == WL_CONNECTED && Firebase.ready()) {
-    if (firebaseMutex != NULL && xSemaphoreTake(firebaseMutex, pdMS_TO_TICKS(1500)) == pdTRUE) {
+  bool isConnected = (WiFi.status() == WL_CONNECTED);
+  bool isReady = Firebase.ready();
+
+  if (isConnected && isReady) {
+    if (firebaseMutex != NULL && xSemaphoreTake(firebaseMutex, pdMS_TO_TICKS(4000)) == pdTRUE) {
       String docPath = String(FIRESTORE_STUDENTS) + "/" + cleanUID;
       Serial.print(F("[AUTH] Querying Firestore for student UID ["));
       Serial.print(cleanUID);
       Serial.println(F("]..."));
 
-      if (Firebase.Firestore.getDocument(&fbdo, FIREBASE_PROJECT_ID, "", docPath.c_str())) {
-        int httpCode = fbdo.httpCode();
-        if (httpCode == 200) {
-          FirebaseJson json;
-          json.setJsonData(fbdo.payload());
-          FirebaseJsonData nameData, activeData;
-          json.get(nameData, "fields/name/stringValue");
-          json.get(activeData, "fields/active/booleanValue");
-
-          cloudName = nameData.success ? nameData.stringValue : "";
-          cloudName.trim();
-          if (activeData.success) {
-            cloudActive = (activeData.boolValue || activeData.stringValue == "true");
-          } else {
-            cloudActive = true;
-          }
-
-          if (cloudName.length() > 0) {
-            cloudChecked = true;
-            inCloud = true;
-          }
-        } else if (httpCode == 404) {
-          cloudChecked = true;
-          inCloud = false;
-        } else {
-          Serial.print(F("[AUTH] Firestore getDocument returned HTTP "));
-          Serial.print(httpCode);
-          Serial.println(F(". Falling back to ROM cache."));
-        }
+      bool getOk = Firebase.Firestore.getDocument(&fbdo, FIREBASE_PROJECT_ID, "(default)", docPath.c_str());
+      int httpCode = fbdo.httpCode();
+      String payload = "";
+      String errorReason = "";
+      if (getOk && httpCode == 200) {
+        payload = fbdo.payload();
       } else {
-        Serial.print(F("[AUTH] Firestore getDocument request failed: "));
-        Serial.print(fbdo.errorReason());
-        Serial.println(F(". Falling back to ROM cache."));
+        errorReason = fbdo.errorReason();
       }
       xSemaphoreGive(firebaseMutex);
+
+      if (getOk && httpCode == 200) {
+        FirebaseJson json;
+        json.setJsonData(payload);
+        FirebaseJsonData nameData;
+        json.get(nameData, "fields/name/stringValue");
+
+        // Parse active status supporting booleanValue, stringValue ("true"/"false"), and integerValue (1/0)
+        cloudActive = true;
+        FirebaseJsonData bVal, sVal, iVal;
+        if (json.get(bVal, "fields/active/booleanValue") && bVal.success) {
+          cloudActive = bVal.boolValue;
+        } else if (json.get(sVal, "fields/active/stringValue") && sVal.success) {
+          String s = sVal.stringValue;
+          s.trim();
+          s.toLowerCase();
+          cloudActive = (s == "true" || s == "1");
+        } else if (json.get(iVal, "fields/active/integerValue") && iVal.success) {
+          cloudActive = (iVal.intValue != 0);
+        }
+
+        cloudName = nameData.success ? nameData.stringValue : "";
+        cloudName.trim();
+
+        if (cloudName.length() > 0) {
+          cloudChecked = true;
+          inCloud = true;
+        }
+      } else if (httpCode == 404) {
+        cloudChecked = true;
+        inCloud = false;
+      } else {
+        Serial.print(F("[AUTH] Firestore getDocument returned HTTP "));
+        Serial.print(httpCode);
+        Serial.print(F(" | Error: "));
+        Serial.print(errorReason);
+        Serial.println(F(". Falling back to ROM cache."));
+      }
     } else {
       Serial.println(F("[AUTH] Firebase mutex busy. Falling back to ROM cache."));
     }
   } else {
-    Serial.println(F("[AUTH] Wi-Fi or Firebase offline. Falling back to ROM cache."));
+    Serial.print(F("[AUTH] Live check skipped (WiFi: "));
+    Serial.print(isConnected ? F("CONNECTED") : F("DISCONNECTED"));
+    Serial.print(F(", Firebase Ready: "));
+    Serial.print(isReady ? F("YES") : F("NO"));
+    Serial.println(F("). Falling back to ROM cache."));
   }
 
   // 3. Process Cloud vs ROM comparison
@@ -1925,7 +2047,9 @@ void setup() {
   // Enable automatic reconnection and start connecting to Wi-Fi immediately at boot
   Serial.print(F("[WIFI]     Connecting to network: "));
   Serial.println(WIFI_SSID);
+  WiFi.persistent(false);
   WiFi.mode(WIFI_STA);
+  WiFi.setSleep(false);
   WiFi.setAutoReconnect(true);
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
 
