@@ -69,6 +69,9 @@
 #include <esp_idf_version.h>
 #include <vector>
 
+// Expand Arduino loopTask stack size on Core 1 from default 8KB to 16KB to support BearSSL HTTPS operations
+SET_LOOP_TASK_STACK_SIZE(16384);
+
 #if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 0, 0)
 // ESP-IDF v5+ Task Watchdog compatibility overload
 inline esp_err_t esp_task_wdt_init(uint32_t timeout_sec, bool panic) {
@@ -2005,7 +2008,6 @@ void setup() {
 
   // Initialize Task Watchdog with an extended 30-second window and disable panic reset during cryptographic operations
   esp_task_wdt_init(30, false);
-  esp_task_wdt_delete(xTaskGetIdleTaskHandleForCPU(0));
 
   // Initialize NVS Preferences for offline-first student roster caching & offline log buffering
   studentPrefs.begin("students", false);
