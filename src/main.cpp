@@ -400,6 +400,8 @@ void saveStudentToROM(const char* uid, const char* name, bool active);
 void removeStudentFromROM(const char* uid);
 std::vector<String> getAllROMUIDs();
 void printROMCacheSummary();
+void dumpAllROMData();
+void checkSerialCommands();
 
 // Maximum number of offline log events buffered in persistent ROM (NVS)
 const uint16_t MAX_OFFLINE_LOGS = 20;
@@ -1299,6 +1301,95 @@ void printROMCacheSummary() {
   Serial.println(F("==================================================="));
 }
 
+// Dumps all persistent ROM data (Student Roster cache & Offline Log buffer) to Serial Monitor
+void dumpAllROMData() {
+  Serial.println();
+  Serial.println(F("==================================================="));
+  Serial.println(F("              ESP32 ROM (NVS) DATA DUMP            "));
+  Serial.println(F("==================================================="));
+
+  // 1. Student Roster Cache ("students" namespace)
+  std::vector<String> uids = getAllROMUIDs();
+  Serial.print(F("[ROM-STUDENTS] Total Registered Students: "));
+  Serial.println(uids.size());
+  if (uids.empty()) {
+    Serial.println(F("               (No student records found in ROM)"));
+  } else {
+    for (size_t i = 0; i < uids.size(); i++) {
+      StudentRecord rec;
+      if (getStudentFromROM(uids[i].c_str(), rec)) {
+        Serial.print(F("  ["));
+        Serial.print(i + 1);
+        Serial.print(F("] UID: "));
+        Serial.print(uids[i]);
+        Serial.print(F(" | Name: \""));
+        Serial.print(rec.name);
+        Serial.print(F("\" | Status: "));
+        Serial.println(rec.active ? F("ACTIVE") : F("SUSPENDED"));
+      } else {
+        Serial.print(F("  ["));
+        Serial.print(i + 1);
+        Serial.print(F("] UID: "));
+        Serial.print(uids[i]);
+        Serial.println(F(" | Error reading record"));
+      }
+    }
+  }
+  Serial.println(F("---------------------------------------------------"));
+
+  // 2. Offline Logs Buffer ("off_logs" namespace)
+  uint16_t offCount = offlineLogsPrefs.getUShort("count", 0);
+  Serial.print(F("[ROM-OFFLINE-LOGS] Total Buffered Offline Logs: "));
+  Serial.println(offCount);
+  if (offCount == 0) {
+    Serial.println(F("                   (No pending offline logs in ROM)"));
+  } else {
+    for (uint16_t i = 0; i < offCount; i++) {
+      String key = "l_" + String(i);
+      FirestoreLogEvent offEvent;
+      size_t readLen = offlineLogsPrefs.getBytes(key.c_str(), &offEvent, sizeof(offEvent));
+      if (readLen == sizeof(offEvent)) {
+        Serial.print(F("  [Log #"));
+        Serial.print(i + 1);
+        Serial.print(F("] Doc ID: '"));
+        Serial.print(offEvent.docId);
+        Serial.print(F("' | Event: "));
+        Serial.print(offEvent.eventType);
+        Serial.print(F(" | Student: "));
+        Serial.print(offEvent.studentName);
+        Serial.print(F(" ("));
+        Serial.print(offEvent.studentUID);
+        Serial.print(F(") | Book: \""));
+        Serial.print(offEvent.bookTitle[0] ? offEvent.bookTitle : "N/A");
+        Serial.print(F("\" | Shelf: "));
+        Serial.print(offEvent.shelf);
+        Serial.print(F(" | Rack: "));
+        Serial.print(offEvent.rack);
+        Serial.print(F(" | Time: "));
+        Serial.println(offEvent.timestamp);
+      } else {
+        Serial.print(F("  [Log #"));
+        Serial.print(i + 1);
+        Serial.println(F("] (Corrupted or incomplete entry in ROM)"));
+      }
+    }
+  }
+
+  // 3. System & Network State Summary
+  Serial.println(F("---------------------------------------------------"));
+  Serial.print(F("[SYSTEM-STATUS] Free Heap RAM: "));
+  Serial.print(ESP.getFreeHeap());
+  Serial.print(F(" bytes | Wi-Fi: "));
+  Serial.print(WiFi.status() == WL_CONNECTED ? F("CONNECTED (") : F("DISCONNECTED"));
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.print(WiFi.localIP());
+    Serial.print(F(")"));
+  }
+  Serial.println();
+  Serial.println(F("==================================================="));
+  Serial.println();
+}
+
 // Periodic (every 20s) & Boot-Time Roster Synchronization with Diff Detection
 // First reads ROM, then reads Firestore 'student_names'. If differences exist, updates ROM.
 bool compareAndSyncRoster(bool isBoot, bool &outDiffDetected) {
@@ -1960,9 +2051,40 @@ void setup() {
 
   // Reset system to ready state (Line 1: "Please Tap Your ", Line 2: "Student ID Card ")
   resetSystem();
+
+  Serial.println(F("[SERIAL]   Interactive Command Ready: Type \"rom\" and press Enter to inspect all ROM data."));
+}
+
+// Non-blocking serial command listener for runtime diagnostics (e.g. typing "rom")
+void checkSerialCommands() {
+  static String serialBuffer = "";
+  while (Serial.available() > 0) {
+    char c = (char)Serial.read();
+    if (c == '\n' || c == '\r') {
+      serialBuffer.trim();
+      if (serialBuffer.length() > 0) {
+        String cmd = serialBuffer;
+        cmd.toLowerCase();
+        if (cmd == "rom") {
+          dumpAllROMData();
+        } else {
+          Serial.print(F("[SERIAL] Unknown command: '"));
+          Serial.print(serialBuffer);
+          Serial.println(F("'. Type 'rom' to display all data in ROM."));
+        }
+        serialBuffer = "";
+      }
+    } else {
+      if (serialBuffer.length() < 64) {
+        serialBuffer += c;
+      }
+    }
+  }
 }
 
 void loop() {
+  // Check for interactive Serial Monitor commands (e.g. typing "rom")
+  checkSerialCommands();
   // Auto-restart countdown if roster data was updated in Firestore (Requirement 2 & 3)
   if (pendingRestart && currentState == WAITING_FOR_STUDENT) {
     pendingRestart = false;
