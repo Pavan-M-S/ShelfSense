@@ -63,6 +63,24 @@
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 #include <freertos/queue.h>
+#include <esp_task_wdt.h>
+#include <esp_idf_version.h>
+
+#if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 0, 0)
+// ESP-IDF v5+ Task Watchdog compatibility overload
+inline esp_err_t esp_task_wdt_init(uint32_t timeout_sec, bool panic) {
+  esp_task_wdt_config_t twdt_config = {
+    .timeout_ms = timeout_sec * 1000,
+    .idle_core_mask = 0,
+    .trigger_panic = panic
+  };
+  esp_err_t err = esp_task_wdt_reconfigure(&twdt_config);
+  if (err == ESP_ERR_INVALID_STATE) {
+    err = esp_task_wdt_init(&twdt_config);
+  }
+  return err;
+}
+#endif
 
 // =========================================================================================
 // SECTION 1: HARDWARE PINS & SYSTEM CONFIGURATION
@@ -348,7 +366,7 @@ void firestoreSyncTask(void* pvParameters) {
 
   // Wait for initial Wi-Fi connection
   while (WiFi.status() != WL_CONNECTED) {
-    vTaskDelay(pdMS_TO_TICKS(500));
+    vTaskDelay(pdMS_TO_TICKS(100));
   }
 
   Serial.println(F("[FIREBASE] Wi-Fi link ready. Configuring Email/Password Authentication..."));
@@ -370,13 +388,13 @@ void firestoreSyncTask(void* pvParameters) {
   for (;;) {
     // 1. Verify Wi-Fi connectivity
     if (WiFi.status() != WL_CONNECTED) {
-      vTaskDelay(pdMS_TO_TICKS(250));
+      vTaskDelay(pdMS_TO_TICKS(100));
       continue;
     }
 
     // 2. Ensure Firebase token/auth is ready before dequeuing any event
     if (!Firebase.ready()) {
-      vTaskDelay(pdMS_TO_TICKS(50));
+      vTaskDelay(pdMS_TO_TICKS(100));
       continue;
     }
 
@@ -443,14 +461,9 @@ void onWiFiEvent(WiFiEvent_t event) {
       Serial.print(F(" | RSSI: "));
       Serial.print(WiFi.RSSI());
       Serial.println(F(" dBm"));
-
-      // Configure SNTP time synchronization once IP is obtained
-      configTime(GMT_OFFSET_SEC, DAYLIGHT_OFFSET_SEC, NTP_SERVER_1, NTP_SERVER_2);
-      Serial.println(F("[TIME]     NTP synchronization started (pool.ntp.org, IST GMT+5:30)"));
       break;
     case ARDUINO_EVENT_WIFI_STA_DISCONNECTED:
       Serial.println(F("[WIFI]     Disconnected from Wi-Fi! Auto-reconnecting in background..."));
-      WiFi.reconnect();
       break;
     default:
       break;
@@ -1202,6 +1215,10 @@ void setup() {
   Serial.begin(SERIAL_BAUD);
   delay(500); // Allow USB serial link to stabilize
 
+  // Initialize Task Watchdog with an extended 30-second window and disable panic reset during cryptographic operations
+  esp_task_wdt_init(30, false);
+  esp_task_wdt_delete(xTaskGetIdleTaskHandleForCPU(0));
+
   // Perform full hardware diagnostics & welcome display sequence
   runHardwareDiagnostics();
 
@@ -1214,21 +1231,26 @@ void setup() {
   // Register Wi-Fi Event Handler for diagnostic monitoring
   WiFi.onEvent(onWiFiEvent);
 
-  // Initialize Wi-Fi connection in Station mode (non-blocking)
+  // Enable automatic reconnection before calling WiFi.begin()
   Serial.print(F("[WIFI]     Connecting to network: "));
   Serial.println(WIFI_SSID);
   WiFi.mode(WIFI_STA);
+  WiFi.setAutoReconnect(true);
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
 
-  // Launch background Firestore sync task on Core 0 with 10KB stack
+  // Start NTP synchronization safely in setup()
+  configTime(GMT_OFFSET_SEC, DAYLIGHT_OFFSET_SEC, NTP_SERVER_1, NTP_SERVER_2);
+  Serial.println(F("[TIME]     NTP synchronization started (pool.ntp.org, IST GMT+5:30)"));
+
+  // Increase the FreeRTOS worker task stack size from 10240 to 12288 bytes to provide adequate headroom for TLS certificates
   xTaskCreatePinnedToCore(
-    firestoreSyncTask,         // Task function
-    "FirestoreSyncTask",       // Task name
-    10240,                     // Stack size in bytes (plenty for TLS BearSSL handshake)
-    NULL,                      // Parameter
-    1,                         // Priority
-    &firestoreTaskHandle,      // Task handle
-    0                          // Pin to Core 0 (leaving Core 1 for Arduino loop)
+    firestoreSyncTask,
+    "FirestoreSyncTask",
+    12288,
+    NULL,
+    1,
+    &firestoreTaskHandle,
+    0
   );
 
   // Reset system to ready state (Line 1: "Please Tap Your ", Line 2: "Student ID Card ")
