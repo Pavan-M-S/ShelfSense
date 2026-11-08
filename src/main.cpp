@@ -149,9 +149,8 @@ MFRC522 mfrc522(SS_PIN, RST_PIN);
 // LiquidCrystal_I2C instance communicating over standard I2C (SDA=21, SCL=22)
 LiquidCrystal_I2C lcd(LCD_I2C_ADDR, LCD_COLUMNS, LCD_ROWS);
 
-// Mobizt Firebase Data Objects (Dedicated per core to eliminate mutex contention and latency)
-FirebaseData fbdo;     // Core 0: Background Firestore worker (20s roster sync, log queue, offline flush)
-FirebaseData fbdoAuth; // Core 1: Real-time student RFID card authentication
+// Mobizt Firebase Data Objects (Asynchronous background operations on Core 0)
+FirebaseData fbdo;
 FirebaseAuth auth;
 FirebaseConfig config;
 
@@ -163,8 +162,9 @@ Preferences offlineLogsPrefs;
 QueueHandle_t firestoreQueue = NULL;
 TaskHandle_t firestoreTaskHandle = NULL;
 
-// System Restart Flag for automatic restart when cloud roster diff is detected
-volatile bool pendingRestart = false;
+// System synchronization flags
+volatile bool triggerPostRoundSync = false; // Triggers background roster sync right after one book round finishes
+volatile bool pendingRestart = false;        // Schedules restart countdown when cloud roster changes are detected
 
 // =========================================================================================
 // SECTION 3: SYSTEM STATES & IN-MEMORY DATABASES
@@ -391,7 +391,7 @@ bool saveOfflineLogToROM(const FirestoreLogEvent& event);
 void flushOfflineLogsFromROM();
 bool compareAndSyncRoster(bool isBoot, bool &outDiffDetected);
 bool syncStudentsFromCloud();
-bool verifyStudentDual(const char* uid, char* outName, size_t maxLen, StudentAuthStatus& outStatus);
+bool verifyStudentFromROM(const char* uid, char* outName, size_t maxLen, StudentAuthStatus& outStatus);
 bool verifyStudentWithCache(const char* uid, char* outName, size_t maxLen);
 bool getStudentFromROM(const char* uid, StudentRecord& outRecord);
 void saveStudentToROM(const char* uid, const char* name, bool active);
@@ -582,9 +582,6 @@ void firestoreSyncTask(void* pvParameters) {
   fbdo.setBSSLBufferSize(4096 /* Rx buffer */, 1024 /* Tx buffer */);
   fbdo.setResponseSize(8192);
 
-  fbdoAuth.setBSSLBufferSize(2048 /* Rx buffer */, 512 /* Tx buffer */);
-  fbdoAuth.setResponseSize(2048);
-
   Firebase.begin(&config, &auth);
   Serial.print(F("[FIREBASE] Client library initialized for: "));
   Serial.println(FIREBASE_USER_EMAIL);
@@ -651,6 +648,18 @@ void firestoreSyncTask(void* pvParameters) {
       if (millis() - lastOfflineFlushTime >= OFFLINE_FLUSH_INTERVAL_MS) {
         lastOfflineFlushTime = millis();
         flushOfflineLogsFromROM();
+      }
+
+      // Immediate post-round roster sync (triggered after complete book round finishes)
+      if (triggerPostRoundSync && initialSyncDone) {
+        triggerPostRoundSync = false;
+        Serial.println(F("[AUTH-SYNC] Completed one book round. Triggering immediate background roster sync..."));
+        bool diffDetected = false;
+        compareAndSyncRoster(false /* periodic */, diffDetected);
+        lastRosterCheckTime = millis();
+        if (diffDetected) {
+          pendingRestart = true;
+        }
       }
 
       // Periodic 20-second Roster check and diff sync (Requirement 3)
@@ -1453,8 +1462,8 @@ bool syncStudentsFromCloud() {
   return compareAndSyncRoster(true /* isBoot */, unused);
 }
 
-// Dual-Check Student Verification: Checks Firestore & ROM simultaneously with auto-healing and offline fallback
-bool verifyStudentDual(const char* uid, char* outName, size_t maxLen, StudentAuthStatus& outStatus) {
+// Verifies student credentials directly and instantly from ROM cache (0 ms network latency)
+bool verifyStudentFromROM(const char* uid, char* outName, size_t maxLen, StudentAuthStatus& outStatus) {
   if (uid == nullptr || uid[0] == '\0') {
     outStatus = STUDENT_AUTH_NOT_FOUND;
     return false;
@@ -1465,152 +1474,38 @@ bool verifyStudentDual(const char* uid, char* outName, size_t maxLen, StudentAut
   uidStr.toUpperCase();
   const char* cleanUID = uidStr.c_str();
 
-  // 1. Read local ROM
   StudentRecord romRecord;
   bool inROM = getStudentFromROM(cleanUID, romRecord);
 
-  // 2. Query Firestore if network is available
-  bool cloudChecked = false;
-  bool inCloud = false;
-  String cloudName = "";
-  bool cloudActive = true;
-
-  bool isConnected = (WiFi.status() == WL_CONNECTED);
-  bool isReady = Firebase.ready();
-
-  if (isConnected && isReady) {
-    String docPath = String(FIRESTORE_STUDENTS) + "/" + cleanUID;
-    Serial.print(F("[AUTH] Live Firestore query for student UID ["));
-    Serial.print(cleanUID);
-    Serial.println(F("]..."));
-
-    bool getOk = Firebase.Firestore.getDocument(&fbdoAuth, FIREBASE_PROJECT_ID, "(default)", docPath.c_str());
-    int httpCode = fbdoAuth.httpCode();
-    String payload = "";
-    String errorReason = "";
-    if (getOk && httpCode == 200) {
-      payload = fbdoAuth.payload();
-    } else {
-      errorReason = fbdoAuth.errorReason();
-    }
-
-    if (getOk && httpCode == 200) {
-      FirebaseJson json;
-      json.setJsonData(payload);
-      FirebaseJsonData nameData;
-      json.get(nameData, "fields/name/stringValue");
-
-      // Parse active status supporting booleanValue, stringValue ("true"/"false"), and integerValue (1/0)
-      cloudActive = true;
-      FirebaseJsonData bVal, sVal, iVal;
-      if (json.get(bVal, "fields/active/booleanValue") && bVal.success) {
-        cloudActive = bVal.boolValue;
-      } else if (json.get(sVal, "fields/active/stringValue") && sVal.success) {
-        String s = sVal.stringValue;
-        s.trim();
-        s.toLowerCase();
-        cloudActive = (s == "true" || s == "1");
-      } else if (json.get(iVal, "fields/active/integerValue") && iVal.success) {
-        cloudActive = (iVal.intValue != 0);
-      }
-
-      cloudName = nameData.success ? nameData.stringValue : "";
-      cloudName.trim();
-
-      if (cloudName.length() > 0) {
-        cloudChecked = true;
-        inCloud = true;
-      }
-    } else if (httpCode == 404) {
-      cloudChecked = true;
-      inCloud = false;
-    } else {
-      Serial.print(F("[AUTH] Firestore getDocument returned HTTP "));
-      Serial.print(httpCode);
-      Serial.print(F(" | Error: "));
-      Serial.print(errorReason);
-      Serial.println(F(". Falling back to ROM cache."));
-    }
-  } else {
-    Serial.print(F("[AUTH] Live check skipped (WiFi: "));
-    Serial.print(isConnected ? F("CONNECTED") : F("DISCONNECTED"));
-    Serial.print(F(", Firebase Ready: "));
-    Serial.print(isReady ? F("YES") : F("NO"));
-    Serial.println(F("). Falling back to ROM cache."));
-  }
-
-  // 3. Process Cloud vs ROM comparison
-  if (cloudChecked) {
-    if (inCloud) {
-      if (inROM) {
-        Serial.print(F("[AUTH] Card verified in ROM and Firestore: \""));
-        Serial.print(cloudName);
-        Serial.print(F("\" [Active: "));
-        Serial.print(cloudActive ? F("true") : F("false"));
-        Serial.println(F("]"));
-        // Update ROM if name or active state changed in cloud
-        if (String(romRecord.name) != cloudName || romRecord.active != cloudActive) {
-          saveStudentToROM(cleanUID, cloudName.c_str(), cloudActive);
-          Serial.println(F("[AUTH] Synchronized updated cloud data to ROM."));
-        }
-      } else {
-        // "if rom not there but firestore there then continue and also update the rom"
-        Serial.print(F("[AUTH] Card not in ROM, but FOUND in Firestore: \""));
-        Serial.print(cloudName);
-        Serial.print(F("\" [Active: "));
-        Serial.print(cloudActive ? F("true") : F("false"));
-        Serial.println(F("\"]. Updating ROM..."));
-        saveStudentToROM(cleanUID, cloudName.c_str(), cloudActive);
-      }
-
-      if (outName && maxLen > 0) {
-        strncpy(outName, cloudName.c_str(), maxLen - 1);
-        outName[maxLen - 1] = '\0';
-      }
-      outStatus = cloudActive ? STUDENT_AUTH_ACTIVE : STUDENT_AUTH_SUSPENDED;
-      return cloudActive;
-    } else {
-      // Cloud checked, and document was NOT FOUND in Firestore (deleted from cloud)
-      // "means rom there but firestore not there teehn update teh rom and show apprropreiate msg"
-      if (inROM) {
-        Serial.print(F("[AUTH] Card UID ["));
-        Serial.print(cleanUID);
-        Serial.println(F("] present in ROM but DELETED from Firestore. Removing from ROM..."));
-        removeStudentFromROM(cleanUID);
-        outStatus = STUDENT_AUTH_ROM_REMOVED;
-        return false;
-      } else {
-        Serial.print(F("[AUTH] Card UID ["));
-        Serial.print(cleanUID);
-        Serial.println(F("] not found in Firestore or ROM."));
-        outStatus = STUDENT_AUTH_NOT_FOUND;
-        return false;
-      }
-    }
-  }
-
-  // 4. Fallback to ROM (network was offline or error occurred)
   if (inROM) {
-    Serial.print(F("[AUTH] ROM Cache Fallback: Found student \""));
-    Serial.print(romRecord.name);
-    Serial.print(F("\" [UID: "));
-    Serial.print(cleanUID);
-    Serial.print(F(" | Active: "));
-    Serial.print(romRecord.active ? F("true") : F("false"));
-    Serial.println(F("]"));
-
     if (outName && maxLen > 0) {
       strncpy(outName, romRecord.name, maxLen - 1);
       outName[maxLen - 1] = '\0';
     }
-    outStatus = romRecord.active ? STUDENT_AUTH_ACTIVE : STUDENT_AUTH_SUSPENDED;
-    return romRecord.active;
+
+    if (romRecord.active) {
+      outStatus = STUDENT_AUTH_ACTIVE;
+      Serial.print(F("[AUTH] Verified student from ROM cache: \""));
+      Serial.print(romRecord.name);
+      Serial.print(F("\" [UID: "));
+      Serial.print(cleanUID);
+      Serial.println(F(" | Active: true]"));
+      return true;
+    } else {
+      outStatus = STUDENT_AUTH_SUSPENDED;
+      Serial.print(F("[AUTH] Student card SUSPENDED in ROM cache: \""));
+      Serial.print(romRecord.name);
+      Serial.print(F("\" [UID: "));
+      Serial.print(cleanUID);
+      Serial.println(F(" | Active: false]"));
+      return false;
+    }
   }
 
-  Serial.print(F("[AUTH] ROM Cache Fallback: UID ["));
+  outStatus = STUDENT_AUTH_NOT_FOUND;
+  Serial.print(F("[AUTH] Card UID ["));
   Serial.print(cleanUID);
   Serial.println(F("] not found in ROM cache!"));
-  outStatus = STUDENT_AUTH_NOT_FOUND;
   return false;
 }
 
@@ -1658,7 +1553,7 @@ void handleStudentScan(const char* uid) {
   char verifiedName[32] = "";
   StudentAuthStatus authStatus = STUDENT_AUTH_NOT_FOUND;
 
-  verifyStudentDual(uid, verifiedName, sizeof(verifiedName), authStatus);
+  verifyStudentFromROM(uid, verifiedName, sizeof(verifiedName), authStatus);
 
   if (authStatus == STUDENT_AUTH_ACTIVE) {
     // 1. Authorized Active Student authenticated
@@ -1825,8 +1720,12 @@ void handleBookScan(const char* uid) {
     // Run custom animated display sequence (title scroll, reveal, 8s hold, 3s warning)
     displayBookLocationSequence(foundBook.title, foundBook.shelf, foundBook.rack);
 
-    Serial.println(F("[INFO]     Book sequence completed. Resetting for next patron..."));
+    Serial.println(F("[INFO]     Book round completed. Resetting for next patron..."));
     resetSystem();
+
+    // Trigger immediate background roster sync right after one complete book round
+    triggerPostRoundSync = true;
+    Serial.println(F("[AUTH-SYNC] Completed one book round. Triggering immediate background roster sync..."));
     return;
   }
 
@@ -1990,6 +1889,29 @@ void runHardwareDiagnostics() {
     Serial.print(registeredBooks[i].rack);
     Serial.println(F(")"));
   }
+
+  // 5. Inspect persistent ROM (NVS) for cached student roster and pending offline logs
+  Serial.println(F("[BOOT]     Persistent ROM Inspection (NVS):"));
+  std::vector<String> romUIDs = getAllROMUIDs();
+  Serial.print(F("           - Cached Students in ROM: "));
+  Serial.println(romUIDs.size());
+  for (size_t i = 0; i < romUIDs.size(); i++) {
+    StudentRecord rec;
+    if (getStudentFromROM(romUIDs[i].c_str(), rec)) {
+      Serial.print(F("             ["));
+      Serial.print(i + 1);
+      Serial.print(F("] \""));
+      Serial.print(rec.name);
+      Serial.print(F("\" (UID: "));
+      Serial.print(romUIDs[i]);
+      Serial.print(F(" | Status: "));
+      Serial.print(rec.active ? F("ACTIVE") : F("SUSPENDED"));
+      Serial.println(F(")"));
+    }
+  }
+  uint16_t offLogs = offlineLogsPrefs.getUShort("count", 0);
+  Serial.print(F("           - Pending Offline Logs in ROM: "));
+  Serial.println(offLogs);
 
   Serial.println(F("==================================================="));
   Serial.println(F("[BOOT]     Hardware Diagnostics Complete."));
