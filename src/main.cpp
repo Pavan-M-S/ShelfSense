@@ -143,6 +143,7 @@ unsigned long sessionStartTime = 0;
 // Authenticated student session variables
 char activeStudentName[32] = "";
 char activeStudentUID[32]  = "";
+char activeLoginTime[25]   = "";
 
 // Structure modeling a registered student
 struct Student {
@@ -160,14 +161,16 @@ struct Book {
 
 // Structure modeling a Firestore log event for background asynchronous queueing
 struct FirestoreLogEvent {
-  char eventType[20];   // STUDENT_LOGIN, BOOK_PROCESSED, SESSION_TIMEOUT, SECURITY_ALERT
+  char docId[32];       // Formatted Document ID without spaces or colons: "YYYY-MM-DD_HHMMSS"
+  char eventType[20];   // BOOK_PROCESSED, SESSION_TIMEOUT, SECURITY_ALERT
   char studentName[32]; // Authenticated student name
   char studentUID[32];  // Authenticated student UID
+  char loginTime[25];   // Login timestamp "YYYY-MM-DD HH:MM:SS"
   char bookTitle[64];   // Scanned book title (or empty)
   char bookUID[32];     // Scanned book UID (or empty)
   uint8_t shelf;        // Physical shelf location
   uint8_t rack;         // Physical rack location
-  char timestamp[25];   // "YYYY-MM-DD HH:MM:SS"
+  char timestamp[25];   // Processed timestamp "YYYY-MM-DD HH:MM:SS"
   char statusNote[96];  // Diagnostic status note
 };
 
@@ -276,6 +279,23 @@ void getCurrentTimestamp(char* outBuf, size_t maxLen) {
   }
 }
 
+// Formats current local time into human-readable timestamp AND custom document ID without spaces or colons
+void getCurrentTimestamps(char* humanReadable, size_t maxHumanLen, char* docId, size_t maxDocIdLen) {
+  struct tm timeinfo;
+  if (getLocalTime(&timeinfo, 20)) {
+    strftime(humanReadable, maxHumanLen, "%Y-%m-%d %H:%M:%S", &timeinfo);
+    strftime(docId, maxDocIdLen, "%Y-%m-%d_%H%M%S", &timeinfo);
+  } else {
+    unsigned long sec = millis() / 1000;
+    unsigned long h   = (sec / 3600) % 24;
+    unsigned long m   = (sec / 60) % 60;
+    unsigned long s   = sec % 60;
+    snprintf(humanReadable, maxHumanLen, "1970-01-01 %02lu:%02lu:%02lu", h, m, s);
+    snprintf(docId, maxDocIdLen, "1970-01-01_%02lu%02lu%02lu", h, m, s);
+    Serial.println(F("[TIME]     NTP sync pending; formatted fallback uptime timestamp"));
+  }
+}
+
 // =========================================================================================
 // SECTION 6: BACKGROUND FIRESTORE SYNCHRONIZATION (FREERTOS WORKER TASK)
 // =========================================================================================
@@ -284,6 +304,7 @@ void getCurrentTimestamp(char* outBuf, size_t maxLen) {
 void queueFirestoreLog(const char* eventType,
                        const char* studentName,
                        const char* studentUID,
+                       const char* loginTime,
                        const char* bookTitle,
                        const char* bookUID,
                        uint8_t shelf,
@@ -297,19 +318,23 @@ void queueFirestoreLog(const char* eventType,
   FirestoreLogEvent logEvent;
   memset(&logEvent, 0, sizeof(logEvent));
 
-  strncpy(logEvent.eventType, eventType, sizeof(logEvent.eventType) - 1);
+  getCurrentTimestamps(logEvent.timestamp, sizeof(logEvent.timestamp), logEvent.docId, sizeof(logEvent.docId));
+
+  strncpy(logEvent.eventType,   eventType   ? eventType   : "", sizeof(logEvent.eventType)   - 1);
   strncpy(logEvent.studentName, studentName ? studentName : "", sizeof(logEvent.studentName) - 1);
   strncpy(logEvent.studentUID,  studentUID  ? studentUID  : "", sizeof(logEvent.studentUID)  - 1);
+  strncpy(logEvent.loginTime,   loginTime   ? loginTime   : "", sizeof(logEvent.loginTime)   - 1);
   strncpy(logEvent.bookTitle,   bookTitle   ? bookTitle   : "", sizeof(logEvent.bookTitle)   - 1);
   strncpy(logEvent.bookUID,     bookUID     ? bookUID     : "", sizeof(logEvent.bookUID)     - 1);
   logEvent.shelf = shelf;
   logEvent.rack  = rack;
-  getCurrentTimestamp(logEvent.timestamp, sizeof(logEvent.timestamp));
   strncpy(logEvent.statusNote,  statusNote  ? statusNote  : "", sizeof(logEvent.statusNote)  - 1);
 
   Serial.print(F("[FIREBASE] Dispatching '"));
   Serial.print(logEvent.eventType);
-  Serial.println(F("' event to background sync queue..."));
+  Serial.print(F("' event (Doc ID: '"));
+  Serial.print(logEvent.docId);
+  Serial.println(F("') to background sync queue..."));
 
   // Send to queue non-blockingly (timeout = 0 ticks)
   if (xQueueSend(firestoreQueue, &logEvent, 0) != pdTRUE) {
@@ -361,11 +386,12 @@ void firestoreSyncTask(void* pvParameters) {
       Serial.print(F("[FIREBASE] Processing queued event: "));
       Serial.println(event.eventType);
 
-      // Construct Firestore Document JSON according to required schema
+      // Construct Firestore Document JSON according to required schema (combined login + processed data)
       FirebaseJson content;
       content.set("fields/eventType/stringValue", event.eventType);
       content.set("fields/studentName/stringValue", event.studentName);
       content.set("fields/studentUID/stringValue", event.studentUID);
+      content.set("fields/loginTime/stringValue", event.loginTime);
       content.set("fields/bookTitle/stringValue", event.bookTitle);
       content.set("fields/bookUID/stringValue", event.bookUID);
       content.set("fields/shelf/integerValue", String(event.shelf));
@@ -375,12 +401,14 @@ void firestoreSyncTask(void* pvParameters) {
 
       Serial.print(F("[FIREBASE] Target Collection: '"));
       Serial.print(FIRESTORE_COLLECTION);
+      Serial.print(F("' | Custom Doc ID (Time formatted): '"));
+      Serial.print(event.docId);
       Serial.println(F("'"));
       Serial.print(F("[FIREBASE] Document JSON Payload: "));
       Serial.println(content.raw());
 
-      // Automatic document creation in Google Cloud Firestore
-      if (Firebase.Firestore.createDocument(&fbdo, FIREBASE_PROJECT_ID, "", FIRESTORE_COLLECTION, content.raw())) {
+      // Create document in Firestore with custom Document ID (no random string)
+      if (Firebase.Firestore.createDocument(&fbdo, FIREBASE_PROJECT_ID, "", FIRESTORE_COLLECTION, event.docId, content.raw(), "")) {
         Serial.print(F("[FIREBASE] Document sync SUCCESS! HTTP Code: "));
         Serial.println(fbdo.httpCode());
         Serial.print(F("[FIREBASE] Server Response: "));
@@ -707,6 +735,7 @@ void resetSystem() {
   // Clear active authenticated student session credentials
   activeStudentName[0] = '\0';
   activeStudentUID[0]  = '\0';
+  activeLoginTime[0]   = '\0';
 
   // Ensure both indicator LEDs are OFF in standby
   digitalWrite(RED_LED_PIN, LOW);
@@ -884,14 +913,20 @@ void handleStudentScan(const char* uid) {
     // Immediate local feedback: short green LED flash + simultaneous buzzer beep
     indicateSuccess(1, 100);
 
-    // Store authenticated student credentials in session memory
+    // Store authenticated student credentials & login time in session memory
     strncpy(activeStudentName, student.name, sizeof(activeStudentName) - 1);
     activeStudentName[sizeof(activeStudentName) - 1] = '\0';
     strncpy(activeStudentUID, student.uid, sizeof(activeStudentUID) - 1);
     activeStudentUID[sizeof(activeStudentUID) - 1] = '\0';
+    getCurrentTimestamp(activeLoginTime, sizeof(activeLoginTime));
 
-    // Silent Background Cloud Sync: Dispatch STUDENT_LOGIN event to Firestore
-    queueFirestoreLog("STUDENT_LOGIN", activeStudentName, activeStudentUID, "", "", 0, 0, "Student authenticated successfully");
+    Serial.print(F("[SESSION]  Student login recorded: "));
+    Serial.print(activeStudentName);
+    Serial.print(F(" ("));
+    Serial.print(activeStudentUID);
+    Serial.print(F(") at "));
+    Serial.println(activeLoginTime);
+    Serial.println(F("[SESSION]  Login data will be combined into single Firestore document when book is processed."));
 
     // Transition state
     logStateTransition(WAITING_FOR_STUDENT, WAITING_FOR_BOOK);
@@ -935,7 +970,7 @@ void handleStudentScan(const char* uid) {
   snprintf(reason, sizeof(reason), "Unrecognized card scanned at Step 1 (UID: %s)", uid);
 
   // Silent Background Cloud Sync: Dispatch SECURITY_ALERT document to Firestore
-  queueFirestoreLog("SECURITY_ALERT", "UNKNOWN", uid, "", "", 0, 0, reason);
+  queueFirestoreLog("SECURITY_ALERT", "UNKNOWN", uid, "", "", "", 0, 0, reason);
 
   // Emergency Alarm: 10 rapid pulses of Red LED + Buzzer across 2 seconds
   showEmergencyAlarm("Unrecognized ID ", " Access Denied! ", reason);
@@ -963,10 +998,18 @@ void handleBookScan(const char* uid) {
     // Stop session timer
     sessionStartTime = 0;
 
-    // Silent Background Cloud Sync: Dispatch BOOK_PROCESSED document to Firestore
+    // Silent Background Cloud Sync: Dispatch ONE COMBINED document to Firestore (both login and processed data)
     char note[96];
-    snprintf(note, sizeof(note), "Book mapped to Shelf %u, Rack %u", foundBook.shelf, foundBook.rack);
-    queueFirestoreLog("BOOK_PROCESSED", activeStudentName, activeStudentUID, foundBook.title, foundBook.uid, foundBook.shelf, foundBook.rack, note);
+    snprintf(note, sizeof(note), "Student authenticated & book mapped to Shelf %u, Rack %u", foundBook.shelf, foundBook.rack);
+    queueFirestoreLog("BOOK_PROCESSED",
+                      activeStudentName,
+                      activeStudentUID,
+                      activeLoginTime,
+                      foundBook.title,
+                      foundBook.uid,
+                      foundBook.shelf,
+                      foundBook.rack,
+                      note);
 
     // Run custom animated display sequence (title scroll, reveal, 8s hold, 3s warning)
     displayBookLocationSequence(foundBook.title, foundBook.shelf, foundBook.rack);
@@ -997,7 +1040,7 @@ void handleBookScan(const char* uid) {
   snprintf(reason, sizeof(reason), "Unregistered tag scanned at Step 2 (UID: %s)", uid);
 
   // Silent Background Cloud Sync: Dispatch SECURITY_ALERT document to Firestore
-  queueFirestoreLog("SECURITY_ALERT", activeStudentName, activeStudentUID, "UNKNOWN", uid, 0, 0, reason);
+  queueFirestoreLog("SECURITY_ALERT", activeStudentName, activeStudentUID, activeLoginTime, "UNKNOWN", uid, 0, 0, reason);
 
   // Emergency Alarm: 10 rapid pulses of Red LED + Buzzer across 2 seconds
   showEmergencyAlarm("Unrecognized ID ", "Unknown Book Tag", reason);
@@ -1200,7 +1243,7 @@ void loop() {
     Serial.println(F(" seconds."));
 
     // Silent Background Cloud Sync: Dispatch SESSION_TIMEOUT document to Firestore
-    queueFirestoreLog("SESSION_TIMEOUT", activeStudentName, activeStudentUID, "", "", 0, 0, "Session expired after 20 seconds of inactivity");
+    queueFirestoreLog("SESSION_TIMEOUT", activeStudentName, activeStudentUID, activeLoginTime, "", "", 0, 0, "Session expired after 20 seconds of inactivity");
 
     // Auditory and visual timeout notification on LCD and status peripherals
     showMessage("Session Expired ", "Please Try Again");
