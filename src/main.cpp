@@ -67,6 +67,7 @@
 #include <Preferences.h>
 #include <esp_task_wdt.h>
 #include <esp_idf_version.h>
+#include <vector>
 
 #if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 0, 0)
 // ESP-IDF v5+ Task Watchdog compatibility overload
@@ -150,12 +151,17 @@ FirebaseData fbdo;
 FirebaseAuth auth;
 FirebaseConfig config;
 
-// ESP32 Non-Volatile Storage (Preferences) for offline-first student roster caching
+// ESP32 Non-Volatile Storage (Preferences) for offline-first student roster caching & offline log buffering
 Preferences studentPrefs;
+Preferences offlineLogsPrefs;
 
 // FreeRTOS Queue & Task handles for background Firestore sync
 QueueHandle_t firestoreQueue = NULL;
 TaskHandle_t firestoreTaskHandle = NULL;
+
+// Multi-Core & Hardware Synchronization Mutex & Restart Flag
+SemaphoreHandle_t firebaseMutex = NULL;
+volatile bool pendingRestart = false;
 
 // =========================================================================================
 // SECTION 3: SYSTEM STATES & IN-MEMORY DATABASES
@@ -363,11 +369,164 @@ void queueFirestoreLog(const char* eventType,
   }
 }
 
-// Forward declarations for offline-first student roster caching
-bool syncStudentsFromCloud();
-bool verifyStudentWithCache(const char* uid, char* outName, size_t maxLen);
+// Structure representing cached student record in ROM (Preferences NVS)
+struct StudentRecord {
+  char name[32];
+  bool active;
+};
 
-// FreeRTOS Background Task running on Core 0 to handle Wi-Fi & Firestore synchronization
+// Student authentication states for dual-check verification
+enum StudentAuthStatus {
+  STUDENT_AUTH_ACTIVE,      // Authenticated active student
+  STUDENT_AUTH_SUSPENDED,   // Registered student with active: false (Suspended Card)
+  STUDENT_AUTH_NOT_FOUND,   // Unregistered card (not in cloud or ROM)
+  STUDENT_AUTH_ROM_REMOVED  // Card was cached in ROM but deleted from Firestore
+};
+
+// Forward declarations for offline caching & roster synchronization
+bool saveOfflineLogToROM(const FirestoreLogEvent& event);
+void flushOfflineLogsFromROM();
+bool compareAndSyncRoster(bool isBoot, bool &outDiffDetected);
+bool syncStudentsFromCloud();
+bool verifyStudentDual(const char* uid, char* outName, size_t maxLen, StudentAuthStatus& outStatus);
+bool verifyStudentWithCache(const char* uid, char* outName, size_t maxLen);
+bool getStudentFromROM(const char* uid, StudentRecord& outRecord);
+void saveStudentToROM(const char* uid, const char* name, bool active);
+void removeStudentFromROM(const char* uid);
+std::vector<String> getAllROMUIDs();
+
+// Maximum number of offline log events buffered in persistent ROM (NVS)
+const uint16_t MAX_OFFLINE_LOGS = 20;
+
+// Temporarily stores an unsent Firestore log event in ROM if Wi-Fi drops or upload fails
+bool saveOfflineLogToROM(const FirestoreLogEvent& event) {
+  uint16_t count = offlineLogsPrefs.getUShort("count", 0);
+  if (count >= MAX_OFFLINE_LOGS) {
+    Serial.println(F("[OFFLINE-ROM] Warning: ROM offline log buffer full. Overwriting oldest log."));
+    for (uint16_t i = 1; i < count; i++) {
+      String srcKey = "l_" + String(i);
+      String dstKey = "l_" + String(i - 1);
+      FirestoreLogEvent temp;
+      if (offlineLogsPrefs.getBytes(srcKey.c_str(), &temp, sizeof(temp)) == sizeof(temp)) {
+        offlineLogsPrefs.putBytes(dstKey.c_str(), &temp, sizeof(temp));
+      }
+    }
+    count = MAX_OFFLINE_LOGS - 1;
+  }
+
+  String key = "l_" + String(count);
+  size_t written = offlineLogsPrefs.putBytes(key.c_str(), &event, sizeof(FirestoreLogEvent));
+  if (written == sizeof(FirestoreLogEvent)) {
+    offlineLogsPrefs.putUShort("count", count + 1);
+    Serial.print(F("[OFFLINE-ROM] Event cached in ROM (Pending offline logs: "));
+    Serial.print(count + 1);
+    Serial.print(F("). Doc ID: '"));
+    Serial.print(event.docId);
+    Serial.println(F("'"));
+    return true;
+  }
+  Serial.println(F("[OFFLINE-ROM] ERROR: Failed to write log event to ROM!"));
+  return false;
+}
+
+// Background sync: Drains and uploads buffered offline logs from ROM to Firestore upon Wi-Fi reconnection
+void flushOfflineLogsFromROM() {
+  if (WiFi.status() != WL_CONNECTED || !Firebase.ready()) {
+    return;
+  }
+
+  uint16_t count = offlineLogsPrefs.getUShort("count", 0);
+  if (count == 0) {
+    return;
+  }
+
+  Serial.println(F("---------------------------------------------------"));
+  Serial.print(F("[OFFLINE-ROM] Network link active. Synchronizing "));
+  Serial.print(count);
+  Serial.println(F(" offline log(s) from ROM to Firestore..."));
+
+  uint16_t syncedCount = 0;
+
+  for (uint16_t i = 0; i < count; i++) {
+    if (WiFi.status() != WL_CONNECTED || !Firebase.ready()) {
+      Serial.println(F("[OFFLINE-ROM] Wi-Fi lost during flush. Retaining remaining in ROM."));
+      break;
+    }
+
+    String key = "l_" + String(i);
+    FirestoreLogEvent offEvent;
+    size_t readLen = offlineLogsPrefs.getBytes(key.c_str(), &offEvent, sizeof(offEvent));
+    if (readLen != sizeof(offEvent)) {
+      Serial.print(F("[OFFLINE-ROM] Invalid ROM entry at index "));
+      Serial.print(i);
+      Serial.println(F(". Removing."));
+      offlineLogsPrefs.remove(key.c_str());
+      syncedCount++;
+      continue;
+    }
+
+    FirebaseJson content;
+    content.set("fields/eventType/stringValue", offEvent.eventType);
+    content.set("fields/studentName/stringValue", offEvent.studentName);
+    content.set("fields/studentUID/stringValue", offEvent.studentUID);
+    content.set("fields/loginTime/stringValue", offEvent.loginTime);
+    content.set("fields/bookTitle/stringValue", offEvent.bookTitle);
+    content.set("fields/bookUID/stringValue", offEvent.bookUID);
+    content.set("fields/shelf/integerValue", String(offEvent.shelf));
+    content.set("fields/rack/integerValue", String(offEvent.rack));
+    content.set("fields/timestamp/stringValue", offEvent.timestamp);
+    content.set("fields/statusNote/stringValue", offEvent.statusNote);
+
+    Serial.print(F("[OFFLINE-ROM] Uploading pending log (Doc ID: '"));
+    Serial.print(offEvent.docId);
+    Serial.println(F("')..."));
+
+    bool success = false;
+    if (firebaseMutex != NULL && xSemaphoreTake(firebaseMutex, pdMS_TO_TICKS(5000)) == pdTRUE) {
+      success = Firebase.Firestore.createDocument(&fbdo, FIREBASE_PROJECT_ID, "", FIRESTORE_COLLECTION, offEvent.docId, content.raw(), "");
+      xSemaphoreGive(firebaseMutex);
+    }
+
+    if (success && fbdo.httpCode() == 200) {
+      Serial.print(F("[OFFLINE-ROM] Document sync SUCCESS! Doc ID: '"));
+      Serial.print(offEvent.docId);
+      Serial.println(F("'. Deleted from ROM."));
+      offlineLogsPrefs.remove(key.c_str());
+      syncedCount++;
+    } else {
+      Serial.print(F("[OFFLINE-ROM] Document sync FAILED! HTTP: "));
+      Serial.print(fbdo.httpCode());
+      Serial.println(F(". Stopping flush for next retry."));
+      break;
+    }
+
+    vTaskDelay(pdMS_TO_TICKS(50));
+  }
+
+  if (syncedCount > 0) {
+    uint16_t remaining = (count >= syncedCount) ? (count - syncedCount) : 0;
+    if (remaining > 0) {
+      for (uint16_t i = 0; i < remaining; i++) {
+        String srcKey = "l_" + String(i + syncedCount);
+        String dstKey = "l_" + String(i);
+        FirestoreLogEvent temp;
+        if (offlineLogsPrefs.getBytes(srcKey.c_str(), &temp, sizeof(temp)) == sizeof(temp)) {
+          offlineLogsPrefs.putBytes(dstKey.c_str(), &temp, sizeof(temp));
+          offlineLogsPrefs.remove(srcKey.c_str());
+        }
+      }
+    }
+    offlineLogsPrefs.putUShort("count", remaining);
+    Serial.print(F("[OFFLINE-ROM] Flush progress: "));
+    Serial.print(syncedCount);
+    Serial.print(F(" synced, "));
+    Serial.print(remaining);
+    Serial.println(F(" remaining in ROM."));
+  }
+  Serial.println(F("---------------------------------------------------"));
+}
+
+// FreeRTOS Background Task running on Core 0 to handle Wi-Fi, Firestore sync & 20s roster polling
 void firestoreSyncTask(void* pvParameters) {
   Serial.println(F("[FIREBASE] Background Firestore sync worker task started on Core 0"));
 
@@ -391,74 +550,99 @@ void firestoreSyncTask(void* pvParameters) {
 
   FirestoreLogEvent event;
   bool initialSyncDone = false;
+  unsigned long lastRosterCheckTime = 0;
+  const unsigned long ROSTER_CHECK_INTERVAL_MS = 20000; // 20-second repeat roster sync
 
   // Infinite processing loop on Core 0
   for (;;) {
-    // 1. Verify Wi-Fi connectivity
-    if (WiFi.status() != WL_CONNECTED) {
-      vTaskDelay(pdMS_TO_TICKS(100));
-      continue;
-    }
-
-    // 2. Ensure Firebase token/auth is ready before dequeuing any event
-    if (!Firebase.ready()) {
-      vTaskDelay(pdMS_TO_TICKS(100));
-      continue;
-    }
-
-    // Boot-Time Roster Synchronization (executed once Wi-Fi connects and Firebase.ready() is verified)
-    if (!initialSyncDone) {
-      static int syncAttempts = 0;
-      initialSyncDone = syncStudentsFromCloud();
+    // 1. Maintain Wi-Fi and Firebase synchronization
+    if (WiFi.status() == WL_CONNECTED && Firebase.ready()) {
+      // Boot-Time Roster Synchronization (executed once upon boot)
       if (!initialSyncDone) {
-        syncAttempts++;
-        if (syncAttempts >= 3) {
-          Serial.println(F("[AUTH-SYNC] Max initial sync attempts reached. Retaining existing local NVS cache."));
-          initialSyncDone = true; // Fallback to local NVS cache so event queue processing is not blocked
+        static int syncAttempts = 0;
+        initialSyncDone = syncStudentsFromCloud();
+        if (!initialSyncDone) {
+          syncAttempts++;
+          if (syncAttempts >= 3) {
+            Serial.println(F("[AUTH-SYNC] Max initial sync attempts reached. Retaining existing local NVS cache."));
+            initialSyncDone = true; // Fallback to local NVS cache so event queue processing is not blocked
+          } else {
+            vTaskDelay(pdMS_TO_TICKS(2000));
+          }
         } else {
-          vTaskDelay(pdMS_TO_TICKS(2000));
+          lastRosterCheckTime = millis();
+        }
+      }
+
+      // Flush any offline logs buffered in ROM
+      flushOfflineLogsFromROM();
+
+      // Periodic 20-second Roster check and diff sync (Requirement 3)
+      if (initialSyncDone && (millis() - lastRosterCheckTime >= ROSTER_CHECK_INTERVAL_MS)) {
+        lastRosterCheckTime = millis();
+        bool diffDetected = false;
+        compareAndSyncRoster(false /* periodic */, diffDetected);
+        if (diffDetected) {
+          pendingRestart = true;
         }
       }
     }
 
-    // 3. Dequeue and process incoming log events (waiting up to 100ms)
+    // 2. Dequeue and process incoming log events (waiting up to 100ms)
     if (xQueueReceive(firestoreQueue, &event, pdMS_TO_TICKS(100)) == pdTRUE) {
       Serial.println(F("---------------------------------------------------"));
       Serial.print(F("[FIREBASE] Processing queued event: "));
       Serial.println(event.eventType);
 
-      // Construct Firestore Document JSON according to required schema (combined login + processed data)
-      FirebaseJson content;
-      content.set("fields/eventType/stringValue", event.eventType);
-      content.set("fields/studentName/stringValue", event.studentName);
-      content.set("fields/studentUID/stringValue", event.studentUID);
-      content.set("fields/loginTime/stringValue", event.loginTime);
-      content.set("fields/bookTitle/stringValue", event.bookTitle);
-      content.set("fields/bookUID/stringValue", event.bookUID);
-      content.set("fields/shelf/integerValue", String(event.shelf));
-      content.set("fields/rack/integerValue", String(event.rack));
-      content.set("fields/timestamp/stringValue", event.timestamp);
-      content.set("fields/statusNote/stringValue", event.statusNote);
+      bool sent = false;
+      if (WiFi.status() == WL_CONNECTED && Firebase.ready()) {
+        // Construct Firestore Document JSON according to required schema
+        FirebaseJson content;
+        content.set("fields/eventType/stringValue", event.eventType);
+        content.set("fields/studentName/stringValue", event.studentName);
+        content.set("fields/studentUID/stringValue", event.studentUID);
+        content.set("fields/loginTime/stringValue", event.loginTime);
+        content.set("fields/bookTitle/stringValue", event.bookTitle);
+        content.set("fields/bookUID/stringValue", event.bookUID);
+        content.set("fields/shelf/integerValue", String(event.shelf));
+        content.set("fields/rack/integerValue", String(event.rack));
+        content.set("fields/timestamp/stringValue", event.timestamp);
+        content.set("fields/statusNote/stringValue", event.statusNote);
 
-      Serial.print(F("[FIREBASE] Target Collection: '"));
-      Serial.print(FIRESTORE_COLLECTION);
-      Serial.print(F("' | Custom Doc ID (Time formatted): '"));
-      Serial.print(event.docId);
-      Serial.println(F("'"));
-      Serial.print(F("[FIREBASE] Document JSON Payload: "));
-      Serial.println(content.raw());
+        Serial.print(F("[FIREBASE] Target Collection: '"));
+        Serial.print(FIRESTORE_COLLECTION);
+        Serial.print(F("' | Custom Doc ID (Time formatted): '"));
+        Serial.print(event.docId);
+        Serial.println(F("'"));
+        Serial.print(F("[FIREBASE] Document JSON Payload: "));
+        Serial.println(content.raw());
 
-      // Create document in Firestore with custom Document ID (no random string)
-      if (Firebase.Firestore.createDocument(&fbdo, FIREBASE_PROJECT_ID, "", FIRESTORE_COLLECTION, event.docId, content.raw(), "")) {
-        Serial.print(F("[FIREBASE] Document sync SUCCESS! HTTP Code: "));
-        Serial.println(fbdo.httpCode());
-        Serial.print(F("[FIREBASE] Server Response: "));
-        Serial.println(fbdo.payload());
+        if (firebaseMutex != NULL && xSemaphoreTake(firebaseMutex, pdMS_TO_TICKS(5000)) == pdTRUE) {
+          if (Firebase.Firestore.createDocument(&fbdo, FIREBASE_PROJECT_ID, "", FIRESTORE_COLLECTION, event.docId, content.raw(), "")) {
+            if (fbdo.httpCode() == 200) {
+              sent = true;
+              Serial.print(F("[FIREBASE] Document sync SUCCESS! HTTP Code: "));
+              Serial.println(fbdo.httpCode());
+              Serial.print(F("[FIREBASE] Server Response: "));
+              Serial.println(fbdo.payload());
+            }
+          }
+          if (!sent) {
+            Serial.print(F("[FIREBASE] Document sync FAILED! HTTP Code: "));
+            Serial.print(fbdo.httpCode());
+            Serial.print(F(" | Reason: "));
+            Serial.println(fbdo.errorReason());
+          }
+          xSemaphoreGive(firebaseMutex);
+        }
       } else {
-        Serial.print(F("[FIREBASE] Document sync FAILED! HTTP Code: "));
-        Serial.print(fbdo.httpCode());
-        Serial.print(F(" | Reason: "));
-        Serial.println(fbdo.errorReason());
+        Serial.println(F("[FIREBASE] Network offline or Firebase not ready."));
+      }
+
+      // If document could not be synced immediately, store in ROM for background retry
+      if (!sent) {
+        Serial.println(F("[FIREBASE] Storing unsent event in ROM for background retry..."));
+        saveOfflineLogToROM(event);
       }
       Serial.println(F("---------------------------------------------------"));
     }
@@ -892,135 +1076,449 @@ void readCardUID(char* outBuffer, size_t maxLen) {
 // SECTION 8: OFFLINE-FIRST ROSTER SYNC & VERIFICATION (FIRESTORE & NVS FLASH)
 // =========================================================================================
 
-// Boot-Time Roster Synchronization: Fetches all active students from Firestore and caches in NVS
-bool syncStudentsFromCloud() {
-  Serial.println(F("[AUTH-SYNC] Starting boot-time student roster synchronization from Firestore..."));
+// Retrieve student record from persistent ROM (Preferences NVS)
+bool getStudentFromROM(const char* uid, StudentRecord& outRecord) {
+  if (!uid || uid[0] == '\0') return false;
+  String cleanUID = String(uid);
+  cleanUID.trim();
+  cleanUID.toUpperCase();
 
-  if (WiFi.status() != WL_CONNECTED || !Firebase.ready()) {
-    Serial.println(F("[AUTH-SYNC] Wi-Fi or Firebase offline! Aborting sync; retaining existing local NVS cache."));
+  if (!studentPrefs.isKey(cleanUID.c_str())) {
     return false;
   }
 
-  bool syncSuccess = false;
-  Serial.print(F("[AUTH-SYNC] Fetching collection '"));
-  Serial.print(FIRESTORE_STUDENTS);
-  Serial.println(F("'..."));
+  String val = studentPrefs.getString(cleanUID.c_str(), "");
+  if (val.length() == 0) return false;
 
-  // Fetch all documents from student_names collection using the single global fbdo
-  if (Firebase.Firestore.getDocuments(&fbdo, FIREBASE_PROJECT_ID, "(default)", FIRESTORE_STUDENTS)) {
-    int httpCode = fbdo.httpCode();
-    if (httpCode == 200) {
-      FirebaseJson json;
-      json.setJsonData(fbdo.payload());
-
-      FirebaseJsonData docsData;
-      json.get(docsData, "documents");
-
-      if (docsData.success && docsData.type == "array") {
-        FirebaseJsonArray arr;
-        docsData.getArray(arr);
-        size_t numDocs = arr.size();
-
-        // Clear local NVS "students" namespace before populating fresh cloud roster
-        studentPrefs.clear();
-        size_t activeCount = 0;
-
-        for (size_t i = 0; i < numDocs; i++) {
-          FirebaseJsonData itemData;
-          arr.get(itemData, i);
-          if (itemData.success) {
-            FirebaseJson docJson;
-            itemData.getJSON(docJson);
-
-            FirebaseJsonData resNameData, nameData, activeData;
-            docJson.get(resNameData, "name");
-            docJson.get(nameData, "fields/name/stringValue");
-            docJson.get(activeData, "fields/active/booleanValue");
-
-            bool isActive = true;
-            if (activeData.success) {
-              isActive = (activeData.boolValue || activeData.stringValue == "true");
-            }
-
-            if (isActive && resNameData.success && nameData.success) {
-              // Extract document ID (the RFID UID) from resource path (everything after last '/')
-              String fullPath = resNameData.stringValue;
-              int lastSlash = fullPath.lastIndexOf('/');
-              String uid = (lastSlash >= 0) ? fullPath.substring(lastSlash + 1) : fullPath;
-              uid.trim();
-              uid.toUpperCase();
-
-              String studentName = nameData.stringValue;
-              studentName.trim();
-
-              if (uid.length() > 0 && studentName.length() > 0) {
-                studentPrefs.putString(uid.c_str(), studentName.c_str());
-                activeCount++;
-                Serial.print(F("[AUTH-SYNC] Cached student: \""));
-                Serial.print(studentName);
-                Serial.print(F("\" [UID: "));
-                Serial.print(uid);
-                Serial.println(F("]"));
-              }
-            }
-          }
-        }
-        Serial.print(F("[AUTH-SYNC] Sync SUCCESS! Total active students cached in NVS: "));
-        Serial.println(activeCount);
-        syncSuccess = true;
-      } else {
-        // Collection returned empty or no documents array
-        studentPrefs.clear();
-        Serial.println(F("[AUTH-SYNC] Collection 'student_names' is empty. Local NVS cache cleared."));
-        syncSuccess = true;
-      }
-    } else {
-      Serial.print(F("[AUTH-SYNC] Sync request failed! HTTP Code: "));
-      Serial.print(httpCode);
-      Serial.println(F(". Retaining existing local NVS cache."));
-    }
+  int sep = val.indexOf('|');
+  if (sep >= 0) {
+    String nameStr = val.substring(0, sep);
+    nameStr.trim();
+    strncpy(outRecord.name, nameStr.c_str(), sizeof(outRecord.name) - 1);
+    outRecord.name[sizeof(outRecord.name) - 1] = '\0';
+    String actStr = val.substring(sep + 1);
+    actStr.trim();
+    outRecord.active = (actStr == "1" || actStr == "true");
   } else {
-    Serial.print(F("[AUTH-SYNC] Sync request failed: "));
-    Serial.println(fbdo.errorReason());
-    Serial.println(F("[AUTH-SYNC] Retaining existing local NVS cache."));
+    strncpy(outRecord.name, val.c_str(), sizeof(outRecord.name) - 1);
+    outRecord.name[sizeof(outRecord.name) - 1] = '\0';
+    outRecord.active = true;
   }
-
-  return syncSuccess;
+  return true;
 }
 
-// Student Verification: Read student name directly from the NVS namespace "students" populated during boot sync
-bool verifyStudentWithCache(const char* uid, char* outName, size_t maxLen) {
-  if (uid == nullptr || uid[0] == '\0') {
+// Stores or updates student credentials & active status in persistent ROM (NVS)
+void saveStudentToROM(const char* uid, const char* name, bool active) {
+  if (!uid || uid[0] == '\0' || !name || name[0] == '\0') return;
+  String cleanUID = String(uid);
+  cleanUID.trim();
+  cleanUID.toUpperCase();
+
+  String val = String(name) + "|" + (active ? "1" : "0");
+  studentPrefs.putString(cleanUID.c_str(), val);
+
+  // Maintain UID in __uids__ list
+  String uids = studentPrefs.getString("__uids__", "");
+  bool exists = false;
+  int start = 0;
+  while (start < uids.length()) {
+    int comma = uids.indexOf(',', start);
+    String token = (comma >= 0) ? uids.substring(start, comma) : uids.substring(start);
+    token.trim();
+    if (token == cleanUID) {
+      exists = true;
+      break;
+    }
+    if (comma < 0) break;
+    start = comma + 1;
+  }
+  if (!exists) {
+    if (uids.length() > 0) uids += ",";
+    uids += cleanUID;
+    studentPrefs.putString("__uids__", uids);
+  }
+}
+
+// Removes a student from persistent ROM (NVS)
+void removeStudentFromROM(const char* uid) {
+  if (!uid || uid[0] == '\0') return;
+  String cleanUID = String(uid);
+  cleanUID.trim();
+  cleanUID.toUpperCase();
+
+  studentPrefs.remove(cleanUID.c_str());
+
+  String uids = studentPrefs.getString("__uids__", "");
+  if (uids.length() > 0) {
+    String newUids = "";
+    int start = 0;
+    while (start < uids.length()) {
+      int comma = uids.indexOf(',', start);
+      String token = (comma >= 0) ? uids.substring(start, comma) : uids.substring(start);
+      token.trim();
+      if (token.length() > 0 && token != cleanUID) {
+        if (newUids.length() > 0) newUids += ",";
+        newUids += token;
+      }
+      if (comma < 0) break;
+      start = comma + 1;
+    }
+    studentPrefs.putString("__uids__", newUids);
+  }
+}
+
+// Reads all student UIDs currently indexed in persistent ROM (NVS)
+std::vector<String> getAllROMUIDs() {
+  std::vector<String> list;
+  String uids = studentPrefs.getString("__uids__", "");
+  int start = 0;
+  while (start < uids.length()) {
+    int comma = uids.indexOf(',', start);
+    String token = (comma >= 0) ? uids.substring(start, comma) : uids.substring(start);
+    token.trim();
+    if (token.length() > 0) {
+      list.push_back(token);
+    }
+    if (comma < 0) break;
+    start = comma + 1;
+  }
+  return list;
+}
+
+// Periodic (every 20s) & Boot-Time Roster Synchronization with Diff Detection
+// First reads ROM, then reads Firestore 'student_names'. If differences exist, updates ROM.
+bool compareAndSyncRoster(bool isBoot, bool &outDiffDetected) {
+  outDiffDetected = false;
+  if (WiFi.status() != WL_CONNECTED || !Firebase.ready()) {
     return false;
   }
 
-  // Ensure UID is formatted as uppercase hex
+  Serial.println(F("[AUTH-SYNC] Reading ROM cache & checking Firestore student_names collection..."));
+
+  // 1. Read current ROM roster
+  std::vector<String> romUIDs = getAllROMUIDs();
+  struct RosterEntry {
+    String uid;
+    String name;
+    bool active;
+  };
+  std::vector<RosterEntry> romList;
+  for (size_t i = 0; i < romUIDs.size(); i++) {
+    StudentRecord rec;
+    if (getStudentFromROM(romUIDs[i].c_str(), rec)) {
+      RosterEntry e;
+      e.uid = romUIDs[i];
+      e.name = String(rec.name);
+      e.active = rec.active;
+      romList.push_back(e);
+    }
+  }
+
+  // 2. Fetch Firestore student_names collection using thread-safe mutex
+  bool getOk = false;
+  if (firebaseMutex != NULL && xSemaphoreTake(firebaseMutex, pdMS_TO_TICKS(5000)) == pdTRUE) {
+    getOk = Firebase.Firestore.getDocuments(&fbdo, FIREBASE_PROJECT_ID, "(default)", FIRESTORE_STUDENTS);
+    xSemaphoreGive(firebaseMutex);
+  }
+
+  if (!getOk || fbdo.httpCode() != 200) {
+    Serial.print(F("[AUTH-SYNC] Failed to fetch documents from Firestore. HTTP: "));
+    Serial.println(fbdo.httpCode());
+    return false;
+  }
+
+  FirebaseJson json;
+  json.setJsonData(fbdo.payload());
+  FirebaseJsonData docsData;
+  json.get(docsData, "documents");
+
+  std::vector<RosterEntry> cloudList;
+  if (docsData.success && docsData.type == "array") {
+    FirebaseJsonArray arr;
+    docsData.getArray(arr);
+    size_t numDocs = arr.size();
+
+    for (size_t i = 0; i < numDocs; i++) {
+      FirebaseJsonData itemData;
+      arr.get(itemData, i);
+      if (itemData.success) {
+        FirebaseJson docJson;
+        itemData.getJSON(docJson);
+
+        FirebaseJsonData resNameData, nameData, activeData;
+        docJson.get(resNameData, "name");
+        docJson.get(nameData, "fields/name/stringValue");
+        docJson.get(activeData, "fields/active/booleanValue");
+
+        bool isActive = true;
+        if (activeData.success) {
+          isActive = (activeData.boolValue || activeData.stringValue == "true");
+        }
+
+        if (resNameData.success && nameData.success) {
+          String fullPath = resNameData.stringValue;
+          int lastSlash = fullPath.lastIndexOf('/');
+          String uid = (lastSlash >= 0) ? fullPath.substring(lastSlash + 1) : fullPath;
+          uid.trim();
+          uid.toUpperCase();
+
+          String studentName = nameData.stringValue;
+          studentName.trim();
+
+          if (uid.length() > 0 && studentName.length() > 0) {
+            RosterEntry e;
+            e.uid = uid;
+            e.name = studentName;
+            e.active = isActive;
+            cloudList.push_back(e);
+          }
+        }
+      }
+    }
+  }
+
+  // 3. Compare romList with cloudList
+  bool diff = false;
+  if (romList.size() != cloudList.size()) {
+    diff = true;
+    Serial.print(F("[AUTH-SYNC] Difference: Student count changed (ROM: "));
+    Serial.print(romList.size());
+    Serial.print(F(", Cloud: "));
+    Serial.print(cloudList.size());
+    Serial.println(F(")"));
+  } else {
+    for (size_t c = 0; c < cloudList.size(); c++) {
+      bool found = false;
+      for (size_t r = 0; r < romList.size(); r++) {
+        if (cloudList[c].uid == romList[r].uid) {
+          found = true;
+          if (cloudList[c].name != romList[r].name) {
+            diff = true;
+            Serial.print(F("[AUTH-SYNC] Difference: Student name changed for UID "));
+            Serial.print(cloudList[c].uid);
+            Serial.print(F(" (\""));
+            Serial.print(romList[r].name);
+            Serial.print(F("\" -> \""));
+            Serial.print(cloudList[c].name);
+            Serial.println(F("\")"));
+          }
+          if (cloudList[c].active != romList[r].active) {
+            diff = true;
+            Serial.print(F("[AUTH-SYNC] Difference: Student active status changed for UID "));
+            Serial.print(cloudList[c].uid);
+            Serial.print(F(" ("));
+            Serial.print(romList[r].active ? F("active") : F("suspended"));
+            Serial.print(F(" -> "));
+            Serial.print(cloudList[c].active ? F("active") : F("suspended"));
+            Serial.println(F(")"));
+          }
+          break;
+        }
+      }
+      if (!found) {
+        diff = true;
+        Serial.print(F("[AUTH-SYNC] Difference: Student UID in cloud not found in ROM: "));
+        Serial.println(cloudList[c].uid);
+        break;
+      }
+      if (diff) break;
+    }
+  }
+
+  if (diff) {
+    Serial.println(F("[AUTH-SYNC] Updating ROM cache with fresh Firestore roster..."));
+    studentPrefs.clear();
+    String newUids = "";
+    for (size_t i = 0; i < cloudList.size(); i++) {
+      String val = cloudList[i].name + "|" + (cloudList[i].active ? "1" : "0");
+      studentPrefs.putString(cloudList[i].uid.c_str(), val);
+      if (newUids.length() > 0) newUids += ",";
+      newUids += cloudList[i].uid;
+      Serial.print(F("[AUTH-SYNC] Cached: \""));
+      Serial.print(cloudList[i].name);
+      Serial.print(F("\" [UID: "));
+      Serial.print(cloudList[i].uid);
+      Serial.print(F(" | Active: "));
+      Serial.print(cloudList[i].active ? F("true") : F("false"));
+      Serial.println(F("]"));
+    }
+    studentPrefs.putString("__uids__", newUids);
+    Serial.print(F("[AUTH-SYNC] ROM update complete. Total students cached: "));
+    Serial.println(cloudList.size());
+
+    if (!isBoot) {
+      outDiffDetected = true;
+      Serial.println(F("[AUTH-SYNC] Differences detected! Roster updated. Scheduling restart countdown..."));
+    }
+  } else {
+    Serial.println(F("[AUTH-SYNC] Periodic 20s check: ROM cache and Firestore match perfectly. No changes."));
+  }
+
+  return true;
+}
+
+// Boot-Time Roster Synchronization entry point
+bool syncStudentsFromCloud() {
+  bool unused = false;
+  return compareAndSyncRoster(true /* isBoot */, unused);
+}
+
+// Dual-Check Student Verification: Checks Firestore & ROM simultaneously with auto-healing and offline fallback
+bool verifyStudentDual(const char* uid, char* outName, size_t maxLen, StudentAuthStatus& outStatus) {
+  if (uid == nullptr || uid[0] == '\0') {
+    outStatus = STUDENT_AUTH_NOT_FOUND;
+    return false;
+  }
+
   String uidStr = String(uid);
   uidStr.trim();
   uidStr.toUpperCase();
   const char* cleanUID = uidStr.c_str();
 
-  // Avoid executing conflicting network requests on Core 1 while Core 0 runs background logging.
-  // Read student name directly from NVS namespace "students" populated during boot sync.
-  if (studentPrefs.isKey(cleanUID)) {
-    String cachedName = studentPrefs.getString(cleanUID, "");
-    if (cachedName.length() > 0) {
-      if (outName != nullptr && maxLen > 0) {
-        strncpy(outName, cachedName.c_str(), maxLen - 1);
+  // 1. Read local ROM
+  StudentRecord romRecord;
+  bool inROM = getStudentFromROM(cleanUID, romRecord);
+
+  // 2. Query Firestore if network is available
+  bool cloudChecked = false;
+  bool inCloud = false;
+  String cloudName = "";
+  bool cloudActive = true;
+
+  if (WiFi.status() == WL_CONNECTED && Firebase.ready()) {
+    if (firebaseMutex != NULL && xSemaphoreTake(firebaseMutex, pdMS_TO_TICKS(1500)) == pdTRUE) {
+      String docPath = String(FIRESTORE_STUDENTS) + "/" + cleanUID;
+      Serial.print(F("[AUTH] Querying Firestore for student UID ["));
+      Serial.print(cleanUID);
+      Serial.println(F("]..."));
+
+      if (Firebase.Firestore.getDocument(&fbdo, FIREBASE_PROJECT_ID, "", docPath.c_str())) {
+        int httpCode = fbdo.httpCode();
+        if (httpCode == 200) {
+          FirebaseJson json;
+          json.setJsonData(fbdo.payload());
+          FirebaseJsonData nameData, activeData;
+          json.get(nameData, "fields/name/stringValue");
+          json.get(activeData, "fields/active/booleanValue");
+
+          cloudName = nameData.success ? nameData.stringValue : "";
+          cloudName.trim();
+          if (activeData.success) {
+            cloudActive = (activeData.boolValue || activeData.stringValue == "true");
+          } else {
+            cloudActive = true;
+          }
+
+          if (cloudName.length() > 0) {
+            cloudChecked = true;
+            inCloud = true;
+          }
+        } else if (httpCode == 404) {
+          cloudChecked = true;
+          inCloud = false;
+        } else {
+          Serial.print(F("[AUTH] Firestore getDocument returned HTTP "));
+          Serial.print(httpCode);
+          Serial.println(F(". Falling back to ROM cache."));
+        }
+      } else {
+        Serial.print(F("[AUTH] Firestore getDocument request failed: "));
+        Serial.print(fbdo.errorReason());
+        Serial.println(F(". Falling back to ROM cache."));
+      }
+      xSemaphoreGive(firebaseMutex);
+    } else {
+      Serial.println(F("[AUTH] Firebase mutex busy. Falling back to ROM cache."));
+    }
+  } else {
+    Serial.println(F("[AUTH] Wi-Fi or Firebase offline. Falling back to ROM cache."));
+  }
+
+  // 3. Process Cloud vs ROM comparison
+  if (cloudChecked) {
+    if (inCloud) {
+      if (inROM) {
+        Serial.print(F("[AUTH] Card verified in ROM and Firestore: \""));
+        Serial.print(cloudName);
+        Serial.print(F("\" [Active: "));
+        Serial.print(cloudActive ? F("true") : F("false"));
+        Serial.println(F("]"));
+        // Update ROM if name or active state changed in cloud
+        if (String(romRecord.name) != cloudName || romRecord.active != cloudActive) {
+          saveStudentToROM(cleanUID, cloudName.c_str(), cloudActive);
+          Serial.println(F("[AUTH] Synchronized updated cloud data to ROM."));
+        }
+      } else {
+        // "if rom not there but firestore there then continue and also update the rom"
+        Serial.print(F("[AUTH] Card not in ROM, but FOUND in Firestore: \""));
+        Serial.print(cloudName);
+        Serial.print(F("\" [Active: "));
+        Serial.print(cloudActive ? F("true") : F("false"));
+        Serial.println(F("\"]. Updating ROM..."));
+        saveStudentToROM(cleanUID, cloudName.c_str(), cloudActive);
+      }
+
+      if (outName && maxLen > 0) {
+        strncpy(outName, cloudName.c_str(), maxLen - 1);
         outName[maxLen - 1] = '\0';
       }
-      Serial.print(F("[AUTH]     Verified student from NVS cache: \""));
-      Serial.print(outName ? outName : "");
-      Serial.print(F("\" [UID: "));
-      Serial.print(cleanUID);
-      Serial.println(F("]"));
-      return true;
+      outStatus = cloudActive ? STUDENT_AUTH_ACTIVE : STUDENT_AUTH_SUSPENDED;
+      return cloudActive;
+    } else {
+      // Cloud checked, and document was NOT FOUND in Firestore (deleted from cloud)
+      // "means rom there but firestore not there teehn update teh rom and show apprropreiate msg"
+      if (inROM) {
+        Serial.print(F("[AUTH] Card UID ["));
+        Serial.print(cleanUID);
+        Serial.println(F("] present in ROM but DELETED from Firestore. Removing from ROM..."));
+        removeStudentFromROM(cleanUID);
+        outStatus = STUDENT_AUTH_ROM_REMOVED;
+        return false;
+      } else {
+        Serial.print(F("[AUTH] Card UID ["));
+        Serial.print(cleanUID);
+        Serial.println(F("] not found in Firestore or ROM."));
+        outStatus = STUDENT_AUTH_NOT_FOUND;
+        return false;
+      }
     }
   }
 
-  Serial.print(F("[AUTH]     Student UID ["));
+  // 4. Fallback to ROM (network was offline or error occurred)
+  if (inROM) {
+    Serial.print(F("[AUTH] ROM Cache Fallback: Found student \""));
+    Serial.print(romRecord.name);
+    Serial.print(F("\" [UID: "));
+    Serial.print(cleanUID);
+    Serial.print(F(" | Active: "));
+    Serial.print(romRecord.active ? F("true") : F("false"));
+    Serial.println(F("]"));
+
+    if (outName && maxLen > 0) {
+      strncpy(outName, romRecord.name, maxLen - 1);
+      outName[maxLen - 1] = '\0';
+    }
+    outStatus = romRecord.active ? STUDENT_AUTH_ACTIVE : STUDENT_AUTH_SUSPENDED;
+    return romRecord.active;
+  }
+
+  Serial.print(F("[AUTH] ROM Cache Fallback: UID ["));
   Serial.print(cleanUID);
-  Serial.println(F("] not found in local cache!"));
+  Serial.println(F("] not found in ROM cache!"));
+  outStatus = STUDENT_AUTH_NOT_FOUND;
+  return false;
+}
+
+// Student Verification: Read student name directly from ROM cache
+bool verifyStudentWithCache(const char* uid, char* outName, size_t maxLen) {
+  StudentRecord rec;
+  if (getStudentFromROM(uid, rec)) {
+    if (outName && maxLen > 0) {
+      strncpy(outName, rec.name, maxLen - 1);
+      outName[maxLen - 1] = '\0';
+    }
+    return true;
+  }
   return false;
 }
 
@@ -1053,9 +1551,12 @@ int findBookIndex(const char* uid) {
 // Handles Student Check-In (State 1: WAITING_FOR_STUDENT)
 void handleStudentScan(const char* uid) {
   char verifiedName[32] = "";
+  StudentAuthStatus authStatus = STUDENT_AUTH_NOT_FOUND;
 
-  if (verifyStudentWithCache(uid, verifiedName, sizeof(verifiedName))) {
-    // 1. Authorized Student authenticated
+  verifyStudentDual(uid, verifiedName, sizeof(verifiedName), authStatus);
+
+  if (authStatus == STUDENT_AUTH_ACTIVE) {
+    // 1. Authorized Active Student authenticated
     Serial.print(F("[SUCCESS]  Student authenticated: "));
     Serial.print(verifiedName);
     Serial.print(F(" ("));
@@ -1102,7 +1603,56 @@ void handleStudentScan(const char* uid) {
     return;
   }
 
-  // 2. Book tag scanned instead of Student ID Card
+  if (authStatus == STUDENT_AUTH_SUSPENDED) {
+    // 2. Student Card Suspended (active: false in Firestore / ROM)
+    Serial.print(F("[AUTH]     Student Card SUSPENDED (active=false): \""));
+    Serial.print(verifiedName);
+    Serial.print(F("\" [UID: "));
+    Serial.print(uid);
+    Serial.println(F("]"));
+
+    // 2 warning beeps on buzzer + Red LED
+    for (int i = 0; i < 2; i++) {
+      digitalWrite(RED_LED_PIN, HIGH);
+      digitalWrite(BUZZER_PIN, HIGH);
+      delay(150);
+      digitalWrite(RED_LED_PIN, LOW);
+      digitalWrite(BUZZER_PIN, LOW);
+      if (i < 1) delay(100);
+    }
+
+    // Display suspended message on LCD (Requirement 1)
+    showMessage(" Card Suspended ", " Contact Admin  ");
+    delay(2500);
+
+    resetSystem();
+    return;
+  }
+
+  if (authStatus == STUDENT_AUTH_ROM_REMOVED) {
+    // 3. Card was cached in ROM, but deleted from Firestore
+    Serial.print(F("[AUTH]     Card UID ["));
+    Serial.print(uid);
+    Serial.println(F("] deleted from cloud. ROM updated (cache cleared)."));
+
+    // 2 warning beeps on buzzer + Red LED
+    for (int i = 0; i < 2; i++) {
+      digitalWrite(RED_LED_PIN, HIGH);
+      digitalWrite(BUZZER_PIN, HIGH);
+      delay(150);
+      digitalWrite(RED_LED_PIN, LOW);
+      digitalWrite(BUZZER_PIN, LOW);
+      if (i < 1) delay(100);
+    }
+
+    showMessage(" Card Inactive  ", " Access Revoked ");
+    delay(2500);
+
+    resetSystem();
+    return;
+  }
+
+  // 4. Book tag scanned instead of Student ID Card
   int bookIdx = findBookIndex(uid);
   if (bookIdx != -1) {
     const Book& scannedBook = registeredBooks[bookIdx];
@@ -1118,7 +1668,7 @@ void handleStudentScan(const char* uid) {
     return;
   }
 
-  // 3. Unrecognized tag scanned -> Emergency alarm & SECURITY_ALERT
+  // 5. Unrecognized tag scanned -> Emergency alarm & SECURITY_ALERT
   Serial.print(F("[ERROR]    Unrecognized tag UID: "));
   Serial.println(uid);
   char reason[96];
@@ -1355,9 +1905,13 @@ void setup() {
   esp_task_wdt_init(30, false);
   esp_task_wdt_delete(xTaskGetIdleTaskHandleForCPU(0));
 
-  // Initialize NVS Preferences for offline-first student roster caching
+  // Initialize NVS Preferences for offline-first student roster caching & offline log buffering
   studentPrefs.begin("students", false);
-  Serial.println(F("[NVS]      Preferences namespace \"students\" initialized"));
+  offlineLogsPrefs.begin("off_logs", false);
+  Serial.println(F("[NVS]      Preferences namespaces \"students\" & \"off_logs\" initialized"));
+
+  // Initialize FreeRTOS mutex for safe multi-core Firebase access
+  firebaseMutex = xSemaphoreCreateMutex();
 
   // Create FreeRTOS Queue for non-blocking Firestore document synchronization (up to 10 events)
   firestoreQueue = xQueueCreate(10, sizeof(FirestoreLogEvent));
@@ -1399,6 +1953,21 @@ void setup() {
 }
 
 void loop() {
+  // Auto-restart countdown if roster data was updated in Firestore (Requirement 2 & 3)
+  if (pendingRestart && currentState == WAITING_FOR_STUDENT) {
+    pendingRestart = false;
+    Serial.println(F("[SYSTEM]   Roster update detected in Firestore! Starting restart sequence..."));
+    showMessage(" Data Updated!  ", "Restarting in 3.");
+    delay(1000);
+    showMessage(" Data Updated!  ", "Restarting in 2.");
+    delay(1000);
+    showMessage(" Data Updated!  ", "Restarting in 1.");
+    delay(1000);
+    showMessage("  Restarting... ", "   ShelfSense   ");
+    delay(500);
+    ESP.restart();
+  }
+
   // Non-blocking inactivity detection in WAITING_FOR_BOOK (18-second timeout)
   if (currentState == WAITING_FOR_BOOK) {
     unsigned long elapsedMs = millis() - sessionStartTime;
