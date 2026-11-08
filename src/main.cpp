@@ -93,9 +93,11 @@
 #define WIFI_PASSWORD       ""              // Replace with your Wi-Fi password
 
 // Firebase & Google Cloud Firestore Configuration
-#define FIREBASE_PROJECT_ID "shelf-sense-f86ba"
-#define FIREBASE_API_KEY    "AIzaSyDHboFG0dyoMTLCH0bkZ85OkWk2yxBXVRQ"
-#define FIRESTORE_COLLECTION "library_logs"
+#define FIREBASE_PROJECT_ID    "shelf-sense-f86ba"
+#define FIREBASE_API_KEY       "AIzaSyDHboFG0dyoMTLCH0bkZ85OkWk2yxBXVRQ"
+#define FIREBASE_USER_EMAIL    "esp32@shelfsense.local"
+#define FIREBASE_USER_PASSWORD "ShelfSense@2026"
+#define FIRESTORE_COLLECTION   "library_logs"
 
 // NTP Time Synchronization Configuration (IST: UTC + 5:30 = 19800 seconds)
 #define NTP_SERVER_1        "pool.ntp.org"
@@ -319,91 +321,75 @@ void queueFirestoreLog(const char* eventType,
 void firestoreSyncTask(void* pvParameters) {
   Serial.println(F("[FIREBASE] Background Firestore sync worker task started on Core 0"));
 
-  // Configure Firebase Credentials & Connection Parameters
-  config.api_key = FIREBASE_API_KEY;
-  config.token_status_callback = tokenStatusCallback;
-  Firebase.reconnectNetwork(true);
-  fbdo.setBSSLBufferSize(4096 /* Rx buffer */, 1024 /* Tx buffer */);
-  fbdo.setResponseSize(2048);
-
   // Wait for initial Wi-Fi connection
   while (WiFi.status() != WL_CONNECTED) {
     vTaskDelay(pdMS_TO_TICKS(500));
   }
 
-  Serial.println(F("[FIREBASE] Wi-Fi link ready. Initializing Firebase Authentication..."));
-  if (Firebase.signUp(&config, &auth, "", "")) {
-    Serial.println(F("[FIREBASE] Anonymous Authentication initialized successfully"));
-  } else {
-    Serial.print(F("[FIREBASE] Authentication status note: "));
-    Serial.println(config.signer.signupError.message.c_str());
-  }
+  Serial.println(F("[FIREBASE] Wi-Fi link ready. Configuring Email/Password Authentication..."));
+  config.api_key = FIREBASE_API_KEY;
+  auth.user.email = FIREBASE_USER_EMAIL;
+  auth.user.password = FIREBASE_USER_PASSWORD;
+  config.token_status_callback = tokenStatusCallback;
+  Firebase.reconnectNetwork(true);
+  fbdo.setBSSLBufferSize(4096 /* Rx buffer */, 1024 /* Tx buffer */);
+  fbdo.setResponseSize(2048);
 
   Firebase.begin(&config, &auth);
-  Serial.println(F("[FIREBASE] Client library initialized. Ready for background document sync."));
+  Serial.print(F("[FIREBASE] Client library initialized for: "));
+  Serial.println(FIREBASE_USER_EMAIL);
 
   FirestoreLogEvent event;
 
   // Infinite processing loop on Core 0
   for (;;) {
-    // Wait up to 100ms for incoming queued log events
+    // 1. Verify Wi-Fi connectivity
+    if (WiFi.status() != WL_CONNECTED) {
+      vTaskDelay(pdMS_TO_TICKS(250));
+      continue;
+    }
+
+    // 2. Ensure Firebase token/auth is ready before dequeuing any event
+    if (!Firebase.ready()) {
+      vTaskDelay(pdMS_TO_TICKS(50));
+      continue;
+    }
+
+    // 3. Dequeue and process incoming log events (waiting up to 100ms)
     if (xQueueReceive(firestoreQueue, &event, pdMS_TO_TICKS(100)) == pdTRUE) {
       Serial.println(F("---------------------------------------------------"));
       Serial.print(F("[FIREBASE] Processing queued event: "));
       Serial.println(event.eventType);
 
-      // Verify Wi-Fi connectivity
-      if (WiFi.status() != WL_CONNECTED) {
-        Serial.println(F("[WIFI]     Connection lost! Waiting for background link restore..."));
-        unsigned long reconnectStart = millis();
-        while (WiFi.status() != WL_CONNECTED && (millis() - reconnectStart < 6000)) {
-          vTaskDelay(pdMS_TO_TICKS(250));
-        }
-      }
+      // Construct Firestore Document JSON according to required schema
+      FirebaseJson content;
+      content.set("fields/eventType/stringValue", event.eventType);
+      content.set("fields/studentName/stringValue", event.studentName);
+      content.set("fields/studentUID/stringValue", event.studentUID);
+      content.set("fields/bookTitle/stringValue", event.bookTitle);
+      content.set("fields/bookUID/stringValue", event.bookUID);
+      content.set("fields/shelf/integerValue", String(event.shelf));
+      content.set("fields/rack/integerValue", String(event.rack));
+      content.set("fields/timestamp/stringValue", event.timestamp);
+      content.set("fields/statusNote/stringValue", event.statusNote);
 
-      if (WiFi.status() == WL_CONNECTED) {
-        // Ensure Firebase token is ready
-        unsigned long tokenStart = millis();
-        while (!Firebase.ready() && (millis() - tokenStart < 5000)) {
-          vTaskDelay(pdMS_TO_TICKS(150));
-        }
+      Serial.print(F("[FIREBASE] Target Collection: '"));
+      Serial.print(FIRESTORE_COLLECTION);
+      Serial.println(F("'"));
+      Serial.print(F("[FIREBASE] Document JSON Payload: "));
+      Serial.println(content.raw());
 
-        if (Firebase.ready()) {
-          // Construct Firestore Document JSON according to required schema
-          FirebaseJson content;
-          content.set("fields/eventType/stringValue", event.eventType);
-          content.set("fields/studentName/stringValue", event.studentName);
-          content.set("fields/studentUID/stringValue", event.studentUID);
-          content.set("fields/bookTitle/stringValue", event.bookTitle);
-          content.set("fields/bookUID/stringValue", event.bookUID);
-          content.set("fields/shelf/integerValue", String(event.shelf));
-          content.set("fields/rack/integerValue", String(event.rack));
-          content.set("fields/timestamp/stringValue", event.timestamp);
-          content.set("fields/statusNote/stringValue", event.statusNote);
-
-          Serial.print(F("[FIREBASE] Target Collection: '"));
-          Serial.print(FIRESTORE_COLLECTION);
-          Serial.println(F("'"));
-          Serial.print(F("[FIREBASE] Document JSON Payload: "));
-          Serial.println(content.raw());
-
-          // Automatic document creation in Google Cloud Firestore
-          if (Firebase.Firestore.createDocument(&fbdo, FIREBASE_PROJECT_ID, "", FIRESTORE_COLLECTION, content.raw())) {
-            Serial.print(F("[FIREBASE] Document sync SUCCESS! HTTP Code: "));
-            Serial.println(fbdo.httpCode());
-            Serial.print(F("[FIREBASE] Server Response: "));
-            Serial.println(fbdo.payload());
-          } else {
-            Serial.print(F("[FIREBASE] Document sync FAILED! HTTP Code: "));
-            Serial.print(fbdo.httpCode());
-            Serial.print(F(" | Reason: "));
-            Serial.println(fbdo.errorReason());
-          }
-        } else {
-          Serial.println(F("[FIREBASE] ERROR: Firebase token not ready, document sync deferred."));
-        }
+      // Automatic document creation in Google Cloud Firestore
+      if (Firebase.Firestore.createDocument(&fbdo, FIREBASE_PROJECT_ID, "", FIRESTORE_COLLECTION, content.raw())) {
+        Serial.print(F("[FIREBASE] Document sync SUCCESS! HTTP Code: "));
+        Serial.println(fbdo.httpCode());
+        Serial.print(F("[FIREBASE] Server Response: "));
+        Serial.println(fbdo.payload());
       } else {
-        Serial.println(F("[FIREBASE] ERROR: Wi-Fi unavailable, unable to sync document."));
+        Serial.print(F("[FIREBASE] Document sync FAILED! HTTP Code: "));
+        Serial.print(fbdo.httpCode());
+        Serial.print(F(" | Reason: "));
+        Serial.println(fbdo.errorReason());
       }
       Serial.println(F("---------------------------------------------------"));
     }
