@@ -19,6 +19,9 @@
 - [System Architecture & Workflow](#system-architecture--workflow)
 - [Core Features](#core-features)
 - [Interactive Serial Commands](#interactive-serial-commands-115200-baud)
+- [ESP32 Task Manager (`all` command)](#esp32-task-manager-all-command)
+- [Periodic 30-Second Time & Calendar Broadcast](#periodic-30-second-time--calendar-broadcast)
+- [Commands Audit Trail (`commands-log` collection)](#commands-audit-trail-commands-log-collection)
 - [Hardware & Pinout Reference](#hardware--pinout-reference)
   - [1. RC522 RFID Reader (SPI / VSPI)](#1-rc522-rfid-reader-spi--vspi)
   - [2. 16x2 Character LCD (I2C Backpack)](#2-16x2-character-lcd-i2c-backpack)
@@ -27,8 +30,9 @@
 - [Operational Behavior & Guidance Choreography](#operational-behavior--guidance-choreography)
 - [Cloud & Database Configuration](#cloud--database-configuration)
   - [Firestore Collections](#firestore-collections)
+  - [Commands Audit Collection (`commands-log`)](#commands-audit-collection-commands-log)
   - [Offline-First NVS Flash Caching](#offline-first-nvs-flash-caching)
-  - [Registered Library Books Catalog](#registered-library-books-catalog)
+  - [Registered Library Books Catalog Fallback](#registered-library-books-catalog-fallback)
 - [Build, Flash & Memory Configuration](#build-flash--memory-configuration)
 - [Serial Monitor Diagnostic Reference](#serial-monitor-diagnostic-reference)
 - [Troubleshooting](#troubleshooting)
@@ -39,6 +43,12 @@
 
 ## Architectural Highlights
 
+- **Embedded ESP32 Task Manager (`all`)**:
+  - Live inspection utility functioning like a professional operating system task manager. Displays dual-core task assignments (Core 0 cloud/storage engine & Core 1 real-time UI engine), live FreeRTOS task status table (`uxTaskGetSystemState`), memory utilization (heap, watermark, max alloc block), and persistent ROM data.
+- **Commands Audit Trail to Firestore (`commands-log`)**:
+  - Every Serial CLI command execution is automatically synchronized to a dedicated Firestore collection `commands-log`. Each document uses a timestamp ID (`YYYY-MM-DD_HHMMSS`) and records complete pre-execution state (`stateBefore`), Serial Monitor output (`serialOutput`), action summary, and post-execution state (`stateAfter` - e.g. what was done or left after `clr`).
+- **30-Second Periodic Time & Calendar Broadcaster**:
+  - Automatically broadcasts full calendar and clock metrics (Year, Day of Year, Month name and number, Date, Day of Week, 24-hour time, 12-hour time with AM/PM, IST UTC+5:30 offset, ISO-8601, and System Uptime) to the Serial Monitor every 30 seconds.
 - **Dual-Core FreeRTOS Partitioning**:
   - **Core 1 (Real-Time Hardware Engine)**: Dedicated entirely to SPI RFID polling, 16x2 I2C LCD animations, buzzer tones, dual-LED feedback, and serial CLI commands. Scanning evaluates with **instant 0ms zero network latency**.
   - **Core 0 (Background Cloud Worker)**: Runs an asynchronous worker task managing Wi-Fi connectivity, NTP time synchronization, Firebase email/password authentication, periodic 20-second roster diff checks, and non-blocking transaction dispatching.
@@ -144,14 +154,22 @@ stateDiagram-v2
 
 ## Interactive Serial Commands (115200 Baud)
 
-ShelfSense provides a non-blocking interactive command-line interface directly over the USB Serial link (115200 baud). Commands are categorized into **Combined (Global)**, **Student-Specific (`*s`)**, and **Book-Specific (`*b`)** operations:
+ShelfSense provides a non-blocking interactive command-line interface directly over the USB Serial link (115200 baud). Commands are categorized into **System / Task Manager**, **Combined (Global)**, **Student-Specific (`*s`)**, and **Book-Specific (`*b`)** operations:
+
+> [!IMPORTANT]
+> **Automated Cloud Audit Trail**: Every command executed in the Serial CLI is automatically captured with full pre-execution state (`stateBefore`), Serial Monitor output (`serialOutput`), and post-execution state (`stateAfter` - what was done or left) and synced to the Firestore collection `commands-log` with timestamp document IDs (`YYYY-MM-DD_HHMMSS`).
+
+### 0. System & Task Manager Commands
+| Command | Action & Behavior |
+| :--- | :--- |
+| `all` | **ESP32 Task Manager**: Full diagnostic task manager dump showing hardware & chip architecture, Core 0 and Core 1 dual-core workload assignments, live FreeRTOS task status table (`uxTaskGetSystemState`), RAM internal memory utilization (heap, watermark, max block), and persistent ROM data (`students`, `books`, `off_logs`). |
 
 ### 1. Combined (Global) Commands
 | Command | Action & Behavior |
 | :--- | :--- |
 | `rom` | **Inspect Full ROM**: Dumps all cached student records, registered book catalog, buffered offline logs, heap RAM, and Wi-Fi link status. |
 | `upt` | **Force Cloud Update (Both)**: Triggers an immediate, on-demand synchronization of both Firestore collections (`student_names` and `book_names`) to ROM and flushes offline logs. If differences are detected, schedules an auto-restart. |
-| `clr` | **Clear All ROM & Enter REST Mode**: Erases all cached students, books, and offline logs from NVS flash and sets the system to REST mode. Runs silently in the background without LCD disruption. If a card or book is scanned while in REST mode, the LCD alerts `"ROM Empty / System Rest Mode"`. |
+| `clr` | **Clear All ROM & Enter REST Mode**: Erases all cached students, books, and offline logs from NVS flash and sets the system to REST mode. Runs silently in the background without LCD disruption. If a card or book is scanned while in REST mode, the LCD alerts `"ROM Empty / System Rest Mode"`. Logs before state (all data), command run, serial output, and after state (0 left) to Firestore. |
 | `clrupt`| **Clear ROM & Fresh Sync Both**: Clears local ROM and memory, then immediately downloads and caches a fresh student roster and book catalog from Firestore without hardware reboot. |
 
 ### 2. Student-Specific Commands (`*s`)
@@ -169,6 +187,97 @@ ShelfSense provides a non-blocking interactive command-line interface directly o
 | `uptb` | **Force Book Sync**: Triggers an immediate on-demand synchronization of the Firestore `book_names` collection to ROM. |
 | `clrb` | **Clear Book ROM**: Erases the book catalog cache (`"books"` namespace) from persistent ROM. Student roster and offline logs remain intact. |
 | `clruptb`| **Fresh Sync Books**: Clears the book cache and immediately downloads a fresh book catalog from `book_names` in Firestore without reboot. |
+
+---
+
+## ESP32 Task Manager (`all` command)
+
+Typing `all` into the Serial Monitor invokes an operating-system-level Task Manager tailored specifically for the dual-core ESP32 architecture:
+
+1. **Section 1: Hardware & System Architecture**:
+   - ESP32 Chip Model, Hardware Revision, Number of CPU Cores (2 cores @ 240 MHz).
+   - SDK / ESP-IDF Version and total system uptime (days, hours, minutes, seconds).
+   - Real-time Wi-Fi connection status, IP address, and signal strength (RSSI dBm).
+2. **Section 2: Dual-Core Task Workload Assignments**:
+   - **Core 0 (Cloud, Network & Storage Engine)**:
+     - Dedicated FreeRTOS background task: `firestoreTask` (Priority 1).
+     - Services: 20s diff checks (`student_names`, `book_names`), asynchronous Firestore loggers (`library_logs` and `commands-log`), 15s offline ROM log flusher, Wi-Fi auto-reconnect supervisor, NTP system clock synchronizer, TCP/IP stack (`wifi`, `tiT`, `sys_evt`).
+   - **Core 1 (Real-Time Sensor & Interactive UI Engine)**:
+     - Dedicated Arduino task: `loopTask` (Priority 1, 16KB stack).
+     - Services: RC522 SPI 0ms RFID card polling loop, LiquidCrystal I2C 16x2 real-time guidance animations, active buzzer & dual-LED feedback, 18s inactivity watchdog timer, 30s clock broadcaster, interactive Serial CLI.
+3. **Section 3: FreeRTOS Task Manager Table (Live Tasks)**:
+   - Queries `uxTaskGetSystemState()` to display an itemized table of all active tasks:
+     ```text
+     Idx | Task Name        | Core Affinity | State     | Priority | Min Stack Free
+     ----+------------------+---------------+-----------+----------+---------------
+       1 | firestoreTask    | Core 0        | BLOCKED   |    1/1   |    8420 bytes
+       2 | loopTask         | Core 1        | RUNNING   |    1/1   |   12450 bytes
+       3 | wifi             | Core 0        | BLOCKED   |   23/23  |    3840 bytes
+       4 | IDLE0            | Core 0        | READY     |    0/0   |    1024 bytes
+       5 | IDLE1            | Core 1        | READY     |    0/0   |    1024 bytes
+     ```
+4. **Section 4: RAM (Internal Memory) Utilization**:
+   - Total Heap Size, Used Heap RAM, Free Heap RAM, and Heap Usage Percentage.
+   - Lowest Free Heap Watermark (lowest memory recorded since boot).
+   - Maximum Allocatable Contiguous Block (verifies zero memory fragmentation).
+   - FreeRTOS message queues waiting in RAM (`firestoreQueue` and `commandLogQueue`).
+   - Active in-memory session variables (patron name, UID, login time, and FSM state).
+5. **Section 5: ROM (Flash Storage & Persistent NVS Data)**:
+   - Total Flash Size (4MB), Flash Speed (80MHz), Flash Mode (DIO/QIO), App Firmware Size, and Free App Space.
+   - Itemized dump of cached student records in `"students"` namespace.
+   - Itemized dump of cached book records in `"books"` namespace.
+   - Itemized dump of buffered offline logs in `"off_logs"` namespace.
+
+---
+
+## Periodic 30-Second Time & Calendar Broadcast
+
+ShelfSense incorporates an autonomous 30-second system clock and calendar broadcaster in the main real-time loop. Every 30 seconds, it outputs full date, calendar, time, timezone, and uptime details directly to the Serial Monitor:
+
+```text
+================================================================================
+              ESP32 SYSTEM CLOCK & CALENDAR (30-SECOND UPDATE)                 
+================================================================================
+[TIME-30S] Full Date & Time : Monday, 09 November 2026 | 21:35:30
+           • Day of Week    : Monday
+           • Date (Day)     : 09
+           • Month          : November (Month 11 of 12)
+           • Year           : 2026 (Day 313 of Year)
+           • Time (24-Hour) : 21:35:30 IST
+           • Time (12-Hour) : 09:35:30 PM IST
+           • ISO-8601 Stamp : 2026-11-09T21:35:30+05:30
+           • Timezone       : Indian Standard Time (IST, UTC+05:30, GMT Offset: +19800s)
+           • System Uptime  : 0d 0h 5m 30s (330000 ms)
+================================================================================
+```
+
+---
+
+## Commands Audit Trail (`commands-log` collection)
+
+Whenever any command (`all`, `rom`, `clr`, `upt`, `clrupt`, etc.) is received in the Serial Monitor, ShelfSense performs a complete state evaluation and sends an audit record to Google Cloud Firestore in the collection `"commands-log"`:
+
+### Document Schema
+| Field Name | Type | Description |
+| :--- | :--- | :--- |
+| `docId` | `string` | Timestamp identifier: `YYYY-MM-DD_HHMMSS` (same format as `library_logs`). |
+| `command` | `string` | The command executed (e.g. `"clr"`, `"all"`, `"upt"`, `"clrupt"`). |
+| `timestamp` | `string` | Full human-readable timestamp (e.g. `"Monday, 09 November 2026 21:35:00"`). |
+| `stateBefore` | `string` | Complete snapshot before execution: cached student count & roster, cached book count & catalog, offline logs count, free heap RAM, and system mode. |
+| `actionSummary` | `string` | High-level summary of the action performed. |
+| `serialOutput` | `string` | Exact messages and diagnostic logs printed to the Serial Monitor. |
+| `stateAfter` | `string` | Complete snapshot after execution: what was done or left remaining in ROM/RAM. |
+| `executionStatus` | `string` | `"COMPLETED"`, `"TRIGGERED"`, or `"UNKNOWN_COMMAND"`. |
+| `systemMode` | `string` | `"REST_MODE"` or `"NORMAL_STANDBY"`. |
+| `freeHeapBefore` | `integer` | Free heap memory in bytes before command execution. |
+| `freeHeapAfter` | `integer` | Free heap memory in bytes after command execution. |
+
+### Clear Command (`clr`) Before & After Example:
+- **`stateBefore`**: `Students (5): [1] 37E09604 ("Pavan", ACTIVE), [2] ... | Books (8): [1] F10F7E05 ("Geronimo Stilton", S2R1, ACTIVE) ... | Offline Logs: 0 | Free Heap: 182410 B | Mode: NORMAL_STANDBY`
+- **`command`**: `"clr"`
+- **`serialOutput`**: `[ROM-CLEAR] Full Persistent ROM Completely Cleared (Background)! Student roster cache ('students') erased, Book catalog cache ('books') erased, Offline logs buffer ('off_logs') erased, System entered REST MODE, Session credentials reset.`
+- **`stateAfter`**: `Students (0): [None] | Books (0): [None] | Offline Logs: 0 | Free Heap: 184512 B | Mode: REST_MODE`
+- **Result in Firestore**: Kiosk administrators can inspect exactly what data existed before a wipe, what command ran, what was displayed to the operator, and what remained afterwards.
 
 ---
 
@@ -274,6 +383,20 @@ ShelfSense synchronizes with Google Cloud Firestore (`FIREBASE_PROJECT_ID: "shel
      - `rack` (integer): Assigned rack number.
      - `timestamp` (string): Transaction completion timestamp.
      - `statusNote` (string): Informational note or security explanation.
+4. **`commands-log` Collection (Serial CLI Audit Trail)**:
+   - **Document ID**: Timestamp of command execution (`YYYY-MM-DD_HHMMSS`, same convention as `library_logs`).
+   - **Fields**:
+     - `command` (string): The command string entered by operator (e.g., `"clr"`, `"all"`, `"rom"`, `"upt"`).
+     - `timestamp` (string): Human-readable timestamp (e.g., `"Monday, 09 November 2026 21:35:00"`).
+     - `docId` (string): Document ID (`YYYY-MM-DD_HHMMSS`).
+     - `stateBefore` (string): Snapshot of system state before execution (cached students & roster details, cached books & catalog details, offline logs count, free heap RAM, and active mode).
+     - `actionSummary` (string): High-level description of actions performed.
+     - `serialOutput` (string): Exact output printed to the Serial Monitor.
+     - `stateAfter` (string): Snapshot of system state after execution (what was done or left remaining in ROM/RAM).
+     - `executionStatus` (string): `"COMPLETED"`, `"TRIGGERED"`, or `"UNKNOWN_COMMAND"`.
+     - `systemMode` (string): `"REST_MODE"` or `"NORMAL_STANDBY"`.
+     - `freeHeapBefore` (integer): Free heap RAM in bytes prior to execution.
+     - `freeHeapAfter` (integer): Free heap RAM in bytes immediately following execution.
 
 ### Offline-First NVS Flash Caching
 
@@ -348,6 +471,9 @@ ShelfSense outputs categorized, human-readable serial logs for complete runtime 
 | `[BOOT]` | Startup diagnostics, clock frequency, free heap RAM | `[BOOT] CPU Frequency: 240 MHz \| Free Heap RAM: 184512 bytes` |
 | `[WIFI]` | Wi-Fi link status, RSSI, and IP allocation | `[WIFI] Connected! IP: 192.168.43.102 \| RSSI: -48 dBm` |
 | `[TIME]` | NTP time synchronization status | `[TIME] NTP Clock synchronized successfully: 2026-11-09 20:15:30` |
+| `[TIME-30S]` | Autonomous 30s system clock & calendar broadcast | `[TIME-30S] Full Date & Time: Monday, 09 November 2026 \| 21:35:30` |
+| `[TASK-MANAGER]`| ESP32 Task Manager live task, memory & ROM metrics | `[TASK-MANAGER] ESP32 Task Manager report displayed: Core 0 & Core 1` |
+| `[COMMANDS-LOG]`| Command audit sync to Firestore `commands-log` | `[COMMANDS-LOG] Document sync SUCCESS! Doc ID: '2026-11-09_213500'` |
 | `[FIREBASE]` | Background authentication, token status, queue events | `[FIREBASE] Client library initialized for: esp32@shelfsense.local` |
 | `[AUTH-SYNC]` | Periodic 20s diff checks and roster synchronization | `[AUTH-SYNC] Periodic 20s check: ROM cache and Firestore match perfectly.` |
 | `[AUTH-ROM]` | Local zero-delay card evaluation | `[AUTH-ROM] Instant Match: Found active student "Pavan" [UID: 37E09604]` |

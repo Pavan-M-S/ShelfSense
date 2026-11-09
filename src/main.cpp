@@ -41,6 +41,9 @@
  * -----------------------------------------------------------------------------------------
  *   Scope    | Command | Action & Behavior
  *  ----------+---------+-------------------------------------------------------------------
+ *   System   | all     | ESP32 Task Manager: Displays live FreeRTOS tasks on Core 0 & 1,
+ *            |         | RAM heap/stack metrics, ROM NVS namespaces, and system state.
+ *  ----------+---------+-------------------------------------------------------------------
  *   Combined | rom     | Inspect Persistent ROM: Dumps both students and books, offline logs,
  *   (Both)   |         | free heap RAM, and Wi-Fi link status.
  *            | upt     | Update & Sync Both: Triggers on-demand sync of Firestore 'student_names'
@@ -62,13 +65,18 @@
  * 
  * -----------------------------------------------------------------------------------------
  * CRITICAL ARCHITECTURAL RULES:
+ *  - COMMAND AUDIT TRAIL: Every Serial CLI command execution is automatically captured with
+ *    full pre-execution state, Serial Monitor output, and post-execution state, and synced
+ *    to a dedicated Firestore collection 'commands-log' with timestamp document IDs.
+ *  - 30-SECOND SYSTEM CLOCK BROADCAST: Every 30 seconds, full calendar and time details
+ *    (Year, Month, Date, Day of Week, Time 24h/12h, Timezone, Uptime) are printed to Serial.
  *  - SILENT BACKGROUND CLOUD SYNC: All Google Cloud Firestore synchronizations occur
  *    completely in the background via a dedicated FreeRTOS worker task on Core 0.
  *  - ZERO CLOUD/WIFI ON LCD: The LCD is strictly dedicated to physical user guidance.
  *    No Wi-Fi, cloud, or sync status is ever printed to the LCD screen.
  *  - SERIAL DIAGNOSTICS: Every network state change, NTP synchronization, RFID read,
  *    state transition, and Firestore document upload is logged with clear tags:
- *    [BOOT], [WIFI], [TIME], [RFID], [AUTH], [LOOKUP], [STATE], [FEEDBACK], [LCD], [FIREBASE].
+ *    [BOOT], [WIFI], [TIME], [RFID], [AUTH], [LOOKUP], [STATE], [FEEDBACK], [LCD], [FIREBASE], [COMMANDS-LOG].
  *  - ACCURATE TIMESTAMPING: Local time synchronized via NTP (pool.ntp.org) with IST offset
  *    (GMT+5:30 / 19800 seconds). Injected as "YYYY-MM-DD HH:MM:SS" in every Firestore document.
  * =========================================================================================
@@ -153,6 +161,7 @@ inline esp_err_t esp_task_wdt_init(uint32_t timeout_sec, bool panic) {
 #define FIREBASE_USER_EMAIL           "esp32@shelfsense.local"
 #define FIREBASE_USER_PASSWORD        "ShelfSense@2026"
 #define FIRESTORE_COLLECTION          "library_logs"
+#define FIRESTORE_COMMANDS_COLLECTION "commands-log"
 #define FIRESTORE_STUDENTS            "student_names"
 #define FIRESTORE_STUDENTS_COLLECTION FIRESTORE_STUDENTS
 #define FIRESTORE_BOOKS               "book_names"
@@ -186,6 +195,7 @@ Preferences offlineLogsPrefs;
 
 // FreeRTOS Queue & Task handles for background Firestore sync
 QueueHandle_t firestoreQueue = NULL;
+QueueHandle_t commandLogQueue = NULL;
 TaskHandle_t firestoreTaskHandle = NULL;
 
 // System Restart Flag for automatic restart when cloud roster diff is detected
@@ -251,6 +261,24 @@ struct FirestoreLogEvent {
   char timestamp[25];   // Processed timestamp "YYYY-MM-DD HH:MM:SS"
   char statusNote[160]; // Diagnostic status note
 };
+
+// Structure modeling a Command Log event for background Firestore synchronization
+struct CommandLogItem {
+  String docId;
+  String timestamp;
+  String command;
+  String stateBefore;
+  String actionSummary;
+  String serialOutput;
+  String stateAfter;
+  String executionStatus;
+  String systemMode;
+  uint32_t freeHeapBefore;
+  uint32_t freeHeapAfter;
+};
+
+// Pending command logs buffer in RAM if Wi-Fi is temporarily offline
+static std::vector<CommandLogItem*> pendingCommandLogs;
 
 // -----------------------------------------------------------------------------------------
 // DATABASE ENTRIES: Registered Library Books
@@ -471,6 +499,17 @@ void clearAllROMData();
 void executeCleanResetAndSyncStudents();
 void executeCleanResetAndSyncBooks();
 void executeCleanResetAndSync();
+void dumpTaskManagerAll();
+void printPeriodicFullTime();
+String captureDetailedStateSummary();
+void queueCommandLog(const String& cmd,
+                     const String& stateBefore,
+                     const String& serialOutput,
+                     const String& stateAfter,
+                     const String& actionSummary,
+                     const String& executionStatus,
+                     uint32_t freeHeapBefore,
+                     uint32_t freeHeapAfter);
 void checkSerialCommands();
 
 // Maximum number of offline log events buffered in persistent ROM (NVS)
@@ -886,6 +925,98 @@ void firestoreSyncTask(void* pvParameters) {
         saveOfflineLogToROM(event);
       }
       Serial.println(F("---------------------------------------------------"));
+    }
+
+    // 3. Dequeue and process incoming command audit logs for 'commands-log' collection
+    CommandLogItem* cmdEvent = nullptr;
+    if (xQueueReceive(commandLogQueue, &cmdEvent, 0) == pdTRUE && cmdEvent != nullptr) {
+      if (WiFi.status() == WL_CONNECTED && Firebase.ready()) {
+        FirebaseJson cmdContent;
+        cmdContent.set("fields/command/stringValue", cmdEvent->command);
+        cmdContent.set("fields/timestamp/stringValue", cmdEvent->timestamp);
+        cmdContent.set("fields/docId/stringValue", cmdEvent->docId);
+        cmdContent.set("fields/stateBefore/stringValue", cmdEvent->stateBefore);
+        cmdContent.set("fields/actionSummary/stringValue", cmdEvent->actionSummary);
+        cmdContent.set("fields/serialOutput/stringValue", cmdEvent->serialOutput);
+        cmdContent.set("fields/stateAfter/stringValue", cmdEvent->stateAfter);
+        cmdContent.set("fields/executionStatus/stringValue", cmdEvent->executionStatus);
+        cmdContent.set("fields/systemMode/stringValue", cmdEvent->systemMode);
+        cmdContent.set("fields/freeHeapBefore/integerValue", String(cmdEvent->freeHeapBefore));
+        cmdContent.set("fields/freeHeapAfter/integerValue", String(cmdEvent->freeHeapAfter));
+
+        Serial.println(F("---------------------------------------------------"));
+        Serial.print(F("[COMMANDS-LOG] Target Collection: '"));
+        Serial.print(FIRESTORE_COMMANDS_COLLECTION);
+        Serial.print(F("' | Custom Doc ID (Time formatted): '"));
+        Serial.print(cmdEvent->docId);
+        Serial.println(F("'"));
+        Serial.print(F("[COMMANDS-LOG] Command: '"));
+        Serial.print(cmdEvent->command);
+        Serial.print(F("' | Status: "));
+        Serial.println(cmdEvent->executionStatus);
+
+        bool cmdOk = Firebase.Firestore.createDocument(&fbdo, FIREBASE_PROJECT_ID, "", FIRESTORE_COMMANDS_COLLECTION, cmdEvent->docId.c_str(), cmdContent.raw(), "");
+        int cmdHttpCode = fbdo.httpCode();
+        if (cmdOk && cmdHttpCode == 200) {
+          Serial.print(F("[COMMANDS-LOG] Document sync SUCCESS! HTTP Code: "));
+          Serial.println(cmdHttpCode);
+        } else {
+          Serial.print(F("[COMMANDS-LOG] Document sync FAILED! HTTP Code: "));
+          Serial.print(cmdHttpCode);
+          Serial.print(F(" | Reason: "));
+          Serial.println(fbdo.errorReason());
+        }
+        Serial.println(F("---------------------------------------------------"));
+        delete cmdEvent;
+      } else {
+        if (pendingCommandLogs.size() < 10) {
+          pendingCommandLogs.push_back(cmdEvent);
+          Serial.print(F("[COMMANDS-LOG] Network link offline. Buffered '"));
+          Serial.print(cmdEvent->command);
+          Serial.println(F("' log in memory for background retry upon reconnect."));
+        } else {
+          Serial.println(F("[COMMANDS-LOG] WARN: Pending buffer full. Dropping command log."));
+          delete cmdEvent;
+        }
+      }
+    }
+
+    // Flush any pending command logs buffered during offline state
+    if (!pendingCommandLogs.empty() && WiFi.status() == WL_CONNECTED && Firebase.ready()) {
+      CommandLogItem* pendingItem = pendingCommandLogs.front();
+      pendingCommandLogs.erase(pendingCommandLogs.begin());
+
+      FirebaseJson cmdContent;
+      cmdContent.set("fields/command/stringValue", pendingItem->command);
+      cmdContent.set("fields/timestamp/stringValue", pendingItem->timestamp);
+      cmdContent.set("fields/docId/stringValue", pendingItem->docId);
+      cmdContent.set("fields/stateBefore/stringValue", pendingItem->stateBefore);
+      cmdContent.set("fields/actionSummary/stringValue", pendingItem->actionSummary);
+      cmdContent.set("fields/serialOutput/stringValue", pendingItem->serialOutput);
+      cmdContent.set("fields/stateAfter/stringValue", pendingItem->stateAfter);
+      cmdContent.set("fields/executionStatus/stringValue", pendingItem->executionStatus);
+      cmdContent.set("fields/systemMode/stringValue", pendingItem->systemMode);
+      cmdContent.set("fields/freeHeapBefore/integerValue", String(pendingItem->freeHeapBefore));
+      cmdContent.set("fields/freeHeapAfter/integerValue", String(pendingItem->freeHeapAfter));
+
+      Serial.print(F("[COMMANDS-LOG] Uploading buffered command log (Doc ID: '"));
+      Serial.print(pendingItem->docId);
+      Serial.println(F("')..."));
+
+      bool pOk = Firebase.Firestore.createDocument(&fbdo, FIREBASE_PROJECT_ID, "", FIRESTORE_COMMANDS_COLLECTION, pendingItem->docId.c_str(), cmdContent.raw(), "");
+      int pCode = fbdo.httpCode();
+      if (pOk && pCode == 200) {
+        Serial.print(F("[COMMANDS-LOG] Buffered sync SUCCESS! Doc ID: '"));
+        Serial.print(pendingItem->docId);
+        Serial.println(F("'"));
+      } else {
+        Serial.print(F("[COMMANDS-LOG] Buffered sync FAILED! HTTP: "));
+        Serial.print(pCode);
+        Serial.print(F(" | Reason: "));
+        Serial.println(fbdo.errorReason());
+      }
+      delete pendingItem;
+      vTaskDelay(pdMS_TO_TICKS(50));
     }
 
     // Yield control to FreeRTOS watchdog & background token refresh
@@ -1944,6 +2075,466 @@ void executeCleanResetAndSync() {
   triggerCleanSyncBooks = true;
 }
 
+// Captures a detailed snapshot of ROM cache data, memory, and system state
+String captureDetailedStateSummary() {
+  String out = "";
+  std::vector<String> sUids = getAllROMUIDs();
+  out += "Students (" + String(sUids.size()) + "): ";
+  if (sUids.empty()) {
+    out += "[None]";
+  } else {
+    for (size_t i = 0; i < sUids.size(); i++) {
+      if (i > 0) out += ", ";
+      StudentRecord rec;
+      if (getStudentFromROM(sUids[i].c_str(), rec)) {
+        out += "[" + String(i + 1) + "] " + sUids[i] + " (\"" + String(rec.name) + "\", " + (rec.active ? "ACTIVE" : "SUSPENDED") + ")";
+      } else {
+        out += "[" + String(i + 1) + "] " + sUids[i] + " (Read Err)";
+      }
+    }
+  }
+
+  std::vector<String> bUids = getAllROMBookUIDs();
+  out += " | Books (" + String(bUids.size()) + "): ";
+  if (bUids.empty()) {
+    out += "[None]";
+  } else {
+    for (size_t i = 0; i < bUids.size(); i++) {
+      if (i > 0) out += ", ";
+      BookRecord bRec;
+      if (getBookFromROM(bUids[i].c_str(), bRec)) {
+        out += "[" + String(i + 1) + "] " + bUids[i] + " (\"" + String(bRec.title) + "\", S" + String(bRec.shelf) + "R" + String(bRec.rack) + ", " + (bRec.active ? "ACTIVE" : "SUSPENDED") + ")";
+      } else {
+        out += "[" + String(i + 1) + "] " + bUids[i] + " (Read Err)";
+      }
+    }
+  }
+
+  uint16_t offCount = offlineLogsPrefs.getUShort("count", 0);
+  out += " | Offline Logs: " + String(offCount);
+  out += " | Free Heap: " + String(ESP.getFreeHeap()) + " B";
+  out += " | Mode: " + String(systemRestMode ? "REST_MODE" : "NORMAL_STANDBY");
+  out += " | State: " + String(currentState == WAITING_FOR_STUDENT ? "WAITING_FOR_STUDENT" : "WAITING_FOR_BOOK");
+  out += " | Wi-Fi: " + String(WiFi.status() == WL_CONNECTED ? "CONNECTED" : "DISCONNECTED");
+
+  return out;
+}
+
+// Dispatches a command execution audit event to the FreeRTOS background queue for 'commands-log' collection
+void queueCommandLog(const String& cmd,
+                     const String& stateBefore,
+                     const String& serialOutput,
+                     const String& stateAfter,
+                     const String& actionSummary,
+                     const String& executionStatus,
+                     uint32_t freeHeapBefore,
+                     uint32_t freeHeapAfter) {
+  if (commandLogQueue == NULL) {
+    Serial.println(F("[COMMANDS-LOG] ERROR: Command log queue not initialized!"));
+    return;
+  }
+
+  CommandLogItem* item = new CommandLogItem();
+  if (!item) {
+    Serial.println(F("[COMMANDS-LOG] ERROR: Memory allocation failed for command log!"));
+    return;
+  }
+
+  char humanTime[64];
+  char rawDocId[32];
+  getCurrentTimestamps(humanTime, sizeof(humanTime), rawDocId, sizeof(rawDocId));
+
+  // Ensure unique docId if multiple commands run within the same second
+  static String lastDocId = "";
+  static int duplicateSeq = 0;
+  String finalDocId = String(rawDocId);
+  if (finalDocId == lastDocId) {
+    duplicateSeq++;
+    finalDocId += "_" + String(duplicateSeq);
+  } else {
+    lastDocId = finalDocId;
+    duplicateSeq = 0;
+  }
+
+  item->docId = finalDocId;
+  item->timestamp = String(humanTime);
+  item->command = cmd;
+  item->stateBefore = stateBefore;
+  item->actionSummary = actionSummary;
+  item->serialOutput = serialOutput;
+  item->stateAfter = stateAfter;
+  item->executionStatus = executionStatus;
+  item->systemMode = systemRestMode ? "REST_MODE" : "NORMAL_STANDBY";
+  item->freeHeapBefore = freeHeapBefore;
+  item->freeHeapAfter = freeHeapAfter;
+
+  Serial.print(F("[COMMANDS-LOG] Enqueuing '"));
+  Serial.print(cmd);
+  Serial.print(F("' command log (Doc ID: '"));
+  Serial.print(item->docId);
+  Serial.println(F("') to background Firestore queue..."));
+
+  if (xQueueSend(commandLogQueue, &item, 0) != pdTRUE) {
+    Serial.println(F("[COMMANDS-LOG] WARN: Background queue full! Dropping oldest log."));
+    delete item;
+  }
+}
+
+// Periodic 30-second system clock & calendar broadcaster with full details
+void printPeriodicFullTime() {
+  struct tm timeinfo;
+  bool timeValid = getLocalTime(&timeinfo, 20);
+
+  Serial.println();
+  Serial.println(F("================================================================================"));
+  Serial.println(F("              ESP32 SYSTEM CLOCK & CALENDAR (30-SECOND UPDATE)                 "));
+  Serial.println(F("================================================================================"));
+
+  if (timeValid) {
+    char dateStr[64];
+    strftime(dateStr, sizeof(dateStr), "%A, %d %B %Y", &timeinfo);
+
+    char time24Str[32];
+    strftime(time24Str, sizeof(time24Str), "%H:%M:%S", &timeinfo);
+
+    char time12Str[32];
+    strftime(time12Str, sizeof(time12Str), "%I:%M:%S %p", &timeinfo);
+
+    char monthStr[32];
+    strftime(monthStr, sizeof(monthStr), "%B", &timeinfo);
+
+    char dayOfWeek[32];
+    strftime(dayOfWeek, sizeof(dayOfWeek), "%A", &timeinfo);
+
+    char isoStr[40];
+    strftime(isoStr, sizeof(isoStr), "%Y-%m-%dT%H:%M:%S+05:30", &timeinfo);
+
+    Serial.print(F("[TIME-30S] Full Date & Time : "));
+    Serial.print(dateStr);
+    Serial.print(F(" | "));
+    Serial.println(time24Str);
+
+    Serial.print(F("           • Day of Week    : "));
+    Serial.println(dayOfWeek);
+
+    Serial.print(F("           • Date (Day)     : "));
+    Serial.println(timeinfo.tm_mday);
+
+    Serial.print(F("           • Month          : "));
+    Serial.print(monthStr);
+    Serial.print(F(" (Month "));
+    Serial.print(timeinfo.tm_mon + 1);
+    Serial.println(F(" of 12)"));
+
+    Serial.print(F("           • Year           : "));
+    Serial.print(timeinfo.tm_year + 1900);
+    Serial.print(F(" (Day "));
+    Serial.print(timeinfo.tm_yday + 1);
+    Serial.println(F(" of Year)"));
+
+    Serial.print(F("           • Time (24-Hour) : "));
+    Serial.print(time24Str);
+    Serial.println(F(" IST"));
+
+    Serial.print(F("           • Time (12-Hour) : "));
+    Serial.print(time12Str);
+    Serial.println(F(" IST"));
+
+    Serial.print(F("           • ISO-8601 Stamp : "));
+    Serial.println(isoStr);
+
+    Serial.println(F("           • Timezone       : Indian Standard Time (IST, UTC+05:30, GMT Offset: +19800s)"));
+  } else {
+    Serial.println(F("[TIME-30S] System Clock     : NTP Synchronization Pending (Connecting to pool.ntp.org)..."));
+  }
+
+  // System Uptime
+  unsigned long totalSec = millis() / 1000;
+  unsigned long days     = totalSec / 86400;
+  unsigned long hours    = (totalSec % 86400) / 3600;
+  unsigned long mins     = (totalSec % 3600) / 60;
+  unsigned long secs     = totalSec % 60;
+
+  Serial.print(F("           • System Uptime  : "));
+  Serial.print(days);
+  Serial.print(F("d "));
+  Serial.print(hours);
+  Serial.print(F("h "));
+  Serial.print(mins);
+  Serial.print(F("m "));
+  Serial.print(secs);
+  Serial.print(F("s ("));
+  Serial.print(millis());
+  Serial.println(F(" ms)"));
+  Serial.println(F("================================================================================"));
+  Serial.println();
+}
+
+// ESP32 Task Manager: Dumps chip overview, dual-core workloads, live FreeRTOS tasks, RAM and ROM
+void dumpTaskManagerAll() {
+  Serial.println();
+  Serial.println(F("================================================================================"));
+  Serial.println(F("                   SHELFSENSE ESP32 TASK MANAGER & SYSTEM MONITOR               "));
+  Serial.println(F("================================================================================"));
+
+  // --- SECTION 1: HARDWARE & SYSTEM ARCHITECTURE ---
+  Serial.println(F("[1] HARDWARE & SYSTEM ARCHITECTURE:"));
+  Serial.print(F("    • Chip Model        : "));
+  Serial.print(ESP.getChipModel());
+  Serial.print(F(" (Revision "));
+  Serial.print(ESP.getChipRevision());
+  Serial.println(F(")"));
+  Serial.print(F("    • CPU Cores         : "));
+  Serial.print(ESP.getChipCores());
+  Serial.print(F(" cores running @ "));
+  Serial.print(ESP.getCpuFreqMHz());
+  Serial.println(F(" MHz"));
+  Serial.print(F("    • SDK / IDF Version : "));
+  Serial.println(ESP.getSdkVersion());
+
+  unsigned long totalSec = millis() / 1000;
+  unsigned long days     = totalSec / 86400;
+  unsigned long hours    = (totalSec % 86400) / 3600;
+  unsigned long mins     = (totalSec % 3600) / 60;
+  unsigned long secs     = totalSec % 60;
+  Serial.print(F("    • System Uptime     : "));
+  Serial.print(days); Serial.print(F("d "));
+  Serial.print(hours); Serial.print(F("h "));
+  Serial.print(mins); Serial.print(F("m "));
+  Serial.print(secs); Serial.println(F("s"));
+  Serial.print(F("    • Network Status    : Wi-Fi "));
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.print(F("CONNECTED (IP: "));
+    Serial.print(WiFi.localIP());
+    Serial.print(F(", RSSI: "));
+    Serial.print(WiFi.RSSI());
+    Serial.println(F(" dBm)"));
+  } else {
+    Serial.println(F("DISCONNECTED"));
+  }
+
+  // --- SECTION 2: DUAL-CORE 0 & CORE 1 WORKLOAD RESPONSIBILITIES ---
+  Serial.println(F("--------------------------------------------------------------------------------"));
+  Serial.println(F("[2] DUAL-CORE TASK WORKLOAD ASSIGNMENTS:"));
+  Serial.println(F("    ► CORE 0 [Cloud, Network & Storage Engine]:"));
+  Serial.println(F("        - Dedicated Task    : 'firestoreTask' (Pinned to Core 0, Priority 1)"));
+  Serial.println(F("        - Cloud Sync        : Periodic 20s diff sync for 'student_names' and 'book_names'"));
+  Serial.println(F("        - Logging Services  : Asynchronous Firestore logger ('library_logs' & 'commands-log')"));
+  Serial.println(F("        - Offline Buffer    : Automatic ROM offline log drainer and flusher (every 15s)"));
+  Serial.println(F("        - Network Services  : Wi-Fi reconnect supervisor, NTP clock sync, Firebase Auth"));
+  Serial.println(F("        - System Daemons    : ESP32 TCP/IP stack ('wifi', 'tiT', 'sys_evt')"));
+  Serial.println(F("    ► CORE 1 [Real-Time Sensor & Interactive UI Engine]:"));
+  Serial.println(F("        - Dedicated Task    : 'loopTask' (Pinned to Core 1, Priority 1)"));
+  Serial.println(F("        - RFID Sensing      : RC522 SPI high-frequency polling loop (Zero Latency)"));
+  Serial.println(F("        - Display Actuation : LiquidCrystal I2C 16x2 real-time guidance & animated titles"));
+  Serial.println(F("        - Peripherals       : Buzzer acoustic chirps/alarms, Green/Red LED indicators"));
+  Serial.println(F("        - Interactive CLI   : Non-blocking Serial Monitor command listener"));
+  Serial.println(F("        - Timers & Security : 18s inactivity watchdog, 30s clock broadcaster, state machine"));
+
+  // --- SECTION 3: FREERTOS ACTIVE TASK MANAGER TABLE ---
+  Serial.println(F("--------------------------------------------------------------------------------"));
+  Serial.println(F("[3] FREERTOS TASK MANAGER TABLE (LIVE TASKS):"));
+  UBaseType_t numTasks = uxTaskGetNumberOfTasks();
+  TaskStatus_t *pxTaskStatusArray = (TaskStatus_t *)pvPortMalloc(numTasks * sizeof(TaskStatus_t));
+  if (pxTaskStatusArray != NULL) {
+    numTasks = uxTaskGetSystemState(pxTaskStatusArray, numTasks, NULL);
+    Serial.println(F("    Idx | Task Name        | Core Affinity | State     | Priority | Min Stack Free"));
+    Serial.println(F("    ----+------------------+---------------+-----------+----------+---------------"));
+    for (UBaseType_t i = 0; i < numTasks; i++) {
+      char line[110];
+      const char* stateStr = "UNKNOWN";
+      switch (pxTaskStatusArray[i].eCurrentState) {
+        case eRunning:   stateStr = "RUNNING  "; break;
+        case eReady:     stateStr = "READY    "; break;
+        case eBlocked:   stateStr = "BLOCKED  "; break;
+        case eSuspended: stateStr = "SUSPENDED"; break;
+        case eDeleted:   stateStr = "DELETED  "; break;
+        default: break;
+      }
+      const char* coreStr = "Any Core";
+      if (pxTaskStatusArray[i].xCoreID == 0) coreStr = "Core 0  ";
+      else if (pxTaskStatusArray[i].xCoreID == 1) coreStr = "Core 1  ";
+
+      snprintf(line, sizeof(line), "    %3u | %-16s | %-13s | %-9s | %4u/%-4u | %5u bytes",
+               (unsigned int)pxTaskStatusArray[i].xTaskNumber,
+               pxTaskStatusArray[i].pcTaskName,
+               coreStr,
+               stateStr,
+               (unsigned int)pxTaskStatusArray[i].uxCurrentPriority,
+               (unsigned int)pxTaskStatusArray[i].uxBasePriority,
+               (unsigned int)(pxTaskStatusArray[i].usStackHighWaterMark * sizeof(StackType_t)));
+      Serial.println(line);
+    }
+    vPortFree(pxTaskStatusArray);
+  } else {
+    Serial.println(F("    (Unable to allocate memory to query FreeRTOS task status)"));
+  }
+
+  // --- SECTION 4: RAM (INTERNAL MEMORY) UTILIZATION ---
+  Serial.println(F("--------------------------------------------------------------------------------"));
+  Serial.println(F("[4] RAM (INTERNAL MEMORY) UTILIZATION:"));
+  uint32_t totalHeap = ESP.getHeapSize();
+  uint32_t freeHeap  = ESP.getFreeHeap();
+  uint32_t usedHeap  = totalHeap >= freeHeap ? (totalHeap - freeHeap) : 0;
+  float heapUsagePct = totalHeap > 0 ? ((float)usedHeap * 100.0f / (float)totalHeap) : 0.0f;
+  uint32_t minFree   = ESP.getMinFreeHeap();
+  uint32_t maxAlloc  = ESP.getMaxAllocHeap();
+
+  Serial.print(F("    • Total Heap Size   : "));
+  Serial.print(totalHeap);
+  Serial.print(F(" bytes ("));
+  Serial.print(totalHeap / 1024);
+  Serial.println(F(" KB)"));
+
+  Serial.print(F("    • Used Heap RAM     : "));
+  Serial.print(usedHeap);
+  Serial.print(F(" bytes ("));
+  Serial.print(usedHeap / 1024);
+  Serial.print(F(" KB, "));
+  Serial.print(heapUsagePct, 1);
+  Serial.println(F("% used)"));
+
+  Serial.print(F("    • Free Heap RAM     : "));
+  Serial.print(freeHeap);
+  Serial.print(F(" bytes ("));
+  Serial.print(freeHeap / 1024);
+  Serial.println(F(" KB)"));
+
+  Serial.print(F("    • Lowest Free Watermark : "));
+  Serial.print(minFree);
+  Serial.print(F(" bytes ("));
+  Serial.print(minFree / 1024);
+  Serial.println(F(" KB)"));
+
+  Serial.print(F("    • Max Contiguous Block  : "));
+  Serial.print(maxAlloc);
+  Serial.print(F(" bytes ("));
+  Serial.print(maxAlloc / 1024);
+  Serial.println(F(" KB)"));
+
+  if (ESP.getPsramSize() > 0) {
+    Serial.print(F("    • PSRAM Total / Free: "));
+    Serial.print(ESP.getPsramSize());
+    Serial.print(F(" / "));
+    Serial.print(ESP.getFreePsram());
+    Serial.println(F(" bytes"));
+  } else {
+    Serial.println(F("    • PSRAM External RAM: None detected (Using high-speed internal SRAM)"));
+  }
+
+  // Active FreeRTOS Queue Load in RAM
+  UBaseType_t fqWaiting = firestoreQueue != NULL ? uxQueueMessagesWaiting(firestoreQueue) : 0;
+  UBaseType_t cqWaiting = commandLogQueue != NULL ? uxQueueMessagesWaiting(commandLogQueue) : 0;
+  Serial.print(F("    • Queues Waiting in RAM : firestoreQueue: "));
+  Serial.print(fqWaiting);
+  Serial.print(F("/10 | commandLogQueue: "));
+  Serial.print(cqWaiting);
+  Serial.println(F("/10"));
+
+  // In-Memory Active Session Variables
+  Serial.print(F("    • Active State in RAM   : "));
+  Serial.print(currentState == WAITING_FOR_STUDENT ? F("WAITING_FOR_STUDENT") : F("WAITING_FOR_BOOK"));
+  Serial.print(F(" | System Mode: "));
+  Serial.println(systemRestMode ? F("REST MODE (Active)") : F("NORMAL STANDBY"));
+  if (activeStudentName[0] != '\0') {
+    Serial.print(F("    • Active Patron in RAM  : "));
+    Serial.print(activeStudentName);
+    Serial.print(F(" (UID: "));
+    Serial.print(activeStudentUID);
+    Serial.print(F(", Login: "));
+    Serial.print(activeLoginTime);
+    Serial.println(F(")"));
+  }
+
+  // --- SECTION 5: ROM (FLASH STORAGE & PERSISTENT NVS) ---
+  Serial.println(F("--------------------------------------------------------------------------------"));
+  Serial.println(F("[5] ROM (FLASH STORAGE & PERSISTENT NVS DATA):"));
+  Serial.print(F("    • Total Flash Size  : "));
+  Serial.print(ESP.getFlashChipSize());
+  Serial.print(F(" bytes ("));
+  Serial.print(ESP.getFlashChipSize() / (1024 * 1024));
+  Serial.println(F(" MB)"));
+
+  Serial.print(F("    • Flash Chip Speed  : "));
+  Serial.print(ESP.getFlashChipSpeed() / 1000000);
+  Serial.print(F(" MHz | Mode: "));
+  FlashMode_t fMode = ESP.getFlashChipMode();
+  Serial.println(fMode == FM_QIO ? F("QIO") : fMode == FM_QOUT ? F("QOUT") : fMode == FM_DIO ? F("DIO") : F("DOUT"));
+
+  Serial.print(F("    • App Firmware Size : "));
+  Serial.print(ESP.getSketchSize());
+  Serial.print(F(" bytes (Free App Space: "));
+  Serial.print(ESP.getFreeSketchSpace());
+  Serial.println(F(" bytes)"));
+
+  // 1. Student Roster in ROM
+  std::vector<String> sUids = getAllROMUIDs();
+  Serial.print(F("    ► Persistent 'students' Namespace: Total Registered: "));
+  Serial.println(sUids.size());
+  if (sUids.empty()) {
+    Serial.println(F("        (No student records stored in ROM)"));
+  } else {
+    for (size_t i = 0; i < sUids.size(); i++) {
+      StudentRecord rec;
+      if (getStudentFromROM(sUids[i].c_str(), rec)) {
+        Serial.print(F("        [")); Serial.print(i + 1); Serial.print(F("] UID: "));
+        Serial.print(sUids[i]);
+        Serial.print(F(" | Name: \"")); Serial.print(rec.name); Serial.print(F("\" | Status: "));
+        Serial.println(rec.active ? F("ACTIVE") : F("SUSPENDED"));
+      }
+    }
+  }
+
+  // 2. Book Catalog in ROM
+  std::vector<String> bUids = getAllROMBookUIDs();
+  Serial.print(F("    ► Persistent 'books' Namespace: Total Registered: "));
+  Serial.println(bUids.size());
+  if (bUids.empty()) {
+    Serial.println(F("        (No book records stored in ROM)"));
+  } else {
+    for (size_t i = 0; i < bUids.size(); i++) {
+      BookRecord bRec;
+      if (getBookFromROM(bUids[i].c_str(), bRec)) {
+        Serial.print(F("        [")); Serial.print(i + 1); Serial.print(F("] UID: "));
+        Serial.print(bUids[i]);
+        Serial.print(F(" | Title: \"")); Serial.print(bRec.title);
+        Serial.print(F("\" | Shelf: ")); Serial.print(bRec.shelf);
+        Serial.print(F(" | Rack: ")); Serial.print(bRec.rack);
+        Serial.print(F(" | Status: "));
+        Serial.println(bRec.active ? F("ACTIVE") : F("SUSPENDED"));
+      }
+    }
+  }
+
+  // 3. Offline Logs Buffer in ROM
+  uint16_t offCount = offlineLogsPrefs.getUShort("count", 0);
+  Serial.print(F("    ► Persistent 'off_logs' Namespace: Total Buffered Offline Logs: "));
+  Serial.println(offCount);
+  if (offCount == 0) {
+    Serial.println(F("        (No pending offline logs in ROM)"));
+  } else {
+    for (uint16_t i = 0; i < offCount; i++) {
+      String key = "l_" + String(i);
+      FirestoreLogEvent offEvent;
+      size_t readLen = offlineLogsPrefs.getBytes(key.c_str(), &offEvent, sizeof(offEvent));
+      if (readLen == sizeof(offEvent)) {
+        Serial.print(F("        [Log #")); Serial.print(i + 1);
+        Serial.print(F("] Doc ID: '")); Serial.print(offEvent.docId);
+        Serial.print(F("' | Event: ")); Serial.print(offEvent.eventType);
+        Serial.print(F(" | Student: ")); Serial.print(offEvent.studentName);
+        Serial.print(F(" (")); Serial.print(offEvent.studentUID);
+        Serial.print(F(") | Book: \"")); Serial.print(offEvent.bookTitle[0] ? offEvent.bookTitle : "N/A");
+        Serial.print(F("\" | Shelf: ")); Serial.print(offEvent.shelf);
+        Serial.print(F(" | Rack: ")); Serial.print(offEvent.rack);
+        Serial.print(F(" | Time: ")); Serial.println(offEvent.timestamp);
+      }
+    }
+  }
+
+  Serial.println(F("================================================================================"));
+  Serial.println();
+}
+
 // Periodic (every 20s) & Boot-Time Roster Synchronization with Diff Detection
 // First reads ROM, then reads Firestore 'student_names'. If differences exist, updates ROM.
 bool compareAndSyncRoster(bool isBoot, bool &outDiffDetected) {
@@ -2978,6 +3569,12 @@ void setup() {
     Serial.println(F("[FIREBASE] ERROR: Failed to create FreeRTOS Firestore queue!"));
   }
 
+  // Create FreeRTOS Queue for non-blocking command execution audit logging ('commands-log')
+  commandLogQueue = xQueueCreate(10, sizeof(CommandLogItem*));
+  if (commandLogQueue == NULL) {
+    Serial.println(F("[FIREBASE] ERROR: Failed to create FreeRTOS Command Log queue!"));
+  }
+
   // Register Wi-Fi Event Handler for diagnostic monitoring
   WiFi.onEvent(onWiFiEvent);
 
@@ -2999,7 +3596,7 @@ void setup() {
   xTaskCreatePinnedToCore(
     firestoreSyncTask,
     "FirestoreSyncTask",
-    12288,
+    14336,
     NULL,
     1,
     &firestoreTaskHandle,
@@ -3013,6 +3610,8 @@ void setup() {
   resetSystem();
 
   Serial.println(F("[SERIAL]   Interactive Commands Ready:"));
+  Serial.println(F("           System & Task Manager:"));
+  Serial.println(F("           - 'all'     : ESP32 Task Manager (RAM, ROM, Core 0 & Core 1 tasks)"));
   Serial.println(F("           Combined (Both):"));
   Serial.println(F("           - 'rom'     : Inspect all persistent ROM (students, books, logs & RAM)"));
   Serial.println(F("           - 'upt'     : Force immediate on-demand Firestore sync of both"));
@@ -3028,9 +3627,10 @@ void setup() {
   Serial.println(F("           - 'uptb'    : Force immediate Firestore sync of 'book_names'"));
   Serial.println(F("           - 'clrb'    : Clear book catalog from persistent ROM"));
   Serial.println(F("           - 'clruptb' : Clear book ROM and fresh sync from Firestore"));
+  Serial.println(F("           Audit Log: All command executions are automatically logged to Firestore 'commands-log'."));
 }
 
-// Non-blocking serial command listener for runtime diagnostics (e.g. typing "rom", "roms", "romb", "upt", "upts", "uptb", "clr", "clrs", "clrb", "clrupt", "clrupts", "clruptb")
+// Non-blocking serial command listener for runtime diagnostics (e.g. typing "all", "rom", "roms", "romb", "upt", "upts", "uptb", "clr", "clrs", "clrb", "clrupt", "clrupts", "clruptb")
 void checkSerialCommands() {
   static String serialBuffer = "";
   while (Serial.available() > 0) {
@@ -3041,13 +3641,32 @@ void checkSerialCommands() {
         String cmd = serialBuffer;
         cmd.toLowerCase();
 
+        // 1. Snapshot State BEFORE Command Execution
+        String stateBefore = captureDetailedStateSummary();
+        uint32_t heapBefore = ESP.getFreeHeap();
+        String actionSummary = "";
+        String serialOutput = "";
+        String execStatus = "COMPLETED";
+
+        // 0. System Task Manager Command
+        if (cmd == "all") {
+          dumpTaskManagerAll();
+          actionSummary = "Executed ESP32 Task Manager: dumped dual-core status, FreeRTOS live tasks, RAM heap/stack metrics, and ROM NVS namespaces.";
+          serialOutput = "[TASK-MANAGER] ESP32 Task Manager report displayed: Core 0 cloud/storage engine & Core 1 real-time UI engine workloads, live FreeRTOS task table, RAM heap breakdown, and ROM NVS namespaces ('students', 'books', 'off_logs').";
+
         // 1. ROM Inspection Commands
-        if (cmd == "rom") {
+        } else if (cmd == "rom") {
           dumpAllROMData();
+          actionSummary = "Inspected all persistent ROM data (students, books, offline logs, and heap RAM).";
+          serialOutput = "[ROM-INSPECT] Complete persistent ROM dump executed: displayed student roster ('students'), book catalog ('books'), offline logs ('off_logs'), and free heap RAM.";
         } else if (cmd == "roms") {
           dumpROMStudents();
+          actionSummary = "Inspected student roster cache in persistent ROM ('students' namespace).";
+          serialOutput = "[ROM-STUDENTS] Student roster cache dump executed: displayed all registered student UIDs, names, and active/suspended statuses.";
         } else if (cmd == "romb") {
           dumpROMBooks();
+          actionSummary = "Inspected book catalog cache in persistent ROM ('books' namespace).";
+          serialOutput = "[ROM-BOOKS] Book catalog cache dump executed: displayed all registered book UIDs, titles, shelf, rack, and active/suspended statuses.";
 
         // 2. On-Demand Firestore Synchronization Commands
         } else if (cmd == "upt") {
@@ -3058,6 +3677,9 @@ void checkSerialCommands() {
           }
           triggerSyncStudents = true;
           triggerSyncBooks = true;
+          actionSummary = "Triggered immediate on-demand manual synchronization of both students roster and book catalog from Firestore.";
+          serialOutput = "[SERIAL] Manual sync 'upt' (both students & books) received! Dispatching background cloud sync on Core 0.";
+          execStatus = "TRIGGERED";
         } else if (cmd == "upts") {
           systemRestMode = false;
           Serial.println(F("[SERIAL]   Manual sync 'upts' (students only) received! Dispatching..."));
@@ -3065,6 +3687,9 @@ void checkSerialCommands() {
             Serial.println(F("[WARN]     Wi-Fi currently disconnected. Sync will execute upon reconnect."));
           }
           triggerSyncStudents = true;
+          actionSummary = "Triggered immediate on-demand manual synchronization of student roster ('student_names') from Firestore.";
+          serialOutput = "[SERIAL] Manual sync 'upts' (students only) received! Dispatching background cloud sync on Core 0.";
+          execStatus = "TRIGGERED";
         } else if (cmd == "uptb") {
           systemRestMode = false;
           Serial.println(F("[SERIAL]   Manual sync 'uptb' (books only) received! Dispatching..."));
@@ -3072,31 +3697,61 @@ void checkSerialCommands() {
             Serial.println(F("[WARN]     Wi-Fi currently disconnected. Sync will execute upon reconnect."));
           }
           triggerSyncBooks = true;
+          actionSummary = "Triggered immediate on-demand manual synchronization of book catalog ('book_names') from Firestore.";
+          serialOutput = "[SERIAL] Manual sync 'uptb' (books only) received! Dispatching background cloud sync on Core 0.";
+          execStatus = "TRIGGERED";
 
         // 3. ROM Clear Commands
         } else if (cmd == "clr") {
           clearAllROMData();
+          actionSummary = "Erased all persistent ROM data (students, books, offline logs), cleared active session in RAM, and entered system REST mode.";
+          serialOutput = "[ROM-CLEAR] Full Persistent ROM Completely Cleared (Background)! Student roster cache ('students') erased, Book catalog cache ('books') erased, Offline logs buffer ('off_logs') erased, System entered REST MODE, Session credentials reset.";
         } else if (cmd == "clrs") {
           clearStudentROMData();
+          actionSummary = "Erased student roster cache from persistent ROM ('students' namespace); retained books and offline logs.";
+          serialOutput = "[ROM-CLEAR] Student Roster Cache Cleared (Background)! Student roster cache ('students') erased, Book catalog and offline logs retained, Session credentials reset.";
         } else if (cmd == "clrb") {
           clearBookROMData();
+          actionSummary = "Erased book catalog cache from persistent ROM ('books' namespace); retained student roster and offline logs.";
+          serialOutput = "[ROM-CLEAR] Book Catalog Cache Cleared (Background)! Book catalog cache ('books') erased, Student roster and offline logs retained.";
 
         // 4. Clean ROM Reset & Fresh Sync Commands
         } else if (cmd == "clrupt") {
           executeCleanResetAndSync();
+          actionSummary = "Erased full persistent ROM (students, books, offline logs) and dispatched background clean download of student roster and book catalog from Firestore.";
+          serialOutput = "[CLRUPT] Executing background ROM erase and fresh Firestore sync (students & books). Dispatching download on Core 0.";
+          execStatus = "TRIGGERED";
         } else if (cmd == "clrupts") {
           executeCleanResetAndSyncStudents();
+          actionSummary = "Erased student roster from persistent ROM and dispatched background clean download of 'student_names' from Firestore.";
+          serialOutput = "[CLRUPTS] Executing background student erase and fresh Firestore sync. Dispatching download on Core 0.";
+          execStatus = "TRIGGERED";
         } else if (cmd == "clruptb") {
           executeCleanResetAndSyncBooks();
+          actionSummary = "Erased book catalog from persistent ROM and dispatched background clean download of 'book_names' from Firestore.";
+          serialOutput = "[CLRUPTB] Executing background book erase and fresh Firestore sync. Dispatching download on Core 0.";
+          execStatus = "TRIGGERED";
 
         } else {
           Serial.print(F("[SERIAL] Unknown command: '"));
           Serial.print(serialBuffer);
           Serial.println(F("'. Supported commands:"));
+          Serial.println(F("         System:   'all'"));
           Serial.println(F("         Combined: 'rom', 'upt', 'clr', 'clrupt'"));
           Serial.println(F("         Students: 'roms', 'upts', 'clrs', 'clrupts'"));
           Serial.println(F("         Books:    'romb', 'uptb', 'clrb', 'clruptb'"));
+          actionSummary = "Unrecognized command received in Serial CLI.";
+          serialOutput = "[SERIAL] Unknown command: '" + serialBuffer + "'. Supported commands: 'all', 'rom', 'roms', 'romb', 'upt', 'upts', 'uptb', 'clr', 'clrs', 'clrb', 'clrupt', 'clrupts', 'clruptb'.";
+          execStatus = "UNKNOWN_COMMAND";
         }
+
+        // 2. Snapshot State AFTER Command Execution
+        String stateAfter = captureDetailedStateSummary();
+        uint32_t heapAfter = ESP.getFreeHeap();
+
+        // 3. Dispatch Complete Command Execution Log to Firestore ("commands-log" collection)
+        queueCommandLog(cmd, stateBefore, serialOutput, stateAfter, actionSummary, execStatus, heapBefore, heapAfter);
+
         serialBuffer = "";
       }
     } else {
@@ -3108,8 +3763,15 @@ void checkSerialCommands() {
 }
 
 void loop() {
-  // Check for interactive Serial Monitor commands (e.g. typing "rom", "upt", "clr", "clrupt")
+  // Check for interactive Serial Monitor commands (e.g. typing "all", "rom", "upt", "clr", "clrupt")
   checkSerialCommands();
+
+  // Periodic 30-second system clock & calendar broadcast to Serial Monitor
+  static unsigned long last30sTimePrint = 0;
+  if (millis() - last30sTimePrint >= 30000) {
+    last30sTimePrint = millis();
+    printPeriodicFullTime();
+  }
 
   // Handle clean sync completion notice from Core 0 (silent background - zero LCD interruption)
   if (cleanSyncFinished) {
