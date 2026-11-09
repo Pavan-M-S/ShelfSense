@@ -692,8 +692,14 @@ void firestoreSyncTask(void* pvParameters) {
   auth.user.email = FIREBASE_USER_EMAIL;
   auth.user.password = FIREBASE_USER_PASSWORD;
   config.token_status_callback = tokenStatusCallback;
+
+  // Extended Network Timeouts (optimized for mobile hotspots & high-latency cellular links)
+  config.timeout.serverResponse = 30 * 1000;   // 30 seconds response read timeout (prevents -6 timeout on slow mobile hotspots)
+  config.timeout.socketConnection = 25 * 1000; // 25 seconds socket connection & SSL handshake timeout
+  config.timeout.wifiReconnect = 5 * 1000;
+
   Firebase.reconnectNetwork(true);
-  fbdo.setBSSLBufferSize(4096 /* Rx buffer */, 1024 /* Tx buffer */);
+  fbdo.setBSSLBufferSize(4096 /* Rx buffer */, 2048 /* Tx buffer */);
   fbdo.setResponseSize(8192);
 
   Firebase.begin(&config, &auth);
@@ -716,7 +722,7 @@ void firestoreSyncTask(void* pvParameters) {
   bool initialSyncDone = false;
   unsigned long lastRosterCheckTime = 0;
   unsigned long lastOfflineFlushTime = 0;
-  const unsigned long ROSTER_CHECK_INTERVAL_MS = 20000;   // 20-second repeat roster sync
+  const unsigned long ROSTER_CHECK_INTERVAL_MS = 60000;   // Relaxed to 60s periodic sync to prevent hotspot bandwidth saturation
   const unsigned long OFFLINE_FLUSH_INTERVAL_MS = 15000;  // Flush offline ROM logs every 15 seconds
 
   // Infinite processing loop on Core 0
@@ -742,6 +748,7 @@ void firestoreSyncTask(void* pvParameters) {
       if (!initialSyncDone) {
         Serial.println(F("[AUTH-SYNC] Executing Boot-Time Roster & Book Catalog Synchronization..."));
         bool sOk = syncStudentsFromCloud();
+        vTaskDelay(pdMS_TO_TICKS(500));
         bool bOk = syncBooksFromCloud();
         initialSyncDone = sOk && bOk;
         if (initialSyncDone) {
@@ -787,10 +794,12 @@ void firestoreSyncTask(void* pvParameters) {
         bool sDiff = false;
         if (doStudents) {
           compareAndSyncRoster(false /* periodic */, sDiff);
+          vTaskDelay(pdMS_TO_TICKS(500));
         }
         bool bDiff = false;
         if (doBooks) {
           compareAndSyncBooks(false /* periodic */, bDiff);
+          vTaskDelay(pdMS_TO_TICKS(500));
         }
         initialSyncDone = true;
         if (sDiff || bDiff) {
@@ -822,10 +831,12 @@ void firestoreSyncTask(void* pvParameters) {
         bool sOk = true;
         if (doStudents) {
           sOk = compareAndSyncRoster(true /* suppress restart countdown */, unusedDiff);
+          vTaskDelay(pdMS_TO_TICKS(500));
         }
         bool bOk = true;
         if (doBooks) {
           bOk = compareAndSyncBooks(true /* suppress restart countdown */, unusedDiff);
+          vTaskDelay(pdMS_TO_TICKS(500));
         }
         initialSyncDone = true;
         if (sOk && bOk) {
@@ -839,31 +850,41 @@ void firestoreSyncTask(void* pvParameters) {
       }
 
       // Immediate Post-Round Sync Trigger (Triggered after completing a student + book round)
+      // Only runs after any pending queued transaction logs have finished uploading!
       if (initialSyncDone && triggerPostRoundSync) {
-        triggerPostRoundSync = false;
-        lastRosterCheckTime = millis();
-        Serial.println(F("---------------------------------------------------"));
-        Serial.println(F("[AUTH-SYNC] Completed one full book round! Running background cloud sync..."));
-        bool studentDiff = false;
-        compareAndSyncRoster(false /* periodic */, studentDiff);
-        bool bookDiff = false;
-        compareAndSyncBooks(false /* periodic */, bookDiff);
-        if (studentDiff || bookDiff) {
-          pendingRestart = true;
+        if (uxQueueMessagesWaiting(firestoreQueue) == 0) {
+          triggerPostRoundSync = false;
+          lastRosterCheckTime = millis();
+          Serial.println(F("---------------------------------------------------"));
+          Serial.println(F("[AUTH-SYNC] Completed one full book round! Running background cloud sync..."));
+          vTaskDelay(pdMS_TO_TICKS(500));
+          bool studentDiff = false;
+          compareAndSyncRoster(false /* periodic */, studentDiff);
+          vTaskDelay(pdMS_TO_TICKS(500));
+          bool bookDiff = false;
+          compareAndSyncBooks(false /* periodic */, bookDiff);
+          vTaskDelay(pdMS_TO_TICKS(500));
+          if (studentDiff || bookDiff) {
+            pendingRestart = true;
+          }
+          Serial.println(F("---------------------------------------------------"));
         }
-        Serial.println(F("---------------------------------------------------"));
       }
 
-      // Periodic 20-second Roster and Book check and diff sync (skipped in REST mode)
-      if (!systemRestMode && initialSyncDone && (millis() - lastRosterCheckTime >= ROSTER_CHECK_INTERVAL_MS)) {
+      // Periodic 60-second Roster and Book check and diff sync (skipped during active patron interaction or queue load)
+      if (!systemRestMode && initialSyncDone && currentState == WAITING_FOR_STUDENT &&
+          uxQueueMessagesWaiting(firestoreQueue) == 0 && uxQueueMessagesWaiting(commandLogQueue) == 0 &&
+          (millis() - lastRosterCheckTime >= ROSTER_CHECK_INTERVAL_MS)) {
         lastRosterCheckTime = millis();
-        Serial.println(F("[AUTH-SYNC] 20s interval elapsed. Checking Firestore 'student_names' vs ROM..."));
+        Serial.println(F("[AUTH-SYNC] 60s idle interval elapsed. Checking Firestore 'student_names' vs ROM..."));
         bool studentDiff = false;
         compareAndSyncRoster(false /* periodic */, studentDiff);
+        vTaskDelay(pdMS_TO_TICKS(500));
 
-        Serial.println(F("[BOOK-SYNC] 20s interval elapsed. Checking Firestore 'book_names' vs ROM..."));
+        Serial.println(F("[BOOK-SYNC] 60s idle interval elapsed. Checking Firestore 'book_names' vs ROM..."));
         bool bookDiff = false;
         compareAndSyncBooks(false /* periodic */, bookDiff);
+        vTaskDelay(pdMS_TO_TICKS(500));
 
         if (studentDiff || bookDiff) {
           pendingRestart = true;
@@ -907,6 +928,7 @@ void firestoreSyncTask(void* pvParameters) {
             Serial.println(fbdo.httpCode());
             Serial.print(F("[FIREBASE] Server Response: "));
             Serial.println(fbdo.payload());
+            vTaskDelay(pdMS_TO_TICKS(150));
           }
         }
         if (!sent) {
@@ -914,6 +936,8 @@ void firestoreSyncTask(void* pvParameters) {
           Serial.print(fbdo.httpCode());
           Serial.print(F(" | Reason: "));
           Serial.println(fbdo.errorReason());
+          fbdo.clear();
+          vTaskDelay(pdMS_TO_TICKS(1000));
         }
       } else {
         Serial.println(F("[FIREBASE] Network offline or Firebase not ready."));
@@ -960,14 +984,26 @@ void firestoreSyncTask(void* pvParameters) {
         if (cmdOk && cmdHttpCode == 200) {
           Serial.print(F("[COMMANDS-LOG] Document sync SUCCESS! HTTP Code: "));
           Serial.println(cmdHttpCode);
+          delete cmdEvent;
+          vTaskDelay(pdMS_TO_TICKS(150));
         } else {
           Serial.print(F("[COMMANDS-LOG] Document sync FAILED! HTTP Code: "));
           Serial.print(cmdHttpCode);
           Serial.print(F(" | Reason: "));
           Serial.println(fbdo.errorReason());
+          fbdo.clear();
+          if (pendingCommandLogs.size() < 10) {
+            pendingCommandLogs.push_back(cmdEvent);
+            Serial.print(F("[COMMANDS-LOG] Stored '"));
+            Serial.print(cmdEvent->command);
+            Serial.println(F("' log in memory for background retry upon reconnect."));
+          } else {
+            Serial.println(F("[COMMANDS-LOG] WARN: Pending buffer full. Dropping command log."));
+            delete cmdEvent;
+          }
+          vTaskDelay(pdMS_TO_TICKS(1000));
         }
         Serial.println(F("---------------------------------------------------"));
-        delete cmdEvent;
       } else {
         if (pendingCommandLogs.size() < 10) {
           pendingCommandLogs.push_back(cmdEvent);
@@ -1009,14 +1045,17 @@ void firestoreSyncTask(void* pvParameters) {
         Serial.print(F("[COMMANDS-LOG] Buffered sync SUCCESS! Doc ID: '"));
         Serial.print(pendingItem->docId);
         Serial.println(F("'"));
+        delete pendingItem;
+        vTaskDelay(pdMS_TO_TICKS(150));
       } else {
         Serial.print(F("[COMMANDS-LOG] Buffered sync FAILED! HTTP: "));
         Serial.print(pCode);
         Serial.print(F(" | Reason: "));
         Serial.println(fbdo.errorReason());
+        fbdo.clear();
+        pendingCommandLogs.insert(pendingCommandLogs.begin(), pendingItem);
+        vTaskDelay(pdMS_TO_TICKS(2000));
       }
-      delete pendingItem;
-      vTaskDelay(pdMS_TO_TICKS(50));
     }
 
     // Yield control to FreeRTOS watchdog & background token refresh
@@ -2317,14 +2356,14 @@ void dumpTaskManagerAll() {
   Serial.println(F("--------------------------------------------------------------------------------"));
   Serial.println(F("[2] DUAL-CORE TASK WORKLOAD ASSIGNMENTS:"));
   Serial.println(F("    ► CORE 0 [Cloud, Network & Storage Engine]:"));
-  Serial.println(F("        - Dedicated Task    : 'firestoreTask' (Pinned to Core 0, Priority 1)"));
-  Serial.println(F("        - Cloud Sync        : Periodic 20s diff sync for 'student_names' and 'book_names'"));
+  Serial.println(F("        - Dedicated Task    : 'firestoreTask' (Pinned to Core 0, Priority 1 - LOW BACKGROUND PRIORITY)"));
+  Serial.println(F("        - Cloud Sync        : Periodic 60s diff sync for 'student_names' and 'book_names' (idle only)"));
   Serial.println(F("        - Logging Services  : Asynchronous Firestore logger ('library_logs' & 'commands-log')"));
   Serial.println(F("        - Offline Buffer    : Automatic ROM offline log drainer and flusher (every 15s)"));
   Serial.println(F("        - Network Services  : Wi-Fi reconnect supervisor, NTP clock sync, Firebase Auth"));
   Serial.println(F("        - System Daemons    : ESP32 TCP/IP stack ('wifi', 'tiT', 'sys_evt')"));
   Serial.println(F("    ► CORE 1 [Real-Time Sensor & Interactive UI Engine]:"));
-  Serial.println(F("        - Dedicated Task    : 'loopTask' (Pinned to Core 1, Priority 1)"));
+  Serial.println(F("        - Dedicated Task    : 'loopTask' (Pinned to Core 1, Priority 3 - TOP REAL-TIME PRIORITY)"));
   Serial.println(F("        - RFID Sensing      : RC522 SPI high-frequency polling loop (Zero Latency)"));
   Serial.println(F("        - Display Actuation : LiquidCrystal I2C 16x2 real-time guidance & animated titles"));
   Serial.println(F("        - Peripherals       : Buzzer acoustic chirps/alarms, Green/Red LED indicators"));
@@ -2582,6 +2621,8 @@ bool compareAndSyncRoster(bool isBoot, bool &outDiffDetected) {
     Serial.print(httpCode);
     Serial.print(F(" | Error: "));
     Serial.println(errorReason);
+    fbdo.clear();
+    vTaskDelay(pdMS_TO_TICKS(1000));
     return false;
   }
 
@@ -2794,6 +2835,8 @@ bool compareAndSyncBooks(bool isBoot, bool &outDiffDetected) {
     Serial.print(httpCode);
     Serial.print(F(" | Error: "));
     Serial.println(errorReason);
+    fbdo.clear();
+    vTaskDelay(pdMS_TO_TICKS(1000));
     return false;
   }
 
@@ -3591,12 +3634,16 @@ void setup() {
   configTime(GMT_OFFSET_SEC, DAYLIGHT_OFFSET_SEC, NTP_SERVER_1, NTP_SERVER_2);
   Serial.println(F("[TIME]     NTP synchronization started (pool.ntp.org, IST GMT+5:30)"));
 
-  // Launch background Firestore sync task immediately on Core 0 so student roster sync starts at boot
-  // concurrently with hardware diagnostics and welcome splash screens (no waiting for splash screens or ready prompt)
+  // Elevate Arduino loopTask on Core 1 to HIGH PRIORITY (Priority 3)
+  // Ensures RFID SPI scanning, buzzer, dual LEDs, and I2C LCD always have top scheduling priority
+  vTaskPrioritySet(NULL, 3);
+
+  // Launch background Firestore sync task on Core 0 with LOW PRIORITY (Priority 1)
+  // and 20KB generous stack to avoid TLS stack pressure
   xTaskCreatePinnedToCore(
     firestoreSyncTask,
     "FirestoreSyncTask",
-    14336,
+    20480,
     NULL,
     1,
     &firestoreTaskHandle,

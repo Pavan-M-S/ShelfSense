@@ -49,15 +49,15 @@
   - Every Serial CLI command execution is automatically synchronized to a dedicated Firestore collection `commands-log`. Each document uses a timestamp ID (`YYYY-MM-DD_HHMMSS`) and records complete pre-execution state (`stateBefore`), Serial Monitor output (`serialOutput`), action summary, and post-execution state (`stateAfter` - e.g. what was done or left after `clr`).
 - **30-Second Periodic Time & Calendar Broadcaster**:
   - Automatically broadcasts full calendar and clock metrics (Year, Day of Year, Month name and number, Date, Day of Week, 24-hour time, 12-hour time with AM/PM, IST UTC+5:30 offset, ISO-8601, and System Uptime) to the Serial Monitor every 30 seconds.
-- **Dual-Core FreeRTOS Partitioning**:
-  - **Core 1 (Real-Time Hardware Engine)**: Dedicated entirely to SPI RFID polling, 16x2 I2C LCD animations, buzzer tones, dual-LED feedback, and serial CLI commands. Scanning evaluates with **instant 0ms zero network latency**.
-  - **Core 0 (Background Cloud Worker)**: Runs an asynchronous worker task managing Wi-Fi connectivity, NTP time synchronization, Firebase email/password authentication, periodic 20-second roster diff checks, and non-blocking transaction dispatching.
+- **Dual-Core FreeRTOS Partitioning & Priority Scheduling**:
+  - **Core 1 (Real-Time Hardware Engine - Priority 3 TOP PRIORITY)**: Dedicated entirely to high-frequency SPI RFID polling, 16x2 I2C LCD animations, buzzer tones, dual-LED feedback, and serial CLI commands. Scanning evaluates with **instant 0ms zero network latency**. Elevated to **Priority 3** so hardware feedback is never interrupted or delayed by background networking.
+  - **Core 0 (Background Cloud Worker - Priority 1 LOW PRIORITY)**: Runs an asynchronous worker task managing Wi-Fi connectivity, NTP time synchronization, Firebase email/password authentication, periodic 60-second roster diff checks, and non-blocking transaction dispatching. Operates strictly as a **low-priority background worker** with extended 30-second server response timeouts and automatic SSL socket clearing to withstand mobile hotspot latency.
 - **Strict Separation of Concerns (Zero Cloud on LCD)**:
   - The 16x2 LCD is strictly reserved for physical user guidance. Wi-Fi connection states, NTP handshakes, and cloud sync payloads are isolated entirely to the USB Serial Monitor (115200 baud).
 - **Offline-First Roster & Book Catalog Caching**:
   - The student roster and library book catalog are synchronized from Google Cloud Firestore (`student_names` and `book_names` collections) and cached in ESP32 Non-Volatile Storage (NVS / Preferences under `"students"` and `"books"` namespaces).
   - Validates card and book active status locally. Suspended cards or unavailable books (`active: false`) are immediately handled on-device.
-  - Automatically compares local ROM against Firestore every 20 seconds. If differences are detected in student roster or book catalog, it updates ROM and executes a graceful 3-second countdown restart (`"Data Updated! / Restarting in 3.."`).
+  - Automatically compares local ROM against Firestore every 60 seconds (when idle). If differences are detected in student roster or book catalog, it updates ROM and executes a graceful 3-second countdown restart (`"Data Updated! / Restarting in 3.."`).
 - **Persistent Offline Log Buffering**:
   - Transactions are dispatched to a FreeRTOS background queue. If Wi-Fi is lost or Firestore is temporarily unreachable, up to 20 transaction events are buffered in persistent ROM (`"off_logs"` namespace) and automatically flushed upon reconnection.
 - **Accurate NTP Timestamping**:
