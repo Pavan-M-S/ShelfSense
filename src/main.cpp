@@ -41,16 +41,17 @@
  * -----------------------------------------------------------------------------------------
  *   Command | Action & Behavior
  *  ---------+------------------------------------------------------------------------------
- *   rom     | Inspect Persistent ROM: Dumps all cached student records, active/suspended
- *           | status, buffered offline logs, free heap RAM, and Wi-Fi link status.
+ *   rom     | Inspect Persistent ROM: Dumps all cached student records, registered book
+ *           | catalog, active/suspended status, buffered offline logs, free heap RAM,
+ *           | and Wi-Fi link status.
  *   upt     | Update & Sync Firestore: Triggers an immediate, on-demand synchronization
- *           | of Firestore 'student_names' collection to ROM and flushes offline logs.
- *           | If differences are detected, triggers auto-restart countdown.
- *   clr     | Clear All ROM & Rest Mode: Erases all cached students and offline logs from
- *           | persistent ROM and sets system to REST mode. If cards are scanned before
- *           | syncing, LCD alerts 'ROM Empty / System Rest Mode'.
+ *           | of Firestore 'student_names' and 'book_names' collections to ROM and flushes
+ *           | offline logs. If differences are detected, triggers auto-restart countdown.
+ *   clr     | Clear All ROM & Rest Mode: Erases all cached students, books, and offline
+ *           | logs from persistent ROM and sets system to REST mode. If cards or books
+ *           | are scanned before syncing, LCD alerts 'ROM Empty / System Rest Mode'.
  *   clrupt  | Clear ROM & Fresh Sync: Clears full ROM and memory, then immediately pulls
- *           | and caches fresh student roster from Firestore without hardware reboot.
+ *           | and caches fresh student roster and book catalog from Firestore without reboot.
  * 
  * -----------------------------------------------------------------------------------------
  * CRITICAL ARCHITECTURAL RULES:
@@ -147,6 +148,8 @@ inline esp_err_t esp_task_wdt_init(uint32_t timeout_sec, bool panic) {
 #define FIRESTORE_COLLECTION          "library_logs"
 #define FIRESTORE_STUDENTS            "student_names"
 #define FIRESTORE_STUDENTS_COLLECTION FIRESTORE_STUDENTS
+#define FIRESTORE_BOOKS               "book_names"
+#define FIRESTORE_BOOKS_COLLECTION    FIRESTORE_BOOKS
 
 // NTP Time Synchronization Configuration (IST: UTC + 5:30 = 19800 seconds)
 #define NTP_SERVER_1        "pool.ntp.org"
@@ -169,8 +172,9 @@ FirebaseData fbdo;     // Core 0: Background Firestore worker (20s roster sync, 
 FirebaseAuth auth;
 FirebaseConfig config;
 
-// ESP32 Non-Volatile Storage (Preferences) for offline-first student roster caching & offline log buffering
+// ESP32 Non-Volatile Storage (Preferences) for offline-first student roster, book catalog & offline log buffering
 Preferences studentPrefs;
+Preferences bookPrefs;
 Preferences offlineLogsPrefs;
 
 // FreeRTOS Queue & Task handles for background Firestore sync
@@ -414,17 +418,40 @@ enum StudentAuthStatus {
   STUDENT_AUTH_ROM_REMOVED  // Card was cached in ROM but deleted from Firestore
 };
 
-// Forward declarations for offline caching & roster synchronization
+// Structure representing cached book record in ROM (Preferences NVS)
+struct BookRecord {
+  char title[128]; // Supports long titles up to 127 characters
+  uint8_t shelf;   // Physical shelf location
+  uint8_t rack;    // Physical rack location
+  bool active;     // Active / available status
+};
+
+// Book authentication states for verification
+enum BookAuthStatus {
+  BOOK_AUTH_ACTIVE,     // Registered active book
+  BOOK_AUTH_SUSPENDED,  // Registered book with active: false (Suspended / Under Repair)
+  BOOK_AUTH_NOT_FOUND   // Unregistered book tag (not in cloud or ROM)
+};
+
+// Forward declarations for offline caching & roster/catalog synchronization
 bool saveOfflineLogToROM(const FirestoreLogEvent& event);
 void flushOfflineLogsFromROM();
 bool compareAndSyncRoster(bool isBoot, bool &outDiffDetected);
 bool syncStudentsFromCloud();
+bool compareAndSyncBooks(bool isBoot, bool &outDiffDetected);
+bool syncBooksFromCloud();
 bool verifyStudentFromROM(const char* uid, char* outName, size_t maxLen, StudentAuthStatus& outStatus);
 bool verifyStudentWithCache(const char* uid, char* outName, size_t maxLen);
 bool getStudentFromROM(const char* uid, StudentRecord& outRecord);
 void saveStudentToROM(const char* uid, const char* name, bool active);
 void removeStudentFromROM(const char* uid);
 std::vector<String> getAllROMUIDs();
+bool verifyBookFromROM(const char* uid, BookRecord& outRecord, BookAuthStatus& outStatus);
+bool verifyBookWithCache(const char* uid, BookRecord& outRecord);
+bool getBookFromROM(const char* uid, BookRecord& outRecord);
+void saveBookToROM(const char* uid, const char* title, uint8_t shelf, uint8_t rack, bool active);
+void removeBookFromROM(const char* uid);
+std::vector<String> getAllROMBookUIDs();
 void printROMCacheSummary();
 void dumpAllROMData();
 void clearAllROMData();
@@ -657,13 +684,15 @@ void firestoreSyncTask(void* pvParameters) {
     bool fbReady = Firebase.ready();
 
     if (fbReady) {
-      // Boot-Time Roster Synchronization (executed once upon boot)
+      // Boot-Time Synchronization (executed once upon boot)
       if (!initialSyncDone) {
-        Serial.println(F("[AUTH-SYNC] Executing Boot-Time Roster Synchronization..."));
-        initialSyncDone = syncStudentsFromCloud();
+        Serial.println(F("[AUTH-SYNC] Executing Boot-Time Roster & Book Catalog Synchronization..."));
+        bool sOk = syncStudentsFromCloud();
+        bool bOk = syncBooksFromCloud();
+        initialSyncDone = sOk && bOk;
         if (initialSyncDone) {
           lastRosterCheckTime = millis();
-          Serial.println(F("[AUTH-SYNC] Boot-Time Roster Synchronization completed successfully."));
+          Serial.println(F("[AUTH-SYNC] Boot-Time Synchronization completed successfully."));
         } else {
           static int syncAttempts = 0;
           syncAttempts++;
@@ -691,10 +720,12 @@ void firestoreSyncTask(void* pvParameters) {
         Serial.println(F("---------------------------------------------------"));
         Serial.println(F("[MANUAL-SYNC] On-demand Firestore synchronization ('upt') initiated..."));
         flushOfflineLogsFromROM();
-        bool diffDetected = false;
-        compareAndSyncRoster(false /* periodic */, diffDetected);
+        bool studentDiff = false;
+        compareAndSyncRoster(false /* periodic */, studentDiff);
+        bool bookDiff = false;
+        compareAndSyncBooks(false /* periodic */, bookDiff);
         initialSyncDone = true;
-        if (diffDetected) {
+        if (studentDiff || bookDiff) {
           pendingRestart = true;
         } else {
           Serial.println(F("[MANUAL-SYNC] Sync complete: Local ROM is fully up-to-date with Firestore."));
@@ -708,12 +739,13 @@ void firestoreSyncTask(void* pvParameters) {
         systemRestMode = false;
         lastRosterCheckTime = millis();
         Serial.println(F("---------------------------------------------------"));
-        Serial.println(F("[CLRUPT]    Downloading fresh student roster from Firestore..."));
+        Serial.println(F("[CLRUPT]    Downloading fresh student roster & book catalog from Firestore..."));
         bool unusedDiff = false;
-        bool syncOk = compareAndSyncRoster(true /* suppress restart countdown */, unusedDiff);
+        bool sOk = compareAndSyncRoster(true /* suppress restart countdown */, unusedDiff);
+        bool bOk = compareAndSyncBooks(true /* suppress restart countdown */, unusedDiff);
         initialSyncDone = true;
-        if (syncOk) {
-          Serial.println(F("[CLRUPT]    Fresh roster successfully downloaded and cached in ROM!"));
+        if (sOk && bOk) {
+          Serial.println(F("[CLRUPT]    Fresh roster and book catalog successfully downloaded and cached in ROM!"));
           cleanSyncFinished = true;
         } else {
           Serial.println(F("[CLRUPT]    ERROR: Failed to fetch documents from Firestore. Check Wi-Fi / Firebase."));
@@ -722,27 +754,34 @@ void firestoreSyncTask(void* pvParameters) {
         Serial.println(F("---------------------------------------------------"));
       }
 
-      // Immediate Post-Round Roster Sync Trigger (Triggered after completing a student + book round)
+      // Immediate Post-Round Sync Trigger (Triggered after completing a student + book round)
       if (initialSyncDone && triggerPostRoundSync) {
         triggerPostRoundSync = false;
         lastRosterCheckTime = millis();
         Serial.println(F("---------------------------------------------------"));
-        Serial.println(F("[AUTH-SYNC] Completed one full book round! Running background cloud roster sync..."));
-        bool diffDetected = false;
-        compareAndSyncRoster(false /* periodic */, diffDetected);
-        if (diffDetected) {
+        Serial.println(F("[AUTH-SYNC] Completed one full book round! Running background cloud sync..."));
+        bool studentDiff = false;
+        compareAndSyncRoster(false /* periodic */, studentDiff);
+        bool bookDiff = false;
+        compareAndSyncBooks(false /* periodic */, bookDiff);
+        if (studentDiff || bookDiff) {
           pendingRestart = true;
         }
         Serial.println(F("---------------------------------------------------"));
       }
 
-      // Periodic 20-second Roster check and diff sync (Requirement 3 - skipped in REST mode)
+      // Periodic 20-second Roster and Book check and diff sync (skipped in REST mode)
       if (!systemRestMode && initialSyncDone && (millis() - lastRosterCheckTime >= ROSTER_CHECK_INTERVAL_MS)) {
         lastRosterCheckTime = millis();
         Serial.println(F("[AUTH-SYNC] 20s interval elapsed. Checking Firestore 'student_names' vs ROM..."));
-        bool diffDetected = false;
-        compareAndSyncRoster(false /* periodic */, diffDetected);
-        if (diffDetected) {
+        bool studentDiff = false;
+        compareAndSyncRoster(false /* periodic */, studentDiff);
+
+        Serial.println(F("[BOOK-SYNC] 20s interval elapsed. Checking Firestore 'book_names' vs ROM..."));
+        bool bookDiff = false;
+        compareAndSyncBooks(false /* periodic */, bookDiff);
+
+        if (studentDiff || bookDiff) {
           pendingRestart = true;
         }
       }
@@ -1344,7 +1383,149 @@ std::vector<String> getAllROMUIDs() {
   return list;
 }
 
-// Inspects and logs all student records currently stored in persistent ROM (NVS)
+// Retrieve book record from persistent ROM (Preferences NVS)
+bool getBookFromROM(const char* uid, BookRecord& outRecord) {
+  if (!uid || uid[0] == '\0') return false;
+  String cleanUID = String(uid);
+  cleanUID.trim();
+  cleanUID.toUpperCase();
+
+  if (bookPrefs.isKey(cleanUID.c_str())) {
+    String val = bookPrefs.getString(cleanUID.c_str(), "");
+    if (val.length() > 0) {
+      // Parse format: title|shelf|rack|active from right to left
+      int p3 = val.lastIndexOf('|');
+      if (p3 >= 0) {
+        String actStr = val.substring(p3 + 1);
+        actStr.trim();
+        outRecord.active = (actStr == "1" || actStr == "true");
+
+        int p2 = val.lastIndexOf('|', p3 - 1);
+        if (p2 >= 0) {
+          String rackStr = val.substring(p2 + 1, p3);
+          rackStr.trim();
+          outRecord.rack = (uint8_t)rackStr.toInt();
+
+          int p1 = val.lastIndexOf('|', p2 - 1);
+          if (p1 >= 0) {
+            String shelfStr = val.substring(p1 + 1, p2);
+            shelfStr.trim();
+            outRecord.shelf = (uint8_t)shelfStr.toInt();
+
+            String titleStr = val.substring(0, p1);
+            titleStr.trim();
+            strncpy(outRecord.title, titleStr.c_str(), sizeof(outRecord.title) - 1);
+            outRecord.title[sizeof(outRecord.title) - 1] = '\0';
+            return true;
+          }
+        }
+      }
+      // Fallback if unexpected format
+      strncpy(outRecord.title, val.c_str(), sizeof(outRecord.title) - 1);
+      outRecord.title[sizeof(outRecord.title) - 1] = '\0';
+      outRecord.shelf = 1;
+      outRecord.rack = 1;
+      outRecord.active = true;
+      return true;
+    }
+  }
+
+  // Fallback to static registeredBooks array if not in REST mode and not found in bookPrefs
+  if (!systemRestMode) {
+    for (size_t i = 0; i < NUM_BOOKS; i++) {
+      if (strcasecmp(registeredBooks[i].uid, cleanUID.c_str()) == 0) {
+        strncpy(outRecord.title, registeredBooks[i].title, sizeof(outRecord.title) - 1);
+        outRecord.title[sizeof(outRecord.title) - 1] = '\0';
+        outRecord.shelf = registeredBooks[i].shelf;
+        outRecord.rack = registeredBooks[i].rack;
+        outRecord.active = true;
+        return true;
+      }
+    }
+  }
+
+  return false;
+}
+
+// Stores or updates book metadata in persistent ROM (NVS)
+void saveBookToROM(const char* uid, const char* title, uint8_t shelf, uint8_t rack, bool active) {
+  if (!uid || uid[0] == '\0' || !title || title[0] == '\0') return;
+  String cleanUID = String(uid);
+  cleanUID.trim();
+  cleanUID.toUpperCase();
+
+  String val = String(title) + "|" + String(shelf) + "|" + String(rack) + "|" + (active ? "1" : "0");
+  bookPrefs.putString(cleanUID.c_str(), val);
+
+  // Maintain UID in __uids__ list
+  String uids = bookPrefs.getString("__uids__", "");
+  bool exists = false;
+  int start = 0;
+  while (start < uids.length()) {
+    int comma = uids.indexOf(',', start);
+    String token = (comma >= 0) ? uids.substring(start, comma) : uids.substring(start);
+    token.trim();
+    if (token == cleanUID) {
+      exists = true;
+      break;
+    }
+    if (comma < 0) break;
+    start = comma + 1;
+  }
+  if (!exists) {
+    if (uids.length() > 0) uids += ",";
+    uids += cleanUID;
+    bookPrefs.putString("__uids__", uids);
+  }
+}
+
+// Removes a book from persistent ROM (NVS)
+void removeBookFromROM(const char* uid) {
+  if (!uid || uid[0] == '\0') return;
+  String cleanUID = String(uid);
+  cleanUID.trim();
+  cleanUID.toUpperCase();
+
+  bookPrefs.remove(cleanUID.c_str());
+
+  String uids = bookPrefs.getString("__uids__", "");
+  if (uids.length() > 0) {
+    String newUids = "";
+    int start = 0;
+    while (start < uids.length()) {
+      int comma = uids.indexOf(',', start);
+      String token = (comma >= 0) ? uids.substring(start, comma) : uids.substring(start);
+      token.trim();
+      if (token.length() > 0 && token != cleanUID) {
+        if (newUids.length() > 0) newUids += ",";
+        newUids += token;
+      }
+      if (comma < 0) break;
+      start = comma + 1;
+    }
+    bookPrefs.putString("__uids__", newUids);
+  }
+}
+
+// Reads all book UIDs currently indexed in persistent ROM (NVS)
+std::vector<String> getAllROMBookUIDs() {
+  std::vector<String> list;
+  String uids = bookPrefs.getString("__uids__", "");
+  int start = 0;
+  while (start < uids.length()) {
+    int comma = uids.indexOf(',', start);
+    String token = (comma >= 0) ? uids.substring(start, comma) : uids.substring(start);
+    token.trim();
+    if (token.length() > 0) {
+      list.push_back(token);
+    }
+    if (comma < 0) break;
+    start = comma + 1;
+  }
+  return list;
+}
+
+// Inspects and logs all student records and books currently stored in persistent ROM (NVS)
 void printROMCacheSummary() {
   std::vector<String> uids = getAllROMUIDs();
   Serial.println(F("==================================================="));
@@ -1367,10 +1548,36 @@ void printROMCacheSummary() {
   if (uids.empty()) {
     Serial.println(F("            (No student cards cached in ROM yet)"));
   }
+
+  std::vector<String> bookUids = getAllROMBookUIDs();
+  Serial.println(F("---------------------------------------------------"));
+  Serial.print(F("[ROM-CACHE] Registered Book Tags in ROM (Total: "));
+  Serial.print(bookUids.size());
+  Serial.println(F("):"));
+  for (size_t i = 0; i < bookUids.size(); i++) {
+    BookRecord bRec;
+    if (getBookFromROM(bookUids[i].c_str(), bRec)) {
+      Serial.print(F("            ["));
+      Serial.print(i + 1);
+      Serial.print(F("] UID: "));
+      Serial.print(bookUids[i]);
+      Serial.print(F(" | Title: \""));
+      Serial.print(bRec.title);
+      Serial.print(F("\" | Shelf: "));
+      Serial.print(bRec.shelf);
+      Serial.print(F(" | Rack: "));
+      Serial.print(bRec.rack);
+      Serial.print(F(" | Status: "));
+      Serial.println(bRec.active ? F("ACTIVE") : F("SUSPENDED"));
+    }
+  }
+  if (bookUids.empty()) {
+    Serial.println(F("            (No book tags cached in ROM yet)"));
+  }
   Serial.println(F("==================================================="));
 }
 
-// Dumps all persistent ROM data (Student Roster cache & Offline Log buffer) to Serial Monitor
+// Dumps all persistent ROM data (Student Roster, Book Catalog & Offline Logs) to Serial Monitor
 void dumpAllROMData() {
   Serial.println();
   Serial.println(F("==================================================="));
@@ -1406,7 +1613,40 @@ void dumpAllROMData() {
   }
   Serial.println(F("---------------------------------------------------"));
 
-  // 2. Offline Logs Buffer ("off_logs" namespace)
+  // 2. Book Catalog Cache ("books" namespace)
+  std::vector<String> bookUids = getAllROMBookUIDs();
+  Serial.print(F("[ROM-BOOKS] Total Registered Books: "));
+  Serial.println(bookUids.size());
+  if (bookUids.empty()) {
+    Serial.println(F("             (No book records found in ROM)"));
+  } else {
+    for (size_t i = 0; i < bookUids.size(); i++) {
+      BookRecord bRec;
+      if (getBookFromROM(bookUids[i].c_str(), bRec)) {
+        Serial.print(F("  ["));
+        Serial.print(i + 1);
+        Serial.print(F("] UID: "));
+        Serial.print(bookUids[i]);
+        Serial.print(F(" | Title: \""));
+        Serial.print(bRec.title);
+        Serial.print(F("\" | Shelf: "));
+        Serial.print(bRec.shelf);
+        Serial.print(F(" | Rack: "));
+        Serial.print(bRec.rack);
+        Serial.print(F(" | Status: "));
+        Serial.println(bRec.active ? F("ACTIVE") : F("SUSPENDED"));
+      } else {
+        Serial.print(F("  ["));
+        Serial.print(i + 1);
+        Serial.print(F("] UID: "));
+        Serial.print(bookUids[i]);
+        Serial.println(F(" | Error reading book record"));
+      }
+    }
+  }
+  Serial.println(F("---------------------------------------------------"));
+
+  // 3. Offline Logs Buffer ("off_logs" namespace)
   uint16_t offCount = offlineLogsPrefs.getUShort("count", 0);
   Serial.print(F("[ROM-OFFLINE-LOGS] Total Buffered Offline Logs: "));
   Serial.println(offCount);
@@ -1459,11 +1699,12 @@ void dumpAllROMData() {
   Serial.println();
 }
 
-// Erases all student records and offline logs from persistent ROM and enters REST mode
+// Erases all student records, books, and offline logs from persistent ROM and enters REST mode
 // Zero LCD disruption: runs entirely in the background and logs to Serial only
 void clearAllROMData() {
   systemRestMode = true;
   studentPrefs.clear();
+  bookPrefs.clear();
   offlineLogsPrefs.clear();
   // Clear in-memory session credentials without disturbing the LCD display
   activeStudentName[0] = '\0';
@@ -1476,24 +1717,26 @@ void clearAllROMData() {
   Serial.println(F("==================================================="));
   Serial.println(F("[ROM-CLEAR] Persistent ROM completely cleared (Background)!"));
   Serial.println(F("            - Student roster cache ('students') erased"));
+  Serial.println(F("            - Book catalog cache ('books') erased"));
   Serial.println(F("            - Offline logs buffer ('off_logs') erased"));
   Serial.println(F("            - System is now in REST MODE."));
   Serial.println(F("            - LCD display remains untouched (dedicated to user guidance)."));
-  Serial.println(F("            - If a student taps a card before sync, LCD will alert:"));
+  Serial.println(F("            - If a patron taps a card before sync, LCD will alert:"));
   Serial.println(F("              Line 1: '   ROM Empty    ' | Line 2: 'System Rest Mode'"));
   Serial.println(F("            - Type 'upt' or 'clrupt' to exit REST mode and sync from Firestore."));
   Serial.println(F("==================================================="));
   Serial.println();
 }
 
-// Clears ROM & memory and immediately pulls a fresh student roster from Firestore without hardware reboot
+// Clears ROM & memory and immediately pulls fresh student roster & books from Firestore without reboot
 // Zero LCD disruption: runs entirely in the background and logs to Serial only
 void executeCleanResetAndSync() {
   systemRestMode = false;
   Serial.println();
   Serial.println(F("==================================================="));
-  Serial.println(F("[CLRUPT]    Executing background ROM erase and fresh Firestore sync..."));
+  Serial.println(F("[CLRUPT]    Executing background ROM erase and fresh Firestore sync (students & books)..."));
   studentPrefs.clear();
+  bookPrefs.clear();
   offlineLogsPrefs.clear();
   // Clear in-memory session credentials without disturbing the LCD display
   activeStudentName[0] = '\0';
@@ -1717,6 +1960,318 @@ bool syncStudentsFromCloud() {
   return compareAndSyncRoster(true /* isBoot */, unused);
 }
 
+// Periodic (every 20s) & Boot-Time Book Catalog Synchronization with Diff Detection
+// First reads ROM, then reads Firestore 'book_names'. If differences exist, updates ROM.
+bool compareAndSyncBooks(bool isBoot, bool &outDiffDetected) {
+  outDiffDetected = false;
+  if (WiFi.status() != WL_CONNECTED || !Firebase.ready()) {
+    return false;
+  }
+
+  Serial.println(F("[BOOK-SYNC] Reading ROM book cache & checking Firestore book_names collection..."));
+
+  // 1. Read current ROM book catalog
+  std::vector<String> romUIDs = getAllROMBookUIDs();
+  struct BookEntry {
+    String uid;
+    String title;
+    uint8_t shelf;
+    uint8_t rack;
+    bool active;
+  };
+  std::vector<BookEntry> romList;
+  for (size_t i = 0; i < romUIDs.size(); i++) {
+    BookRecord rec;
+    if (getBookFromROM(romUIDs[i].c_str(), rec)) {
+      BookEntry e;
+      e.uid = romUIDs[i];
+      e.title = String(rec.title);
+      e.shelf = rec.shelf;
+      e.rack = rec.rack;
+      e.active = rec.active;
+      romList.push_back(e);
+    }
+  }
+
+  // 2. Fetch Firestore book_names collection on Core 0
+  Serial.println(F("[BOOK-SYNC] Sending GET collection request to Firestore (book_names)..."));
+  bool getOk = Firebase.Firestore.getDocuments(&fbdo, FIREBASE_PROJECT_ID, "(default)", FIRESTORE_BOOKS);
+  int httpCode = fbdo.httpCode();
+  String payload = "";
+  String errorReason = "";
+
+  if (getOk && httpCode == 200) {
+    payload = fbdo.payload();
+    Serial.print(F("[BOOK-SYNC] Received collection response (HTTP 200). Size: "));
+    Serial.print(payload.length());
+    Serial.println(F(" bytes. Comparing with ROM cache..."));
+  } else {
+    errorReason = fbdo.errorReason();
+    Serial.print(F("[BOOK-SYNC] Failed to fetch documents from Firestore. HTTP: "));
+    Serial.print(httpCode);
+    Serial.print(F(" | Error: "));
+    Serial.println(errorReason);
+    return false;
+  }
+
+  FirebaseJson json;
+  json.setJsonData(payload);
+  FirebaseJsonData docsData;
+  json.get(docsData, "documents");
+
+  std::vector<BookEntry> cloudList;
+  if (docsData.success && docsData.type == "array") {
+    FirebaseJsonArray arr;
+    docsData.getArray(arr);
+    size_t numDocs = arr.size();
+
+    for (size_t i = 0; i < numDocs; i++) {
+      FirebaseJsonData itemData;
+      arr.get(itemData, i);
+      if (itemData.success) {
+        FirebaseJson docJson;
+        itemData.getJSON(docJson);
+
+        FirebaseJsonData resNameData, titleData, nameData;
+        docJson.get(resNameData, "name");
+
+        String bookTitle = "";
+        if (docJson.get(titleData, "fields/title/stringValue") && titleData.success) {
+          bookTitle = titleData.stringValue;
+        } else if (docJson.get(nameData, "fields/name/stringValue") && nameData.success) {
+          bookTitle = nameData.stringValue;
+        }
+        bookTitle.trim();
+
+        // Shelf parsing
+        uint8_t shelf = 1;
+        FirebaseJsonData shelfData;
+        if (docJson.get(shelfData, "fields/shelf/integerValue") && shelfData.success) {
+          shelf = (uint8_t)shelfData.intValue;
+        } else if (docJson.get(shelfData, "fields/shelf/stringValue") && shelfData.success) {
+          shelf = (uint8_t)shelfData.stringValue.toInt();
+        } else if (docJson.get(shelfData, "fields/shelfNumber/integerValue") && shelfData.success) {
+          shelf = (uint8_t)shelfData.intValue;
+        }
+
+        // Rack parsing
+        uint8_t rack = 1;
+        FirebaseJsonData rackData;
+        if (docJson.get(rackData, "fields/rack/integerValue") && rackData.success) {
+          rack = (uint8_t)rackData.intValue;
+        } else if (docJson.get(rackData, "fields/rack/stringValue") && rackData.success) {
+          rack = (uint8_t)rackData.stringValue.toInt();
+        } else if (docJson.get(rackData, "fields/rackNumber/integerValue") && rackData.success) {
+          rack = (uint8_t)rackData.intValue;
+        }
+
+        // Active parsing
+        bool isActive = true;
+        FirebaseJsonData bVal, sVal, iVal, rawActive;
+        if (docJson.get(bVal, "fields/active/booleanValue") && bVal.success) {
+          String bStr = bVal.stringValue;
+          bStr.trim();
+          bStr.toLowerCase();
+          if (bStr == "false" || bStr == "0") {
+            isActive = false;
+          } else {
+            isActive = bVal.boolValue;
+          }
+        } else if (docJson.get(sVal, "fields/active/stringValue") && sVal.success) {
+          String s = sVal.stringValue;
+          s.trim();
+          s.toLowerCase();
+          isActive = (s == "true" || s == "1");
+        } else if (docJson.get(iVal, "fields/active/integerValue") && iVal.success) {
+          isActive = (iVal.intValue != 0);
+        } else if (docJson.get(rawActive, "fields/active") && rawActive.success) {
+          String raw = rawActive.stringValue;
+          raw.trim();
+          raw.toLowerCase();
+          if (raw == "false" || raw == "0" || raw.indexOf("false") >= 0) {
+            isActive = false;
+          }
+        }
+
+        if (resNameData.success) {
+          String fullPath = resNameData.stringValue;
+          int lastSlash = fullPath.lastIndexOf('/');
+          String uid = (lastSlash >= 0) ? fullPath.substring(lastSlash + 1) : fullPath;
+          uid.trim();
+          uid.toUpperCase();
+
+          if (uid.length() > 0 && bookTitle.length() > 0) {
+            BookEntry e;
+            e.uid = uid;
+            e.title = bookTitle;
+            e.shelf = shelf;
+            e.rack = rack;
+            e.active = isActive;
+            cloudList.push_back(e);
+          }
+        }
+      }
+    }
+  }
+
+  // 3. Compare romList with cloudList
+  bool diff = false;
+  if (romList.size() != cloudList.size()) {
+    diff = true;
+    Serial.print(F("[BOOK-SYNC] Difference: Book count changed (ROM: "));
+    Serial.print(romList.size());
+    Serial.print(F(", Cloud: "));
+    Serial.print(cloudList.size());
+    Serial.println(F(")"));
+  } else {
+    for (size_t c = 0; c < cloudList.size(); c++) {
+      bool found = false;
+      for (size_t r = 0; r < romList.size(); r++) {
+        if (cloudList[c].uid == romList[r].uid) {
+          found = true;
+          if (cloudList[c].title != romList[r].title) {
+            diff = true;
+            Serial.print(F("[BOOK-SYNC] Difference: Book title changed for UID "));
+            Serial.print(cloudList[c].uid);
+            Serial.print(F(" (\""));
+            Serial.print(romList[r].title);
+            Serial.print(F("\" -> \""));
+            Serial.print(cloudList[c].title);
+            Serial.println(F("\")"));
+          }
+          if (cloudList[c].shelf != romList[r].shelf) {
+            diff = true;
+            Serial.print(F("[BOOK-SYNC] Difference: Shelf location changed for UID "));
+            Serial.print(cloudList[c].uid);
+            Serial.print(F(" ("));
+            Serial.print(romList[r].shelf);
+            Serial.print(F(" -> "));
+            Serial.print(cloudList[c].shelf);
+            Serial.println(F(")"));
+          }
+          if (cloudList[c].rack != romList[r].rack) {
+            diff = true;
+            Serial.print(F("[BOOK-SYNC] Difference: Rack location changed for UID "));
+            Serial.print(cloudList[c].uid);
+            Serial.print(F(" ("));
+            Serial.print(romList[r].rack);
+            Serial.print(F(" -> "));
+            Serial.print(cloudList[c].rack);
+            Serial.println(F(")"));
+          }
+          if (cloudList[c].active != romList[r].active) {
+            diff = true;
+            Serial.print(F("[BOOK-SYNC] Difference: Book active status changed for UID "));
+            Serial.print(cloudList[c].uid);
+            Serial.print(F(" ("));
+            Serial.print(romList[r].active ? F("active") : F("suspended"));
+            Serial.print(F(" -> "));
+            Serial.print(cloudList[c].active ? F("active") : F("suspended"));
+            Serial.println(F(")"));
+          }
+          break;
+        }
+      }
+      if (!found) {
+        diff = true;
+        Serial.print(F("[BOOK-SYNC] Difference: Book UID in cloud not found in ROM: "));
+        Serial.println(cloudList[c].uid);
+        break;
+      }
+      if (diff) break;
+    }
+  }
+
+  if (diff) {
+    Serial.println(F("[BOOK-SYNC] Updating ROM book cache with fresh Firestore catalog..."));
+    bookPrefs.clear();
+    String newUids = "";
+    for (size_t i = 0; i < cloudList.size(); i++) {
+      String val = cloudList[i].title + "|" + String(cloudList[i].shelf) + "|" + String(cloudList[i].rack) + "|" + (cloudList[i].active ? "1" : "0");
+      bookPrefs.putString(cloudList[i].uid.c_str(), val);
+      if (newUids.length() > 0) newUids += ",";
+      newUids += cloudList[i].uid;
+      Serial.print(F("[BOOK-SYNC] Cached: \""));
+      Serial.print(cloudList[i].title);
+      Serial.print(F("\" [UID: "));
+      Serial.print(cloudList[i].uid);
+      Serial.print(F(" | Shelf: "));
+      Serial.print(cloudList[i].shelf);
+      Serial.print(F(" | Rack: "));
+      Serial.print(cloudList[i].rack);
+      Serial.print(F(" | Active: "));
+      Serial.print(cloudList[i].active ? F("true") : F("false"));
+      Serial.println(F("]"));
+    }
+    bookPrefs.putString("__uids__", newUids);
+    Serial.print(F("[BOOK-SYNC] ROM book update complete. Total books cached: "));
+    Serial.println(cloudList.size());
+
+    if (!isBoot) {
+      outDiffDetected = true;
+      Serial.println(F("[BOOK-SYNC] Differences detected! Book catalog updated. Scheduling restart countdown..."));
+    }
+  } else {
+    Serial.println(F("[BOOK-SYNC] Periodic 20s check: ROM book cache and Firestore match perfectly. No changes."));
+  }
+
+  return true;
+}
+
+// Boot-Time Book Catalog Synchronization entry point
+bool syncBooksFromCloud() {
+  bool unused = false;
+  return compareAndSyncBooks(true /* isBoot */, unused);
+}
+
+// Instant Local ROM Book Verification: Zero network latency, instant LCD & buzzer feedback
+bool verifyBookFromROM(const char* uid, BookRecord& outRecord, BookAuthStatus& outStatus) {
+  if (uid == nullptr || uid[0] == '\0') {
+    outStatus = BOOK_AUTH_NOT_FOUND;
+    return false;
+  }
+
+  String uidStr = String(uid);
+  uidStr.trim();
+  uidStr.toUpperCase();
+  const char* cleanUID = uidStr.c_str();
+
+  if (getBookFromROM(cleanUID, outRecord)) {
+    if (outRecord.active) {
+      outStatus = BOOK_AUTH_ACTIVE;
+      Serial.print(F("[BOOK-ROM] Instant Match: Found active book \""));
+      Serial.print(outRecord.title);
+      Serial.print(F("\" [UID: "));
+      Serial.print(cleanUID);
+      Serial.print(F(" -> Shelf "));
+      Serial.print(outRecord.shelf);
+      Serial.print(F(", Rack "));
+      Serial.print(outRecord.rack);
+      Serial.println(F("]"));
+      return true;
+    } else {
+      outStatus = BOOK_AUTH_SUSPENDED;
+      Serial.print(F("[BOOK-ROM] Instant Match: Book is SUSPENDED: \""));
+      Serial.print(outRecord.title);
+      Serial.print(F("\" [UID: "));
+      Serial.print(cleanUID);
+      Serial.println(F("]"));
+      return false;
+    }
+  }
+
+  outStatus = BOOK_AUTH_NOT_FOUND;
+  Serial.print(F("[BOOK-ROM] UID ["));
+  Serial.print(cleanUID);
+  Serial.println(F("] not recognized in local ROM book cache."));
+  return false;
+}
+
+// Book Verification: Read book metadata directly from ROM cache
+bool verifyBookWithCache(const char* uid, BookRecord& outRecord) {
+  return getBookFromROM(uid, outRecord);
+}
+
 // Instant Local ROM Student Verification: Zero network latency, instant LCD & buzzer feedback
 bool verifyStudentFromROM(const char* uid, char* outName, size_t maxLen, StudentAuthStatus& outStatus) {
   if (uid == nullptr || uid[0] == '\0') {
@@ -1780,9 +2335,10 @@ int findBookIndex(const char* uid) {
   Serial.print(uid);
   Serial.println(F("]..."));
 
+  // Check static registeredBooks array
   for (size_t i = 0; i < NUM_BOOKS; i++) {
-    if (strcmp(registeredBooks[i].uid, uid) == 0) {
-      Serial.print(F("[LOOKUP]   Match found! Book: \""));
+    if (strcasecmp(registeredBooks[i].uid, uid) == 0) {
+      Serial.print(F("[LOOKUP]   Match found in catalog! Book: \""));
       Serial.print(registeredBooks[i].title);
       Serial.print(F("\" -> Shelf "));
       Serial.print(registeredBooks[i].shelf);
@@ -1790,6 +2346,18 @@ int findBookIndex(const char* uid) {
       Serial.println(registeredBooks[i].rack);
       return (int)i;
     }
+  }
+
+  // Also check dynamic ROM cache
+  BookRecord rec;
+  if (getBookFromROM(uid, rec)) {
+    Serial.print(F("[LOOKUP]   Match found in ROM cache! Book: \""));
+    Serial.print(rec.title);
+    Serial.print(F("\" -> Shelf "));
+    Serial.print(rec.shelf);
+    Serial.print(F(", Rack "));
+    Serial.println(rec.rack);
+    return 0;
   }
 
   Serial.println(F("[LOOKUP]   No match found in book database!"));
@@ -1804,7 +2372,8 @@ int findBookIndex(const char* uid) {
 void handleStudentScan(const char* uid) {
   // Check if ROM is empty or system is in REST mode (e.g. after 'clr' command)
   std::vector<String> romUIDs = getAllROMUIDs();
-  if (romUIDs.empty() || systemRestMode) {
+  std::vector<String> romBookUIDs = getAllROMBookUIDs();
+  if ((romUIDs.empty() && romBookUIDs.empty()) || systemRestMode) {
     Serial.print(F("[AUTH]     System in REST mode / ROM is EMPTY! Card ["));
     Serial.print(uid);
     Serial.println(F("] scanned. Please sync from Firestore ('upt' or 'clrupt')."));
@@ -1907,9 +2476,9 @@ void handleStudentScan(const char* uid) {
   }
 
   // 3. Book tag scanned instead of Student ID Card
-  int bookIdx = findBookIndex(uid);
-  if (bookIdx != -1) {
-    const Book& scannedBook = registeredBooks[bookIdx];
+  BookRecord scannedBook;
+  BookAuthStatus bStatus = BOOK_AUTH_NOT_FOUND;
+  if (verifyBookFromROM(uid, scannedBook, bStatus) || bStatus == BOOK_AUTH_SUSPENDED) {
     Serial.print(F("[WARN]     Book tag (\""));
     Serial.print(scannedBook.title);
     Serial.println(F("\") scanned at Step 1 instead of Student ID!"));
@@ -1922,7 +2491,7 @@ void handleStudentScan(const char* uid) {
     return;
   }
 
-  // 5. Unrecognized tag scanned -> Emergency alarm & SECURITY_ALERT
+  // 4. Unrecognized tag scanned -> Emergency alarm & SECURITY_ALERT
   Serial.print(F("[ERROR]    Unrecognized tag UID: "));
   Serial.println(uid);
   char reason[160];
@@ -1938,12 +2507,12 @@ void handleStudentScan(const char* uid) {
 
 // Handles Book Scanning & Shelf Guidance (State 2: WAITING_FOR_BOOK)
 void handleBookScan(const char* uid) {
-  int bookIdx = findBookIndex(uid);
+  BookRecord foundBook;
+  BookAuthStatus bStatus = BOOK_AUTH_NOT_FOUND;
+  verifyBookFromROM(uid, foundBook, bStatus);
 
-  if (bookIdx != -1) {
-    // 1. Registered Book Tag identified
-    const Book& foundBook = registeredBooks[bookIdx];
-
+  if (bStatus == BOOK_AUTH_ACTIVE) {
+    // 1. Registered Active Book Tag identified
     Serial.print(F("[SUCCESS]  Book identified: \""));
     Serial.print(foundBook.title);
     Serial.print(F("\" located on Shelf "));
@@ -1966,7 +2535,7 @@ void handleBookScan(const char* uid) {
                       activeStudentUID,
                       activeLoginTime,
                       foundBook.title,
-                      foundBook.uid,
+                      uid,
                       foundBook.shelf,
                       foundBook.rack,
                       note);
@@ -1980,6 +2549,36 @@ void handleBookScan(const char* uid) {
     // Trigger immediate background sync after completing round (Student + Book successfully logged)
     triggerPostRoundSync = true;
     Serial.println(F("[AUTH-SYNC] Completed one full book round. Scheduled immediate background cloud sync."));
+    return;
+  }
+
+  if (bStatus == BOOK_AUTH_SUSPENDED) {
+    // Book tag is marked inactive/suspended in Firestore
+    Serial.print(F("[AUTH]     Book tag SUSPENDED (active=false): \""));
+    Serial.print(foundBook.title);
+    Serial.print(F("\" [UID: "));
+    Serial.print(uid);
+    Serial.println(F("]"));
+
+    // 2 warning beeps on buzzer + Red LED
+    for (int i = 0; i < 2; i++) {
+      digitalWrite(RED_LED_PIN, HIGH);
+      digitalWrite(BUZZER_PIN, HIGH);
+      delay(150);
+      digitalWrite(RED_LED_PIN, LOW);
+      digitalWrite(BUZZER_PIN, LOW);
+      if (i < 1) delay(100);
+    }
+
+    // Display suspended message on LCD
+    showMessage("Book Unavailable", " Contact Admin  ");
+    delay(2500);
+
+    // Renew session timer (+18s) and restore book prompt
+    sessionStartTime = millis();
+    lastSessionSecondLogged = 0;
+    Serial.println(F("[INFO]     Session timer renewed (+18s). Ready for book tag retry..."));
+    showMessage("Tap Your Book...");
     return;
   }
 
@@ -2128,20 +2727,30 @@ void runHardwareDiagnostics() {
   // 4. Print Database Configuration Summary
   Serial.println(F("[BOOT]     Database Configuration:"));
   Serial.println(F("           - Student Roster: Offline-First Cloud Cache (Firestore: student_names / NVS: \"students\")"));
-  Serial.print(F("           - Registered Books:    "));
-  Serial.println(NUM_BOOKS);
-  for (size_t i = 0; i < NUM_BOOKS; i++) {
-    Serial.print(F("             ["));
-    Serial.print(i + 1);
-    Serial.print(F("] \""));
-    Serial.print(registeredBooks[i].title);
-    Serial.print(F("\" (UID: "));
-    Serial.print(registeredBooks[i].uid);
-    Serial.print(F(" -> Shelf "));
-    Serial.print(registeredBooks[i].shelf);
-    Serial.print(F(", Rack "));
-    Serial.print(registeredBooks[i].rack);
-    Serial.println(F(")"));
+  Serial.println(F("           - Book Catalog:   Offline-First Cloud Cache (Firestore: book_names / NVS: \"books\")"));
+  std::vector<String> initBookUids = getAllROMBookUIDs();
+  Serial.print(F("           - Cached Books in ROM: "));
+  Serial.println(initBookUids.size());
+  for (size_t i = 0; i < initBookUids.size(); i++) {
+    BookRecord bRec;
+    if (getBookFromROM(initBookUids[i].c_str(), bRec)) {
+      Serial.print(F("             ["));
+      Serial.print(i + 1);
+      Serial.print(F("] \""));
+      Serial.print(bRec.title);
+      Serial.print(F("\" (UID: "));
+      Serial.print(initBookUids[i]);
+      Serial.print(F(" -> Shelf "));
+      Serial.print(bRec.shelf);
+      Serial.print(F(", Rack "));
+      Serial.print(bRec.rack);
+      Serial.print(F(" | "));
+      Serial.print(bRec.active ? F("ACTIVE") : F("SUSPENDED"));
+      Serial.println(F(")"));
+    }
+  }
+  if (initBookUids.empty()) {
+    Serial.println(F("             (ROM book cache empty; will populate upon Firestore sync or use default catalog)"));
   }
 
   Serial.println(F("==================================================="));
@@ -2162,10 +2771,11 @@ void setup() {
   // Initialize Task Watchdog with an extended 30-second window and disable panic reset during cryptographic operations
   esp_task_wdt_init(30, false);
 
-  // Initialize NVS Preferences for offline-first student roster caching & offline log buffering
+  // Initialize NVS Preferences for offline-first student roster, book catalog & offline log buffering
   studentPrefs.begin("students", false);
+  bookPrefs.begin("books", false);
   offlineLogsPrefs.begin("off_logs", false);
-  Serial.println(F("[NVS]      Preferences namespaces \"students\" & \"off_logs\" initialized"));
+  Serial.println(F("[NVS]      Preferences namespaces \"students\", \"books\" & \"off_logs\" initialized"));
 
   // Check and display what is currently stored in persistent ROM at boot
   printROMCacheSummary();
@@ -2211,10 +2821,10 @@ void setup() {
   resetSystem();
 
   Serial.println(F("[SERIAL]   Interactive Commands Ready:"));
-  Serial.println(F("           - Type 'rom'    + Enter: Inspect all persistent ROM data (students & offline logs)"));
-  Serial.println(F("           - Type 'upt'    + Enter: Force immediate on-demand Firestore synchronization"));
+  Serial.println(F("           - Type 'rom'    + Enter: Inspect all persistent ROM data (students, books & offline logs)"));
+  Serial.println(F("           - Type 'upt'    + Enter: Force immediate on-demand Firestore synchronization (students & books)"));
   Serial.println(F("           - Type 'clr'    + Enter: Clear all ROM data and enter REST mode"));
-  Serial.println(F("           - Type 'clrupt' + Enter: Clear ROM, reset memory, and fresh sync from Firestore"));
+  Serial.println(F("           - Type 'clrupt' + Enter: Clear ROM, reset memory, and fresh sync from Firestore (students & books)"));
 }
 
 // Non-blocking serial command listener for runtime diagnostics (e.g. typing "rom", "upt", "clr", "clrupt")
@@ -2266,10 +2876,10 @@ void loop() {
     cleanSyncFailed = false;
   }
 
-  // Auto-restart countdown if roster data was updated in Firestore (Requirement 2 & 3)
+  // Auto-restart countdown if roster or book data was updated in Firestore (Requirement 2 & 3)
   if (pendingRestart && currentState == WAITING_FOR_STUDENT) {
     pendingRestart = false;
-    Serial.println(F("[SYSTEM]   Roster update detected in Firestore! Starting restart sequence..."));
+    Serial.println(F("[SYSTEM]   Roster or Book catalog update detected in Firestore! Starting restart sequence..."));
     showMessage(" Data Updated!  ", "Restarting in 3.");
     delay(1000);
     showMessage(" Data Updated!  ", "Restarting in 2.");

@@ -44,10 +44,10 @@
   - **Core 0 (Background Cloud Worker)**: Runs an asynchronous worker task managing Wi-Fi connectivity, NTP time synchronization, Firebase email/password authentication, periodic 20-second roster diff checks, and non-blocking transaction dispatching.
 - **Strict Separation of Concerns (Zero Cloud on LCD)**:
   - The 16x2 LCD is strictly reserved for physical user guidance. Wi-Fi connection states, NTP handshakes, and cloud sync payloads are isolated entirely to the USB Serial Monitor (115200 baud).
-- **Offline-First Roster Caching & Verification**:
-  - The student roster is synchronized from Google Cloud Firestore (`student_names` collection) and cached in ESP32 Non-Volatile Storage (NVS / Preferences under the `"students"` namespace).
-  - Validates card active status locally. Suspended cards (`active: false`) are immediately blocked on-device.
-  - Automatically compares local ROM against Firestore every 20 seconds. If roster differences are detected, it updates ROM and executes a graceful 3-second countdown restart (`"Data Updated! / Restarting in 3.."`).
+- **Offline-First Roster & Book Catalog Caching**:
+  - The student roster and library book catalog are synchronized from Google Cloud Firestore (`student_names` and `book_names` collections) and cached in ESP32 Non-Volatile Storage (NVS / Preferences under `"students"` and `"books"` namespaces).
+  - Validates card and book active status locally. Suspended cards or unavailable books (`active: false`) are immediately handled on-device.
+  - Automatically compares local ROM against Firestore every 20 seconds. If differences are detected in student roster or book catalog, it updates ROM and executes a graceful 3-second countdown restart (`"Data Updated! / Restarting in 3.."`).
 - **Persistent Offline Log Buffering**:
   - Transactions are dispatched to a FreeRTOS background queue. If Wi-Fi is lost or Firestore is temporarily unreachable, up to 20 transaction events are buffered in persistent ROM (`"off_logs"` namespace) and automatically flushed upon reconnection.
 - **Accurate NTP Timestamping**:
@@ -148,10 +148,10 @@ ShelfSense provides a non-blocking interactive command-line interface directly o
 
 | Command | Action & Behavior |
 | :--- | :--- |
-| `rom` | **Inspect Persistent ROM**: Dumps all cached student records (`UID`, `Name`, `Status: ACTIVE/SUSPENDED`), buffered offline logs, heap RAM, and Wi-Fi link status. |
-| `upt` | **Force Cloud Update**: Triggers an immediate, on-demand synchronization of the Firestore `student_names` collection to ROM and flushes offline logs. If differences are detected, schedules an auto-restart. |
-| `clr` | **Clear ROM & Enter REST Mode**: Erases all cached students and offline logs from NVS flash and sets the system to REST mode. Runs silently in the background without LCD disruption. If a card is scanned while in REST mode, the LCD alerts `"ROM Empty / System Rest Mode"`. |
-| `clrupt`| **Clear ROM & Fresh Sync**: Clears local ROM and memory, then immediately downloads and caches a fresh student roster from Firestore without hardware reboot. |
+| `rom` | **Inspect Persistent ROM**: Dumps all cached student records (`UID`, `Name`, `Status`), registered book catalog (`UID`, `Title`, `Shelf`, `Rack`, `Status`), buffered offline logs, heap RAM, and Wi-Fi link status. |
+| `upt` | **Force Cloud Update**: Triggers an immediate, on-demand synchronization of the Firestore `student_names` and `book_names` collections to ROM and flushes offline logs. If differences are detected, schedules an auto-restart. |
+| `clr` | **Clear ROM & Enter REST Mode**: Erases all cached students, books, and offline logs from NVS flash and sets the system to REST mode. Runs silently in the background without LCD disruption. If a card or book is scanned while in REST mode, the LCD alerts `"ROM Empty / System Rest Mode"`. |
+| `clrupt`| **Clear ROM & Fresh Sync**: Clears local ROM and memory, then immediately downloads and caches a fresh student roster and book catalog from Firestore without hardware reboot. |
 
 ---
 
@@ -237,7 +237,14 @@ ShelfSense synchronizes with Google Cloud Firestore (`FIREBASE_PROJECT_ID: "shel
    - **Fields**:
      - `name` (string): Student full name (e.g., `"Pavan"`).
      - `active` (boolean / string / integer): Student status (`true` for active, `false` for suspended).
-2. **`library_logs` Collection (Audit Trail)**:
+2. **`book_names` Collection (Book Catalog Ingestion)**:
+   - **Document ID**: The RFID book tag UID (e.g. `F10F7E05`).
+   - **Fields**:
+     - `title` / `name` (string): Book title (e.g., `"Geronimo Stilton - Journey to the Center of the Earth"`).
+     - `shelf` (integer / string): Assigned shelf number (e.g., `2`).
+     - `rack` (integer / string): Assigned rack number (e.g., `1`).
+     - `active` (boolean / string / integer): Availability status (`true` for active, `false` for suspended/under repair).
+3. **`library_logs` Collection (Audit Trail)**:
    - **Document ID**: Generated timestamp (`YYYY-MM-DD_HHMMSS`).
    - **Fields**:
      - `eventType` (string): `BOOK_PROCESSED`, `SESSION_TIMEOUT`, `SECURITY_ALERT`.
@@ -253,15 +260,16 @@ ShelfSense synchronizes with Google Cloud Firestore (`FIREBASE_PROJECT_ID: "shel
 
 ### Offline-First NVS Flash Caching
 
-Student records are stored locally in the `"students"` Preferences namespace using the serialized format:
+Student and book records are stored locally in the `"students"` and `"books"` Preferences namespaces using serialized key-value formats:
 ```text
-Key: <UID>  ->  Value: "<Name>|<1 or 0>"
+Namespace "students": Key: <UID>  ->  Value: "<Name>|<1 or 0>"
+Namespace "books":    Key: <UID>  ->  Value: "<Title>|<Shelf>|<Rack>|<1 or 0>"
 ```
-An index key `__uids__` maintains a comma-separated list of all cached card IDs for rapid traversal.
+Index keys `__uids__` in both namespaces maintain a comma-separated list of all cached IDs for rapid traversal.
 
-### Registered Library Books Catalog
+### Registered Library Books Catalog Fallback
 
-Configured statically in [`src/main.cpp`](src/main.cpp):
+Configured in [`src/main.cpp`](src/main.cpp) as default out-of-the-box fallback seed before first cloud sync:
 
 ```cpp
 // Database of registered books: { "Book Title", "RFID UID", Shelf Number, Rack Number }
