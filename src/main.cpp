@@ -235,7 +235,7 @@ struct FirestoreLogEvent {
 // Database of registered books: { "Book Title", "RFID UID", Shelf Number, Rack Number }
 const Book registeredBooks[] = {
   { "Geronimo Stilton - Journey to the Center of the Earth", "F10F7E05", 2, 1 }, // Shelf 2, Rack 1
-  { "Harry Potter",                                          "8DC0FA6B", 4, 3 }  // Shelf 4, Rack 3
+  { "Geronimo Stilton - The Great Adventure","8DC0FA6B", 4, 3 }  // Shelf 4, Rack 3
 };
 
 // Constant for book database sizing
