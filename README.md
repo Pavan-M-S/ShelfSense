@@ -3,29 +3,33 @@
 [![Platform](https://img.shields.io/badge/Platform-PlatformIO-orange.svg)](https://platformio.org/)
 [![Hardware](https://img.shields.io/badge/Hardware-ESP32--DevKit-blue.svg)](https://www.espressif.com/)
 [![Framework](https://img.shields.io/badge/Framework-Arduino-00979D.svg)](https://www.arduino.cc/)
+[![Cloud](https://img.shields.io/badge/Cloud-Google%20Cloud%20Firestore-yellow.svg)](https://firebase.google.com/)
+[![RTOS](https://img.shields.io/badge/RTOS-FreeRTOS%20Dual--Core-blue.svg)](https://www.freertos.org/)
 [![Sensor](https://img.shields.io/badge/Sensor-MFRC522%20RFID-lightblue.svg)](https://www.nxp.com/)
 [![Display](https://img.shields.io/badge/Display-16x2%20I2C%20LCD-yellow.svg)](https://en.wikipedia.org/wiki/Liquid-crystal_display)
 [![License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 
-**ShelfSense** is an intelligent, automated physical library guidance kiosk built on the ESP32. Designed for institutions and modern libraries (featuring welcome branding for **ABPS Nandyal**), it streamlines book lookup and return navigation using a two-factor RFID workflow: patrons authenticate with their student ID card, then scan any cataloged book tag to receive instant visual, acoustic, and animated shelf/rack guidance.
+**ShelfSense** is an enterprise-grade, physical library navigation and patron guidance kiosk built on the ESP32. Featuring welcome branding for **ABPS Nandyal**, it pairs dual-state RFID verification with an **offline-first local cache** and **silent background Google Cloud Firestore synchronization**. Patrons authenticate with their student ID card and scan cataloged books to receive immediate visual, acoustic, and animated shelf/rack guidance without encountering network latency.
 
 ---
 
 ## Table of Contents
 
+- [Architectural Highlights](#architectural-highlights)
 - [System Architecture & Workflow](#system-architecture--workflow)
-- [Key Features](#key-features)
+- [Core Features](#core-features)
+- [Interactive Serial Commands](#interactive-serial-commands-115200-baud)
 - [Hardware & Pinout Reference](#hardware--pinout-reference)
   - [1. RC522 RFID Reader (SPI / VSPI)](#1-rc522-rfid-reader-spi--vspi)
   - [2. 16x2 Character LCD (I2C Backpack)](#2-16x2-character-lcd-i2c-backpack)
   - [3. Status Indicators (Buzzer & Dual LEDs)](#3-status-indicators-buzzer--dual-leds)
   - [ESP32 Hardware Safety Guidelines](#esp32-hardware-safety-guidelines)
 - [Operational Behavior & Guidance Choreography](#operational-behavior--guidance-choreography)
-- [Software Configuration & Database Management](#software-configuration--database-management)
-  - [Data Structures](#data-structures)
-  - [Adding Students and Books](#adding-students-and-books)
-  - [Discovering New Card UIDs](#discovering-new-card-uids)
-- [Build, Flash & Monitor](#build-flash--monitor)
+- [Cloud & Database Configuration](#cloud--database-configuration)
+  - [Firestore Collections](#firestore-collections)
+  - [Offline-First NVS Flash Caching](#offline-first-nvs-flash-caching)
+  - [Registered Library Books Catalog](#registered-library-books-catalog)
+- [Build, Flash & Memory Configuration](#build-flash--memory-configuration)
 - [Serial Monitor Diagnostic Reference](#serial-monitor-diagnostic-reference)
 - [Troubleshooting](#troubleshooting)
 - [Project Structure](#project-structure)
@@ -33,83 +37,121 @@
 
 ---
 
-## System Architecture & Workflow
+## Architectural Highlights
 
-ShelfSense runs a deterministic Finite State Machine (FSM) with intelligent cross-tag lookup, session persistence, and multi-tier feedback:
+- **Dual-Core FreeRTOS Partitioning**:
+  - **Core 1 (Real-Time Hardware Engine)**: Dedicated entirely to SPI RFID polling, 16x2 I2C LCD animations, buzzer tones, dual-LED feedback, and serial CLI commands. Scanning evaluates with **instant 0ms zero network latency**.
+  - **Core 0 (Background Cloud Worker)**: Runs an asynchronous worker task managing Wi-Fi connectivity, NTP time synchronization, Firebase email/password authentication, periodic 20-second roster diff checks, and non-blocking transaction dispatching.
+- **Strict Separation of Concerns (Zero Cloud on LCD)**:
+  - The 16x2 LCD is strictly reserved for physical user guidance. Wi-Fi connection states, NTP handshakes, and cloud sync payloads are isolated entirely to the USB Serial Monitor (115200 baud).
+- **Offline-First Roster Caching & Verification**:
+  - The student roster is synchronized from Google Cloud Firestore (`student_names` collection) and cached in ESP32 Non-Volatile Storage (NVS / Preferences under the `"students"` namespace).
+  - Validates card active status locally. Suspended cards (`active: false`) are immediately blocked on-device.
+  - Automatically compares local ROM against Firestore every 20 seconds. If roster differences are detected, it updates ROM and executes a graceful 3-second countdown restart (`"Data Updated! / Restarting in 3.."`).
+- **Persistent Offline Log Buffering**:
+  - Transactions are dispatched to a FreeRTOS background queue. If Wi-Fi is lost or Firestore is temporarily unreachable, up to 20 transaction events are buffered in persistent ROM (`"off_logs"` namespace) and automatically flushed upon reconnection.
+- **Accurate NTP Timestamping**:
+  - System time synchronized with Indian Standard Time (IST: UTC+5:30 / 19800 seconds). Documents in Firestore use clean formatted IDs (`YYYY-MM-DD_HHMMSS`) combining patron login and book processing into a unified audit trail.
+- **Zero Dynamic Allocation (24/7 Production Stability)**:
+  - Fixed stack buffers (`char[]`), `const char*` pointers, and `F(...)` flash strings eliminate heap fragmentation and memory leaks during continuous 24/7 public kiosk operation.
+
+---
+
+## System Architecture & Workflow
 
 ```mermaid
 stateDiagram-v2
     [*] --> BootDiagnostics: Power ON / Reset
     BootDiagnostics --> WaitingForStudent: Splash (1.8s) -> Steady LCD: "Please Tap Your Student ID Card"
 
-    state "State 0: WAITING_FOR_STUDENT" as WaitingForStudent {
-        [*] --> DetectTag0: Card Presented
-        DetectTag0 --> AuthSuccess: Valid Student UID
-        DetectTag0 --> BookEarlyWarn: Scanned Book Tag Early
-        DetectTag0 --> UnrecognizedAlarm0: Unregistered Tag
+    state "Core 0 (Background)" as Core0 {
+        [*] --> WiFiConnect: Wi-Fi STA
+        WiFiConnect --> NTPSync: Sync Clock (IST GMT+5:30)
+        NTPSync --> FirebaseAuth: Email/Password Token
+        FirebaseAuth --> InitialRosterSync: Fetch Firestore 'student_names' -> Cache to ROM
+        InitialRosterSync --> BackgroundLoop: 20s Diff Check & Offline Log Flush
     }
 
+    state "State 0: WAITING_FOR_STUDENT (Core 1)" as WaitingForStudent {
+        [*] --> DetectTag0: Card Presented
+        DetectTag0 --> CheckRestMode: Check if System in REST Mode
+        CheckRestMode --> RestModeAlert: ROM Empty / REST Mode -> Alert LCD
+        CheckRestMode --> VerifyROM: Verify against Local ROM Cache
+        VerifyROM --> ActiveStudent: Active Student (active=true)
+        VerifyROM --> SuspendedStudent: Suspended Student (active=false)
+        VerifyROM --> BookEarlyWarn: Scanned Book Tag Early
+        VerifyROM --> UnrecognizedAlarm0: Unregistered Tag
+    }
+
+    RestModeAlert --> WaitingForStudent: LCD: "ROM Empty / System Rest Mode" (2 Beeps + Red LED)
+    SuspendedStudent --> WaitingForStudent: LCD: "Card Suspended / Contact Admin" (2 Beeps + Red LED)
     BookEarlyWarn --> WaitingForStudent: LCD: "Please Tap Your / Student ID First" (2 Warning Beeps + Red LED)
-    UnrecognizedAlarm0 --> WaitingForStudent: LCD: "Unrecognized ID / Access Denied!" (2s Rapid Alarm + Red Strobe)
+    UnrecognizedAlarm0 --> WaitingForStudent: LCD: "Unrecognized ID / Access Denied!" (2s Siren + Red Strobe + Log SECURITY_ALERT)
 
-    AuthSuccess --> WaitingForBook: Beep + Green Pulse | LCD: "Hi <Name>" (Smooth Scroll) / "Tap Book Tag..." (20s Timer Started)
+    ActiveStudent --> WaitingForBook: Beep + Green Pulse | LCD: "Hi <Name>" (Scroll) / "Tap Book Tag..." (18s Timer Started)
 
-    state "State 1: WAITING_FOR_BOOK" as WaitingForBook {
+    state "State 1: WAITING_FOR_BOOK (Core 1)" as WaitingForBook {
         [*] --> DetectTag1: Card Presented or Inactivity
         DetectTag1 --> BookFound: Valid Book Tag
-        DetectTag1 --> StudentAgainWarn: Scanned Student Card Again (Timer Renewed +20s)
-        DetectTag1 --> UnrecognizedAlarm1: Unregistered Tag (Timer Renewed +20s)
-        DetectTag1 --> SessionTimeout: Inactivity >= 20s
+        DetectTag1 --> StudentAgainWarn: Scanned Student Card Again (Timer Renewed +18s)
+        DetectTag1 --> UnrecognizedAlarm1: Unregistered Tag (Timer Renewed +18s)
+        DetectTag1 --> SessionTimeout: Inactivity >= 18s
     }
 
     StudentAgainWarn --> WaitingForBook: LCD: "Please Tap Book / Tag (Not ID)" (Session Maintained)
-    UnrecognizedAlarm1 --> WaitingForBook: LCD: "Unrecognized ID / Unknown Book Tag" (2s Alarm, Session Maintained)
-    SessionTimeout --> WaitingForStudent: LCD: "Session Expired / Please Try Again" (2 Warning Beeps + Red LED)
+    UnrecognizedAlarm1 --> WaitingForBook: LCD: "Unrecognized ID / Unknown Book Tag" (2s Siren, Session Maintained)
+    SessionTimeout --> WaitingForStudent: LCD: "Session Expired / Please Try Again" (2 Beeps + Red LED + Log SESSION_TIMEOUT)
 
-    BookFound --> AnimatedGuidance: Beep + Green Pulse
+    BookFound --> AnimatedGuidance: Beep + Green Pulse | Queue BOOK_PROCESSED to Firestore
 
     state "Animated Shelf Guidance & Return Sequence" as AnimatedGuidance {
         [*] --> TitleScroll: Adaptive Scroll Title (Line 1) + Green LED Rhythm
-        TitleScroll --> RevealShelf: 4 chars before end: Reveal "Shelf:X Rack:Y" (Line 2) + Audio Chime
+        TitleScroll --> RevealShelf: 4 chars before end: Reveal "Shelf:X  Rack:Y" (Line 2) + Audio Chime
         RevealShelf --> HoldPhase1: Hold view 4s with Solid Green LED ON
         HoldPhase1 --> HoldPhase2: Move Shelf & Rack to Line 1; Line 2 scrolls "Please place it in given shelf" (4s)
         HoldPhase2 --> WarningPhase: LCD: "Session Ending.." + 3 Warning Beeps & Green LED Flashes (3s)
-        WarningPhase --> [*]: Green LED OFF
+        WarningPhase --> PostRoundTrigger: Green LED OFF
     }
 
-    AnimatedGuidance --> WaitingForStudent: Auto-Reset to Standby
+    PostRoundTrigger --> WaitingForStudent: Auto-Reset & Trigger Immediate Background Cloud Sync
 ```
 
 ---
 
-## Key Features
+## Core Features
 
-- **Sequential Two-Tier State Machine**:
-  - **Patron Authentication (`WAITING_FOR_STUDENT`)**: Validates student identity against registered credentials. Displays a brief reset splash (`"ShelfSense Ready / Smart Library"` for 1.8s) before settling into steady standby (`"Please Tap Your / Student ID Card"`), with personalized greetings and smooth scrolling for long names.
-  - **Book Localization (`WAITING_FOR_BOOK`)**: Maps book tags to designated **Shelf** and **Rack** coordinates.
-- **Cross-Tag Type Resolution & Session Memory**:
-  - Scanning a book tag before student login prompts: `"Please Tap Your Student ID First"`.
-  - Scanning a student ID while already in book-scan mode prompts: `"Please Tap Book Tag (Not ID)"` without ending the active student session (renews timer).
-  - Unrecognized tags trigger a **2-second emergency alarm** (rapid 100ms pulsing audio-visual strobe), while preserving the authenticated session during book lookups for frictionless retry (renews timer).
-- **Non-Blocking Inactivity Session Timeout (`SESSION_TIMEOUT_MS = 20000`)**:
-  - Automatically expires abandoned patron sessions after 20 seconds of inactivity in `WAITING_FOR_BOOK`.
-  - Issues 2 warning beeps + Red LED flashes, presents `"Session Expired / Please Try Again"` on LCD, and cleanly returns to standby.
-  - Interactive retries (scanning a book out of order or unrecognized tag) automatically renew the 20-second session window (`+20s`).
-- **Zero Dynamic Allocation Architecture (24/7 Production Stability)**:
-  - Eliminates heap-allocating Arduino `String` instances in database models, RFID reading, and logging routines.
-  - Utilizes fixed-size stack buffers (`char[]`), `const char*` pointers, and `F(...)` flash-string macros to prevent RAM heap fragmentation and Out-Of-Memory (OOM) crashes during continuous 24/7 public kiosk operation.
-- **Dynamic Animated Guidance Choreography**:
-  - **Adaptive Title Scrolling**: Automatically chooses 280ms/char for titles $\le 30$ characters and accelerates to 180ms/char for longer titles, accompanied by rhythmic Green LED blinking.
-  - **Pre-Reveal Cue**: Exactly 4 characters before title scrolling concludes, Line 2 reveals `Shelf:X  Rack:Y` with an immediate single audio chime.
-  - **Two-Phase 8-Second Location Hold**:
-    - **Phase 1 (0–4s)**: Displays Title + Shelf/Rack with solid Green LED illumination.
-    - **Phase 2 (4–8s)**: Promotes Shelf/Rack info to Line 1, while Line 2 continuously scrolls `"Please place it in given shelf"` at 280ms per character.
-  - **Session-Ending Countdown**: Issues 3 medium beeps paired with simultaneous Green LED flashes over 3 seconds with `"Session Ending.."`, then turns off all LEDs and resets to standby.
-- **Comprehensive Boot Diagnostics & Self-Healing**:
-  - Scans I2C bus at startup (`0x27`, `0x3F`, or dynamic scan from `0x01` to `0x7F`) to ensure display connection.
-  - Displays branded welcome splash screens (`"ABPS Nandyal - Welcome!"` $\rightarrow$ `"ShelfSense - Smart Library"`).
-  - Queries RC522 SPI version registers (identifies v2.0 `0x92`, v1.0 `0x91`, FM17522 clone `0x88`, or reports SPI communication faults).
-  - Performs an automated power-on indicator test (Green LED, Red LED, and Buzzer).
+- **Instant Local Authentication with Cloud Synchronization**:
+  - Evaluates RFID cards directly against local NVS flash with **0ms latency**.
+  - Background task monitors Firestore for patron modifications, additions, or suspensions.
+- **Suspended Student Enforcement**:
+  - Automatically identifies cards marked `active: false` in Firestore.
+  - Triggers an instant on-device denial sequence (`"Card Suspended / Contact Admin"`, 2 warning beeps + Red LED) without issuing book access.
+- **Unified Cloud Audit Logging**:
+  - Authenticated student login and book identification are combined into a single unified `BOOK_PROCESSED` document in the Firestore `library_logs` collection.
+  - Failed/unregistered card scans dispatch asynchronous `SECURITY_ALERT` documents.
+  - Inactivity timeouts dispatch asynchronous `SESSION_TIMEOUT` documents.
+- **Non-Blocking 18-Second Inactivity Window (`SESSION_TIMEOUT_MS = 18000`)**:
+  - Inactivity during book scanning triggers an audible alert, clears the patron session, logs the event to Firestore, and resets the kiosk to standby.
+  - Real-time second-by-second countdown is displayed in the Serial Monitor.
+  - Retrying with a student card or unrecognized card renews the 18-second timer (`+18s`).
+- **Dynamic Guidance Animation**:
+  - Adaptive title scrolling (150ms for extra-long titles, 180ms for long titles, 250ms standard).
+  - Pre-reveal cue: exactly 4 characters before title scrolling finishes, Line 2 displays `Shelf:X  Rack:Y` with an audio prompt.
+  - Two-phase 8-second hold: 4s static view + 4s shelf/rack display on Line 1 with smooth scrolling placement prompt on Line 2 (`"Please place it in given shelf"`).
+  - 3-second session-ending warning with 3 medium beeps and synchronized Green LED pulses.
+
+---
+
+## Interactive Serial Commands (115200 Baud)
+
+ShelfSense provides a non-blocking interactive command-line interface directly over the USB Serial link:
+
+| Command | Action & Behavior |
+| :--- | :--- |
+| `rom` | **Inspect Persistent ROM**: Dumps all cached student records (`UID`, `Name`, `Status: ACTIVE/SUSPENDED`), buffered offline logs, heap RAM, and Wi-Fi link status. |
+| `upt` | **Force Cloud Update**: Triggers an immediate, on-demand synchronization of the Firestore `student_names` collection to ROM and flushes offline logs. If differences are detected, schedules an auto-restart. |
+| `clr` | **Clear ROM & Enter REST Mode**: Erases all cached students and offline logs from NVS flash and sets the system to REST mode. Runs silently in the background without LCD disruption. If a card is scanned while in REST mode, the LCD alerts `"ROM Empty / System Rest Mode"`. |
+| `clrupt`| **Clear ROM & Fresh Sync**: Clears local ROM and memory, then immediately downloads and caches a fresh student roster from Firestore without hardware reboot. |
 
 ---
 
@@ -118,17 +160,17 @@ stateDiagram-v2
 ### 1. RC522 RFID Reader (SPI / VSPI)
 
 > [!CAUTION]
-> **CRITICAL VOLTAGE REQUIREMENT**: Power the RC522 module with **3.3V ONLY**. Connecting VCC to the 5V rail will permanently damage the RC522 RFID chip.
+> **CRITICAL VOLTAGE REQUIREMENT**: Power the RC522 module with **3.3V ONLY**. Connecting VCC to 5V will permanently burn the RC522 RFID chip.
 
-| RC522 Pin | ESP32 GPIO | Pin Type | Description / Notes |
+| RC522 Pin | ESP32 GPIO | Pin Type | Notes |
 | :--- | :--- | :--- | :--- |
-| **VCC** | `3.3V` | Power (Fixed) | Must connect to 3.3V power rail ONLY |
-| **RST** | `GPIO 4` | Digital Output | RC522 Reset pin (`RST_PIN`) |
+| **VCC** | `3.3V` | Power (Fixed) | Connect to 3.3V rail ONLY |
+| **RST** | `GPIO 4` | Digital Output | RC522 Reset (`RST_PIN`) |
 | **GND** | `GND` | Ground (Fixed) | Common system ground |
-| **IRQ** | *NC* | Not Connected | Unused for polled SPI operation |
-| **MISO** | `GPIO 19` | Hardware SPI | Default VSPI Master-In-Slave-Out |
-| **MOSI** | `GPIO 23` | Hardware SPI | Default VSPI Master-Out-Slave-In |
-| **SCK** | `GPIO 18` | Hardware SPI | Default VSPI Serial Clock |
+| **IRQ** | *NC* | Not Connected | Unused |
+| **MISO** | `GPIO 19` | Hardware SPI | Default VSPI MISO |
+| **MOSI** | `GPIO 23` | Hardware SPI | Default VSPI MOSI |
+| **SCK** | `GPIO 18` | Hardware SPI | Default VSPI Clock |
 | **SDA (SS)**| `GPIO 5` | Digital Output | Hardware SPI Slave Select (`SS_PIN`) |
 
 ### 2. 16x2 Character LCD (I2C Backpack)
@@ -141,7 +183,7 @@ stateDiagram-v2
 | **SCL** | `GPIO 22` | Hardware I2C | Wire Clock line |
 
 > [!TIP]
-> The default PCF8574 I2C address is usually `0x27` (or `0x3F`). ShelfSense includes an automatic bus scanner at boot. Adjust the blue potentiometer on the back of the backpack module to calibrate display text contrast.
+> The default I2C address is usually `0x27` (or `0x3F`). ShelfSense includes an automatic bus scanner at boot. Adjust the blue potentiometer on the backpack module to calibrate display contrast.
 
 ### 3. Status Indicators (Buzzer & Dual LEDs)
 
@@ -149,16 +191,16 @@ stateDiagram-v2
 | :--- | :--- | :--- | :--- |
 | **Active Buzzer** | Anode (+) | `GPIO 27` | Configurable (`BUZZER_PIN`) |
 | | Cathode (-) | `GND` | Common ground |
-| **Red Status LED** | Anode (+) [Long leg] | `GPIO 26` | Configurable (`RED_LED_PIN`), connect via 220Ω–330Ω resistor |
+| **Red Status LED** | Anode (+) [Long leg] | `GPIO 26` | Configurable (`RED_LED_PIN`), connect via 220Ω resistor |
 | | Cathode (-) [Short leg] | `GND` | Common ground |
-| **Green Status LED** | Anode (+) [Long leg] | `GPIO 25` | Configurable (`GREEN_LED_PIN`), connect via 220Ω–330Ω resistor |
+| **Green Status LED** | Anode (+) [Long leg] | `GPIO 25` | Configurable (`GREEN_LED_PIN`), connect via 220Ω resistor |
 | | Cathode (-) [Short leg] | `GND` | Common ground |
 
 ### ESP32 Hardware Safety Guidelines
 
 > [!WARNING]
-> - **DO NOT USE GPIO 6 through 11**: These pins are connected directly to the ESP32's integrated SPI flash memory. Using them will crash the microcontroller.
-> - Ensure all components share a **common ground** (`GND`).
+> - **DO NOT USE GPIO 6 through 11**: These pins are connected to the ESP32's internal SPI flash memory.
+> - Ensure all modules share a **common ground** (`GND`).
 
 ---
 
@@ -168,95 +210,74 @@ stateDiagram-v2
 | :--- | :--- | :--- | :--- | :--- |
 | **Reset Transition** | `ShelfSense Ready`<br>`Smart Library` | Silent | All LEDs OFF | 1.8 seconds splash |
 | **Standby / Ready** | `Please Tap Your`<br>`Student ID Card` | Silent | All LEDs OFF | Continuous steady standby |
-| **Student Authenticated** | `Hi <Student Name>` (scrolling)<br>`Tap Book Tag...` | 1 short beep (100ms) | Green LED pulse | 2.5s |
+| **Student Authenticated** | `Hi <Student Name>` (scrolling)<br>`Tap Book Tag...` | 1 short beep (100ms) | Green LED pulse | Dynamic scroll + 2.5s |
+| **Card Suspended** | `Card Suspended`<br>`Contact Admin` | 2 warning beeps (150ms) | Red LED flashes | 2.5s pause before reset |
+| **REST Mode / Empty ROM** | `ROM Empty`<br>`System Rest Mode` | 2 warning beeps (150ms) | Red LED flashes | 3.0s pause before reset |
 | **Book Tag Identified** | Line 1: Book Title (adaptive scroll)<br>Line 2: Blank initially | 1 confirmation beep (150ms) | Green LED blinks (2 ON, 1 OFF) | Dynamic title length |
 | **Shelf/Rack Pre-Reveal** | Line 1: Continuing title scroll<br>Line 2: `Shelf:X  Rack:Y` | 1 single chime (100ms) | Green LED continues | Exactly 4 chars before end |
 | **Guidance Hold (Phase 1)** | Line 1: Book Title (first 16 chars)<br>Line 2: `Shelf:X  Rack:Y` | Silent | Green LED solid ON | 4.0 seconds |
 | **Placement Prompt (Phase 2)**| Line 1: `Shelf:X  Rack:Y`<br>Line 2: `Please place it in given shelf` | Silent | Green LED solid ON | 4.0 seconds (280ms scroll) |
 | **Session Ending Warning** | Line 1: `Shelf:X  Rack:Y`<br>Line 2: `Session Ending..` | 3 medium beeps (500ms ON / 500ms OFF) | Green LED flashes synchronously | 3.0 seconds |
-| **Out-of-Order Scan** | E.g. `Please Tap Your`<br>`Student ID First` | 2 warning pulses (180ms ON / 120ms OFF) | Red LED flashes synchronously | 1.5s pause |
+| **Out-of-Order Scan** | `Please Tap Your`<br>`Student ID First` | 2 warning pulses (180ms ON / 120ms OFF) | Red LED flashes synchronously | 1.5s pause |
 | **Emergency Alarm** | `Unrecognized ID`<br>`Access Denied!` / `Unknown Book Tag` | Rapid 10-pulse siren (100ms ON / 100ms OFF) | Red LED rapid strobe | 2.0s alarm + 1.0s read time |
-| **Session Inactivity Timeout** | `Session Expired `<br>`Please Try Again` | 2 short beeps (150ms ON / 150ms OFF) | Red LED flashes synchronously | Triggered after 20s; 1.0s pause before reset |
-| **Step 2 Retry (Renew)** | `Tap Your Book...` | Feedback matching scan result | Corresponding LED | Renews 20s session countdown (`+20s`) |
+| **Inactivity Timeout** | `Session Expired`<br>`Please Try Again` | 2 short beeps (150ms ON / 150ms OFF) | Red LED flashes synchronously | Triggered after 18s inactivity |
+| **Step 2 Retry (Renew)** | `Tap Your Book...` | Feedback matching scan result | Corresponding LED | Renews 18s countdown (`+18s`) |
+| **Data Updated Restart** | `Data Updated!`<br>`Restarting in X.` | Silent | All LEDs OFF | 3-second countdown $\rightarrow$ reboot |
 
 ---
 
-## Software Configuration & Database Management
+## Cloud & Database Configuration
 
-### Data Structures & Zero-Heap Architecture
+### Firestore Collections
 
-To guarantee long-term stability without RAM heap fragmentation, records are defined using lightweight C-string pointers and fixed types in [`src/main.cpp`](src/main.cpp):
+ShelfSense synchronizes with Google Cloud Firestore (`FIREBASE_PROJECT_ID: "shelf-sense-f86ba"`):
 
-```cpp
-// Structure modeling student credentials (zero heap allocation)
-struct Student {
-  const char* name;     // Student's full name (e.g. "Pavan")
-  const char* uid;      // RFID tag UID in uppercase HEX without spaces (e.g. "37E09604")
-};
+1. **`student_names` Collection (Roster Ingestion)**:
+   - **Document ID**: The RFID card UID (e.g. `37E09604`).
+   - **Fields**:
+     - `name` (string): Student full name (e.g., `"Pavan"`).
+     - `active` (boolean / string / integer): Student status (`true` for active, `false` for suspended).
+2. **`library_logs` Collection (Audit Trail)**:
+   - **Document ID**: Generated timestamp (`YYYY-MM-DD_HHMMSS`).
+   - **Fields**:
+     - `eventType` (string): `BOOK_PROCESSED`, `SESSION_TIMEOUT`, `SECURITY_ALERT`.
+     - `studentName` (string): Authenticated patron name.
+     - `studentUID` (string): Authenticated student RFID tag.
+     - `loginTime` (string): Authentication timestamp.
+     - `bookTitle` (string): Title of scanned book.
+     - `bookUID` (string): RFID UID of scanned book tag.
+     - `shelf` (integer): Assigned shelf number.
+     - `rack` (integer): Assigned rack number.
+     - `timestamp` (string): Transaction completion timestamp.
+     - `statusNote` (string): Informational note or security explanation.
 
-// Structure modeling book catalog entries with spatial coordinates
-struct Book {
-  const char* title;    // Book title (e.g. "Algorithms")
-  const char* uid;      // RFID tag UID in uppercase HEX without spaces (e.g. "F10F7E05")
-  uint8_t shelf;        // Assigned shelf number
-  uint8_t rack;         // Assigned rack number
-};
+### Offline-First NVS Flash Caching
+
+Student records are stored locally in the `"students"` Preferences namespace using the serialized format:
+```text
+Key: <UID>  ->  Value: "<Name>|<1 or 0>"
 ```
+An index key `__uids__` maintains a comma-separated list of all cached card IDs for rapid traversal.
 
-### Session Timeout Configuration
+### Registered Library Books Catalog
 
-The duration a patron can keep the book-scanning state active before an automated timeout is set via:
-
-```cpp
-#define SESSION_TIMEOUT_MS 20000 // Inactivity timeout in ms (default: 20 seconds)
-```
-
-### Adding Students and Books
-
-Modify the database arrays directly in [`src/main.cpp`](src/main.cpp):
+Configured statically in [`src/main.cpp`](src/main.cpp):
 
 ```cpp
-// List of authorized students
-const Student registeredStudents[] = {
-  { "Pavan", "37E09604" },
-  { "Rehan", "A97AF8B2" },
-  { "DVS", "0203448B258000" },
-  { "Pruthvi", "C94B8554" }
-  // Add new students: { "Name", "UID" },
-};
-
-// Database of registered books with shelf and rack assignments
+// Database of registered books: { "Book Title", "RFID UID", Shelf Number, Rack Number }
 const Book registeredBooks[] = {
   { "Geronimo Stilton - Journey to the Center of the Earth", "F10F7E05", 2, 1 }, // Shelf 2, Rack 1
-  { "Harry Potter", "8DC0FA6B", 4, 3 }                                           // Shelf 4, Rack 3
-  // Add new books: { "Title", "UID", shelf, rack },
+  { "Geronimo Stilton - The Great Adventure",                "8DC0FA6B", 4, 3 }  // Shelf 4, Rack 3
 };
 ```
 
-### Discovering New Card UIDs
-
-To register a new card or book tag:
-1. Open the PlatformIO Serial Monitor at **115200 baud**.
-2. Tap the physical RFID tag on the RC522 antenna.
-3. Observe the output:
-   ```text
-   ---------------------------------------------------
-   [RFID]    Card Detected! UID: 37E09604 | Size: 4 bytes | PICC Type: MIFARE 1KB
-   ```
-4. Copy the HEX string into `registeredStudents[]` or `registeredBooks[]` in [`src/main.cpp`](src/main.cpp) and re-flash the firmware.
-
 ---
 
-## Build, Flash & Monitor
+## Build, Flash & Memory Configuration
 
-ShelfSense is built with [PlatformIO](https://platformio.org/).
+ShelfSense is built with [PlatformIO](https://platformio.org/). Because the firmware incorporates FreeRTOS, BearSSL HTTPS, Firebase, SPI, and I2C, custom partition configurations and expanded task stacks are enforced:
 
-### Prerequisites
-
-- [VS Code](https://code.visualstudio.com/) with the [PlatformIO IDE extension](https://marketplace.visualstudio.com/items?itemName=platformio.platformio-ide), or the [PlatformIO Core (CLI)](https://docs.platformio.org/page/core.html).
-- ESP32 connected via USB.
-
-### PlatformIO Configuration (`platformio.ini`)
+### PlatformIO Configuration ([`platformio.ini`](platformio.ini))
 
 ```ini
 [env:esp32dev]
@@ -271,7 +292,14 @@ lib_deps =
     mobizt/Firebase Arduino Client Library for ESP8266 and ESP32@^4.4.17
 ```
 
-### CLI Commands
+### Stack Allocation
+
+In [`src/main.cpp`](src/main.cpp), the Arduino loop stack size is expanded to accommodate SSL handshakes:
+```cpp
+SET_LOOP_TASK_STACK_SIZE(16384); // 16KB stack on Core 1
+```
+
+### CLI Build & Upload Commands
 
 ```bash
 # Compile project
@@ -282,56 +310,61 @@ pio run --target upload
 
 # Open Serial Monitor at 115200 baud
 pio device monitor -b 115200
-
-# Perform clean build and upload
-pio run -t clean && pio run -t upload
 ```
 
 ---
 
 ## Serial Monitor Diagnostic Reference
 
-ShelfSense produces categorized, human-readable serial logs for observability and debugging:
+ShelfSense outputs categorized, human-readable serial logs for complete runtime observability:
 
 | Tag | Meaning | Example Output |
 | :--- | :--- | :--- |
-| `[BOOT]` | Startup diagnostics, heap memory, and peripheral discovery | `[BOOT] RC522 Firmware Version Register: 0x92` |
-| `[WIFI]` | Wi-Fi connection lifecycle, IP acquisition, RSSI, auto-reconnects | `[WIFI] IP Address obtained: 192.168.1.105 \| RSSI: -54 dBm` |
-| `[TIME]` | NTP time synchronization status and formatted timestamps | `[TIME] NTP synchronization started (pool.ntp.org, IST GMT+5:30)` |
-| `[RFID]` | Low-level tag detection, UID extraction, and PICC classification | `[RFID] Card Detected! UID: F10F7E05 \| Size: 4 bytes` |
-| `[AUTH]` | Student identification and credential checks | `[AUTH] Match found! Student: "Pavan" at index [0]` |
-| `[LOOKUP]` | Book catalog searches and coordinate retrieval | `[LOOKUP] Match found! Book: "..." -> Shelf 2, Rack 1` |
+| `[BOOT]` | Startup diagnostics, clock frequency, free heap RAM | `[BOOT] CPU Frequency: 240 MHz \| Free Heap RAM: 184512 bytes` |
+| `[WIFI]` | Wi-Fi link status, RSSI, and IP allocation | `[WIFI] Connected! IP: 192.168.43.102 \| RSSI: -48 dBm` |
+| `[TIME]` | NTP time synchronization status | `[TIME] NTP Clock synchronized successfully: 2026-11-09 20:15:30` |
+| `[FIREBASE]` | Background authentication, token status, queue events | `[FIREBASE] Client library initialized for: esp32@shelfsense.local` |
+| `[AUTH-SYNC]` | Periodic 20s diff checks and roster synchronization | `[AUTH-SYNC] Periodic 20s check: ROM cache and Firestore match perfectly.` |
+| `[AUTH-ROM]` | Local zero-delay card evaluation | `[AUTH-ROM] Instant Match: Found active student "Pavan" [UID: 37E09604]` |
+| `[OFFLINE-ROM]`| Offline log buffer operations and cloud flushes | `[OFFLINE-ROM] Event cached in ROM (Pending offline logs: 1)` |
+| `[ROM-CACHE]` | Summary of student cards stored in NVS flash | `[ROM-CACHE] Registered Student Cards in ROM (Total: 4)` |
+| `[RFID]` | Low-level card detection and UID extraction | `[RFID] Card Detected! UID: 37E09604 \| Size: 4 bytes` |
+| `[LOOKUP]` | Book catalog searches and physical coordinate retrieval | `[LOOKUP] Match found! Book: "..." -> Shelf 2, Rack 1` |
 | `[STATE]` | State machine transitions | `[STATE] Transition: WAITING_FOR_STUDENT -> WAITING_FOR_BOOK` |
-| `[FIREBASE]` | Asynchronous background Firestore sync payloads, HTTP codes, and results | `[FIREBASE] Document sync SUCCESS! HTTP Code: 200` |
-| `[FEEDBACK]` | Buzzer, Red LED, and Green LED hardware invocations | `[FEEDBACK] SUCCESS -> Green LED + Buzzer (1 beep @ 150 ms)` |
-| `[LCD]` | Display screen updates and scroll frame activity | `[LCD] Line 2 revealed (4 chars before end): "Shelf:2 Rack:1"` |
-| `[TIMER]` | Second-by-second countdown logs for guidance holds | `[TIMER] Hold elapsed: 4s / 8s [View: Title + Shelf & Rack]` |
-| `[INFO]` | General info & session inactivity timer renewals | `[INFO] Session timer renewed (+20s). Ready for book tag retry...` |
-| `[WARN]` | Warnings (e.g. wrong scan order, session timeout) | `[WARN] Session timed out: No book scan received within 20 seconds.` |
-| `[ERROR]` | Serious faults (unrecognized tag emergency, hardware failure) | `[ERROR] EMERGENCY ALARM TRIGGERED: Unrecognized tag UID: A1B2C3D4` |
+| `[FEEDBACK]` | Buzzer, Red LED, and Green LED hardware invocations | `[FEEDBACK] SUCCESS -> Green LED + Buzzer (1 pulse @ 100 ms)` |
+| `[LCD]` | Display screen updates and scroll frame activity | `[LCD] Line 2 revealed (4 chars before end): "Shelf:2  Rack:1"` |
+| `[TIMER]` | Guidance hold countdowns and inactivity timers | `[TIMER] Waiting for book scan: Second 5 of 18s` |
+| `[WARN]` | Warnings (wrong scan order, suspended card, timeout) | `[WARN] Session timed out: No book scan received within 18 seconds.` |
+| `[ERROR]` | Critical faults (unrecognized tag emergency, SPI fault) | `[ERROR] EMERGENCY ALARM TRIGGERED: Unrecognized card scanned` |
 
 ---
 
 ## Troubleshooting
 
-### 1. RC522 RFID Reader Communication Failure (`0x00` or `0xFF`)
-- **Symptoms**: Serial Monitor outputs `RC522 RFID READER COMMUNICATION FAILED!` and version is `0x00` or `0xFF`.
+### 1. RC522 Reader Communication Failure (`0x00` or `0xFF`)
+- **Symptoms**: Serial outputs `RC522 RFID READER COMMUNICATION FAILED!` and version is `0x00` or `0xFF`.
 - **Resolution**:
-  - Verify VCC is on **3.3V** (never 5V).
-  - Inspect SPI connections: `SCK` $\rightarrow$ GPIO 18, `MISO` $\rightarrow$ GPIO 19, `MOSI` $\rightarrow$ GPIO 23, `SS/SDA` $\rightarrow$ GPIO 5, `RST` $\rightarrow$ GPIO 4.
-  - Verify soldered header pins for dry solder joints or bridging between adjacent pins.
+  - Verify VCC is connected to **3.3V** (never 5V).
+  - Inspect SPI connections: `SCK` $\rightarrow$ GPIO 18, `MISO` $\rightarrow$ GPIO 19, `MOSI` $\rightarrow$ GPIO 23, `SS` $\rightarrow$ GPIO 5, `RST` $\rightarrow$ GPIO 4.
+  - Verify header soldering for bridges or dry joints.
 
-### 2. LCD Shows Blank Screen or Black Boxes
-- **Symptoms**: Backlight turns on, but no characters appear or solid rectangles show.
+### 2. LCD Displays Blank Screen or Solid Boxes
+- **Symptoms**: Backlight turns on, but no characters appear.
 - **Resolution**:
-  - Rotate the blue contrast potentiometer on the back of the I2C backpack with a small screwdriver.
-  - Check whether the backpack is receiving a full **5V** supply (ESP32 `VIN` pin when powered via USB).
-  - Check Serial Monitor `[BOOT]` output: if the device was found at an address other than `0x27`, ShelfSense will automatically attempt discovery.
+  - Rotate the blue contrast trimmer on the back of the I2C backpack.
+  - Check whether the backpack is receiving **5V** (`VIN` when powered via USB).
+  - Check Serial Monitor `[BOOT]` output: ShelfSense automatically scans `0x01`–`0x7F` if `0x27` does not respond.
 
-### 3. False Triggering or RFID Bounce
-- **Symptoms**: Multiple rapid detections of the same tag.
+### 3. Firebase Authentication or SSL Fails
+- **Symptoms**: `Token error` or `SSL connection failed`.
 - **Resolution**:
-  - ShelfSense invokes `mfrc522.PICC_HaltA()` after reading and filters out unreadable RF noise frames. Ensure the tag is swept smoothly across the antenna rather than held continuously on it.
+  - Check network Wi-Fi credentials in [`src/main.cpp`](src/main.cpp).
+  - BearSSL requires a valid system clock to verify Google certificates; verify NTP status in the serial log (`[TIME] NTP Clock synchronized`).
+
+### 4. Card Scan Reads "Card Suspended Contact Admin"
+- **Symptoms**: Card is recognized, but access is denied.
+- **Resolution**:
+  - The student's document in the Firestore `student_names` collection has `active: false`. Set `active: true` in Firestore; ShelfSense will update within 20 seconds.
 
 ---
 
@@ -340,11 +373,11 @@ ShelfSense produces categorized, human-readable serial logs for observability an
 ```text
 ShelfSense/
 ├── include/                 # Project headers
-├── lib/                     # Custom private libraries (if any)
+├── lib/                     # Custom local libraries
 ├── src/
-│   └── main.cpp             # Complete FSM logic, diagnostics, display animation & RFID handling
+│   └── main.cpp             # FreeRTOS dual-core engine, Firestore worker, NVS ROM, FSM & RFID routines
 ├── test/                    # Unit testing suites
-├── platformio.ini           # PlatformIO environment, target board & dependencies
+├── platformio.ini           # PlatformIO configuration (huge_app.csv, Firebase & hardware drivers)
 └── README.md                # System documentation
 ```
 
@@ -352,4 +385,4 @@ ShelfSense/
 
 ## License
 
-This project is licensed under the [MIT License](LICENSE). Feel free to adapt and expand it for your library automation needs.
+This project is licensed under the [MIT License](LICENSE). Feel free to adapt and expand it for your smart library deployment.
