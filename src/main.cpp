@@ -84,6 +84,7 @@
 
 #include <Arduino.h>
 #include <WiFi.h>
+#include <WiFiManager.h>
 #include <time.h>
 #include <SPI.h>
 #include <MFRC522.h>
@@ -152,8 +153,9 @@ inline esp_err_t esp_task_wdt_init(uint32_t timeout_sec, bool panic) {
 #define SERIAL_BAUD         115200
 
 // Wi-Fi Configuration
-#define WIFI_SSID           "narzo 50A"   // Replace with your local Wi-Fi SSID
-#define WIFI_PASSWORD       "MSPP9347"              // Replace with your Wi-Fi password
+#define WIFI_SSID           "narzo 50A"   // Default / fallback Wi-Fi SSID
+#define WIFI_PASSWORD       "MSPP9347"    // Default / fallback Wi-Fi password
+#define PORTAL_AP_NAME      "ShelfSense-Setup" // Captive Portal Hotspot SSID (Open AP)
 
 // Firebase & Google Cloud Firestore Configuration
 #define FIREBASE_PROJECT_ID           "shelf-sense-f86ba"
@@ -192,6 +194,16 @@ FirebaseConfig config;
 Preferences studentPrefs;
 Preferences bookPrefs;
 Preferences offlineLogsPrefs;
+Preferences wifiPrefs; // Persistent NVS namespace "wifi_cred" for custom provisioned Wi-Fi
+
+// WiFiManager instance for Wi-Fi provisioning via Captive Portal
+WiFiManager wm;
+
+// Captive Portal runtime state variables
+volatile bool captivePortalRunning = false;
+bool wifiConnectionFailedReported = false;
+unsigned long wifiDisconnectedStartTime = 0;
+const unsigned long WIFI_DISCONNECT_GRACE_PERIOD_MS = 10000; // 10-second grace period before starting captive portal
 
 // FreeRTOS Queue & Task handles for background Firestore sync
 QueueHandle_t firestoreQueue = NULL;
@@ -511,6 +523,12 @@ void queueCommandLog(const String& cmd,
                      uint32_t freeHeapBefore,
                      uint32_t freeHeapAfter);
 void checkSerialCommands();
+void showWiFiConnectionErrorLCD();
+void startProvisioningPortal();
+void stopProvisioningPortal();
+void initWiFiConnection();
+void handleWiFiProvisioning();
+void resetSystem();
 
 // Maximum number of offline log events buffered in persistent ROM (NVS)
 const uint16_t MAX_OFFLINE_LOGS = 20;
@@ -647,16 +665,9 @@ void flushOfflineLogsFromROM() {
 void firestoreSyncTask(void* pvParameters) {
   Serial.println(F("[FIREBASE] Background Firestore sync worker task started on Core 0"));
 
-  // 1. Proactive Wi-Fi connection loop
-  unsigned long startWifiWait = millis();
+  // 1. Proactive Wi-Fi connection loop (waits for Core 1 Wi-Fi provisioning controller)
   while (WiFi.status() != WL_CONNECTED || WiFi.localIP() == IPAddress(0, 0, 0, 0)) {
-    vTaskDelay(pdMS_TO_TICKS(200));
-    if (millis() - startWifiWait > 6000) {
-      Serial.println(F("[WIFI]     Still connecting to Wi-Fi... Re-issuing connect command"));
-      WiFi.disconnect();
-      WiFi.reconnect();
-      startWifiWait = millis();
-    }
+    vTaskDelay(pdMS_TO_TICKS(500));
   }
 
   Serial.print(F("[WIFI]     Connected! IP: "));
@@ -729,11 +740,15 @@ void firestoreSyncTask(void* pvParameters) {
   for (;;) {
     // A. Proactive Wi-Fi connection supervisor
     if (WiFi.status() != WL_CONNECTED) {
+      if (captivePortalRunning) {
+        // Yield while Captive Portal is active; do not disrupt AP
+        vTaskDelay(pdMS_TO_TICKS(500));
+        continue;
+      }
       static unsigned long lastWifiReconnect = 0;
-      if (millis() - lastWifiReconnect > 4000) {
+      if (millis() - lastWifiReconnect > 5000) {
         lastWifiReconnect = millis();
-        Serial.println(F("[WIFI]     Link disconnected! Auto-reconnecting..."));
-        WiFi.disconnect();
+        Serial.println(F("[WIFI]     Link disconnected! Auto-reconnecting in background..."));
         WiFi.reconnect();
       }
       vTaskDelay(pdMS_TO_TICKS(200));
@@ -1070,8 +1085,9 @@ void onWiFiEvent(WiFiEvent_t event) {
       Serial.println(F("[WIFI]     Station mode started"));
       break;
     case ARDUINO_EVENT_WIFI_STA_CONNECTED:
-      Serial.print(F("[WIFI]     Connected to AP: "));
-      Serial.println(WIFI_SSID);
+      Serial.print(F("[WIFI]     Connected to AP: \""));
+      Serial.print(WiFi.SSID());
+      Serial.println(F("\""));
       break;
     case ARDUINO_EVENT_WIFI_STA_GOT_IP:
       Serial.print(F("[WIFI]     IP Address obtained: "));
@@ -1082,6 +1098,15 @@ void onWiFiEvent(WiFiEvent_t event) {
       break;
     case ARDUINO_EVENT_WIFI_STA_DISCONNECTED:
       Serial.println(F("[WIFI]     Disconnected from Wi-Fi! Auto-reconnecting in background..."));
+      break;
+    case ARDUINO_EVENT_WIFI_AP_START:
+      Serial.println(F("[PORTAL]   Captive Portal SoftAP started: 'ShelfSense-Setup'"));
+      break;
+    case ARDUINO_EVENT_WIFI_AP_STACONNECTED:
+      Serial.println(F("[PORTAL]   Phone / Client device connected to 'ShelfSense-Setup' hotspot!"));
+      break;
+    case ARDUINO_EVENT_WIFI_AP_STADISCONNECTED:
+      Serial.println(F("[PORTAL]   Phone / Client device disconnected from 'ShelfSense-Setup' hotspot."));
       break;
     default:
       break;
@@ -1359,6 +1384,208 @@ void displayBookLocationSequence(const char* title, uint8_t shelf, uint8_t rack)
   holdLocationWait(locationLine);
 }
 
+// Displays strict single-line Wi-Fi error on LCD as required (suppressing all portal/IP/SSID info)
+void showWiFiConnectionErrorLCD() {
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print("wifi connection ");
+  lcd.setCursor(0, 1);
+  lcd.print("     error      ");
+  Serial.println(F("[LCD]      Displaying: \"wifi connection error\""));
+}
+
+// Starts the Wi-Fi Provisioning Captive Portal on-demand or upon connection failure
+void startProvisioningPortal() {
+  if (captivePortalRunning) return;
+
+  Serial.println();
+  Serial.println(F("================================================================================"));
+  Serial.println(F("[PORTAL]   >>> STARTING WI-FI PROVISIONING CAPTIVE PORTAL <<<"));
+  Serial.print(F("[PORTAL]   Hotspot AP SSID : \""));
+  Serial.print(PORTAL_AP_NAME);
+  Serial.println(F("\" (Open - No Password)"));
+  Serial.println(F("[PORTAL]   Server URL      : http://192.168.4.1"));
+  Serial.println(F("[PORTAL]   Capabilities    : 2.4GHz Wi-Fi scan, credential entry, ROM NVS storage"));
+  Serial.println(F("[PORTAL]   LCD Notice      : Strictly suppressed (displaying 'wifi connection error')"));
+  Serial.println(F("================================================================================"));
+
+  showWiFiConnectionErrorLCD();
+  wifiConnectionFailedReported = true;
+
+  wm.setConfigPortalBlocking(false); // Non-blocking!
+  wm.setConfigPortalTimeout(0);      // Keep open until configured or Wi-Fi reconnects
+  wm.setConnectTimeout(15);          // 15 seconds connection timeout
+  wm.setTitle("ShelfSense Wi-Fi Setup");
+  wm.setScanDispPerc(true);          // Display signal strength as percentage
+
+  wm.setAPCallback([](WiFiManager* myWiFiManager) {
+    Serial.println(F("[PORTAL]   SoftAP Mode Active!"));
+    Serial.print(F("[PORTAL]   Hotspot IP Address: "));
+    Serial.println(WiFi.softAPIP());
+    Serial.print(F("[PORTAL]   SoftAP MAC: "));
+    Serial.println(WiFi.softAPmacAddress());
+    Serial.println(F("[PORTAL]   Webpage hosted for 2.4GHz Wi-Fi scanning & credential configuration."));
+  });
+
+  wm.setSaveConfigCallback([]() {
+    Serial.println();
+    Serial.println(F("---------------------------------------------------"));
+    Serial.println(F("[PORTAL]   New Wi-Fi credentials submitted via web page!"));
+    String newSSID = wm.getWiFiSSID();
+    String newPass = wm.getWiFiPass();
+    Serial.print(F("[PORTAL]   Submitted SSID: \""));
+    Serial.print(newSSID);
+    Serial.println(F("\""));
+
+    // Save permanently to persistent ROM (NVS)
+    wifiPrefs.putString("ssid", newSSID);
+    wifiPrefs.putString("pass", newPass);
+    Serial.println(F("[NVS]      Saved new Wi-Fi credentials to persistent ROM (namespace 'wifi_cred')"));
+    Serial.println(F("[WIFI]     ESP32 attempting connection to new network..."));
+    Serial.println(F("---------------------------------------------------"));
+  });
+
+  wm.startConfigPortal(PORTAL_AP_NAME);
+  captivePortalRunning = true;
+}
+
+// Stops the Wi-Fi Provisioning Captive Portal
+void stopProvisioningPortal() {
+  if (!captivePortalRunning) return;
+  Serial.println(F("[PORTAL]   Shutting down captive portal..."));
+  wm.stopConfigPortal();
+  captivePortalRunning = false;
+  wifiDisconnectedStartTime = 0;
+  wifiConnectionFailedReported = false;
+  Serial.println(F("[PORTAL]   Captive portal closed."));
+}
+
+// Proactive Wi-Fi connection with fallback to hardcoded WIFI_SSID & Captive Portal
+void initWiFiConnection() {
+  WiFi.persistent(true);
+  WiFi.mode(WIFI_STA);
+  WiFi.setSleep(false);
+  WiFi.setAutoReconnect(true);
+
+  String provSSID = wifiPrefs.getString("ssid", "");
+  String provPass = wifiPrefs.getString("pass", "");
+
+  bool connected = false;
+
+  // 1. Try saved / provisioned Wi-Fi credentials from ROM NVS first
+  if (provSSID.length() > 0) {
+    Serial.println(F("---------------------------------------------------"));
+    Serial.print(F("[WIFI]     Found provisioned credentials in ROM NVS: \""));
+    Serial.print(provSSID);
+    Serial.println(F("\""));
+    Serial.print(F("[WIFI]     Attempting connection to \""));
+    Serial.print(provSSID);
+    Serial.println(F("\"..."));
+
+    WiFi.begin(provSSID.c_str(), provPass.c_str());
+    unsigned long startWait = millis();
+    while (WiFi.status() != WL_CONNECTED && (millis() - startWait < 8000)) {
+      delay(250);
+      Serial.print(F("."));
+    }
+    Serial.println();
+
+    if (WiFi.status() == WL_CONNECTED) {
+      connected = true;
+      Serial.print(F("[WIFI]     SUCCESS! Connected to provisioned network: \""));
+      Serial.print(provSSID);
+      Serial.println(F("\""));
+    } else {
+      Serial.print(F("[WIFI]     FAILED to connect to provisioned network: \""));
+      Serial.print(provSSID);
+      Serial.println(F("\""));
+    }
+  }
+
+  // 2. If provisioned Wi-Fi failed or not set, try default hardcoded network (#define WIFI_SSID)
+  if (!connected) {
+    Serial.println(F("---------------------------------------------------"));
+    Serial.print(F("[WIFI]     Attempting connection to default defined network: \""));
+    Serial.print(WIFI_SSID);
+    Serial.println(F("\"..."));
+
+    WiFi.disconnect();
+    delay(200);
+    WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+    unsigned long startWait = millis();
+    while (WiFi.status() != WL_CONNECTED && (millis() - startWait < 8000)) {
+      delay(250);
+      Serial.print(F("."));
+    }
+    Serial.println();
+
+    if (WiFi.status() == WL_CONNECTED) {
+      connected = true;
+      Serial.print(F("[WIFI]     SUCCESS! Connected to default network: \""));
+      Serial.print(WIFI_SSID);
+      Serial.println(F("\""));
+    } else {
+      Serial.print(F("[WIFI]     FAILED to connect to default network: \""));
+      Serial.print(WIFI_SSID);
+      Serial.println(F("\""));
+    }
+  }
+
+  // 3. Fallback: If neither connected, start Captive Portal and display error on LCD!
+  if (!connected) {
+    Serial.println(F("---------------------------------------------------"));
+    Serial.println(F("[WIFI]     CRITICAL: No known Wi-Fi network could be connected!"));
+    Serial.println(F("[LCD]      Displaying: \"wifi connection error\""));
+    startProvisioningPortal();
+  } else {
+    Serial.print(F("[WIFI]     IP Address: "));
+    Serial.print(WiFi.localIP());
+    Serial.print(F(" | RSSI: "));
+    Serial.print(WiFi.RSSI());
+    Serial.println(F(" dBm"));
+  }
+}
+
+// Runtime Wi-Fi supervisor & non-blocking Captive Portal handler
+void handleWiFiProvisioning() {
+  if (captivePortalRunning) {
+    wm.process();
+
+    if (WiFi.status() == WL_CONNECTED) {
+      Serial.println();
+      Serial.println(F("==================================================="));
+      Serial.println(F("[WIFI]     Connection established successfully via Captive Portal!"));
+      Serial.print(F("[WIFI]     SSID: "));
+      Serial.println(WiFi.SSID());
+      Serial.print(F("[WIFI]     IP Address: "));
+      Serial.print(WiFi.localIP());
+      Serial.print(F(" | RSSI: "));
+      Serial.print(WiFi.RSSI());
+      Serial.println(F(" dBm"));
+      Serial.println(F("==================================================="));
+
+      stopProvisioningPortal();
+      resetSystem();
+    }
+  } else {
+    // Portal is not active. Monitor Wi-Fi connection health.
+    if (WiFi.status() != WL_CONNECTED) {
+      if (wifiDisconnectedStartTime == 0) {
+        wifiDisconnectedStartTime = millis();
+        Serial.println(F("[WIFI]     Wi-Fi disconnected! Starting 10s reconnection grace period..."));
+      } else if (millis() - wifiDisconnectedStartTime >= WIFI_DISCONNECT_GRACE_PERIOD_MS) {
+        Serial.println(F("[WIFI]     Wi-Fi offline > 10 seconds! Network appears unavailable."));
+        startProvisioningPortal();
+      }
+    } else {
+      if (wifiDisconnectedStartTime != 0) {
+        wifiDisconnectedStartTime = 0;
+        Serial.println(F("[WIFI]     Wi-Fi connection restored during grace period!"));
+      }
+    }
+  }
+}
+
 // Resets system back to the default student check-in state (turns off all LEDs)
 void resetSystem() {
   SystemState previousState = currentState;
@@ -1381,10 +1608,15 @@ void resetSystem() {
     logInfo(F("System reset to ready state (waiting for student ID)"));
   }
 
-  // Show "ShelfSense Ready" for 1.8 seconds, then transition to steady "Please Tap Your Student ID Card"
-  showMessage("ShelfSense Ready", " Smart Library  ");
-  delay(1800);
-  showMessage("Please Tap Your ", "Student ID Card ");
+  // If Wi-Fi is currently in error/portal state, show required single error line on LCD
+  if (WiFi.status() != WL_CONNECTED && (captivePortalRunning || wifiConnectionFailedReported)) {
+    showWiFiConnectionErrorLCD();
+  } else {
+    // Show "ShelfSense Ready" for 1.8 seconds, then transition to steady "Please Tap Your Student ID Card"
+    showMessage("ShelfSense Ready", " Smart Library  ");
+    delay(1800);
+    showMessage("Please Tap Your ", "Student ID Card ");
+  }
 }
 
 // SUCCESS FEEDBACK: Short buzzer chirp + Green LED flash SIMULTANEOUSLY
@@ -2343,13 +2575,21 @@ void dumpTaskManagerAll() {
   Serial.print(secs); Serial.println(F("s"));
   Serial.print(F("    • Network Status    : Wi-Fi "));
   if (WiFi.status() == WL_CONNECTED) {
-    Serial.print(F("CONNECTED (IP: "));
+    Serial.print(F("CONNECTED (SSID: \""));
+    Serial.print(WiFi.SSID());
+    Serial.print(F("\", IP: "));
     Serial.print(WiFi.localIP());
     Serial.print(F(", RSSI: "));
     Serial.print(WiFi.RSSI());
     Serial.println(F(" dBm)"));
   } else {
-    Serial.println(F("DISCONNECTED"));
+    Serial.print(F("DISCONNECTED"));
+    if (captivePortalRunning) {
+      Serial.print(F(" [Captive Portal ACTIVE: \""));
+      Serial.print(PORTAL_AP_NAME);
+      Serial.print(F("\" @ http://192.168.4.1]"));
+    }
+    Serial.println();
   }
 
   // --- SECTION 2: DUAL-CORE 0 & CORE 1 WORKLOAD RESPONSIBILITIES ---
@@ -2568,6 +2808,19 @@ void dumpTaskManagerAll() {
         Serial.print(F(" | Time: ")); Serial.println(offEvent.timestamp);
       }
     }
+  }
+
+  // 4. Provisioned Wi-Fi Credentials in ROM
+  String provSSID = wifiPrefs.getString("ssid", "");
+  Serial.print(F("    ► Persistent 'wifi_cred' Namespace: Provisioned SSID: "));
+  if (provSSID.length() > 0) {
+    Serial.print(F("\""));
+    Serial.print(provSSID);
+    Serial.println(F("\" (ROM NVS)"));
+  } else {
+    Serial.print(F("None stored (using fallback \""));
+    Serial.print(WIFI_SSID);
+    Serial.println(F("\")"));
   }
 
   Serial.println(F("================================================================================"));
@@ -3601,7 +3854,8 @@ void setup() {
   studentPrefs.begin("students", false);
   bookPrefs.begin("books", false);
   offlineLogsPrefs.begin("off_logs", false);
-  Serial.println(F("[NVS]      Preferences namespaces \"students\", \"books\" & \"off_logs\" initialized"));
+  wifiPrefs.begin("wifi_cred", false);
+  Serial.println(F("[NVS]      Preferences namespaces \"students\", \"books\", \"off_logs\" & \"wifi_cred\" initialized"));
 
   // Check and display what is currently stored in persistent ROM at boot
   printROMCacheSummary();
@@ -3621,14 +3875,8 @@ void setup() {
   // Register Wi-Fi Event Handler for diagnostic monitoring
   WiFi.onEvent(onWiFiEvent);
 
-  // Enable automatic reconnection and start connecting to Wi-Fi immediately at boot
-  Serial.print(F("[WIFI]     Connecting to network: "));
-  Serial.println(WIFI_SSID);
-  WiFi.persistent(false);
-  WiFi.mode(WIFI_STA);
-  WiFi.setSleep(false);
-  WiFi.setAutoReconnect(true);
-  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  // Connect to provisioned Wi-Fi from NVS, or fallback to default WIFI_SSID, or launch Captive Portal
+  initWiFiConnection();
 
   // Start NTP synchronization safely at boot
   configTime(GMT_OFFSET_SEC, DAYLIGHT_OFFSET_SEC, NTP_SERVER_1, NTP_SERVER_2);
@@ -3674,6 +3922,10 @@ void setup() {
   Serial.println(F("           - 'uptb'    : Force immediate Firestore sync of 'book_names'"));
   Serial.println(F("           - 'clrb'    : Clear book catalog from persistent ROM"));
   Serial.println(F("           - 'clruptb' : Clear book ROM and fresh sync from Firestore"));
+  Serial.println(F("           Wi-Fi & Provisioning:"));
+  Serial.println(F("           - 'wifi'    : Inspect Wi-Fi metrics, signal RSSI, IP & Captive Portal"));
+  Serial.println(F("           - 'portal'  : Start Captive Portal ('ShelfSense-Setup') manually"));
+  Serial.println(F("           - 'clrwifi' : Clear saved Wi-Fi from ROM and launch Captive Portal"));
   Serial.println(F("           Audit Log: All command executions are automatically logged to Firestore 'commands-log'."));
 }
 
@@ -3779,6 +4031,49 @@ void checkSerialCommands() {
           serialOutput = "[CLRUPTB] Executing background book erase and fresh Firestore sync. Dispatching download on Core 0.";
           execStatus = "TRIGGERED";
 
+        // 5. Wi-Fi & Captive Portal Provisioning Commands
+        } else if (cmd == "wifi") {
+          Serial.println(F("---------------------------------------------------"));
+          Serial.println(F("[WIFI-INFO] Current Wi-Fi Diagnostics:"));
+          Serial.print(F("            Status          : "));
+          Serial.println(WiFi.status() == WL_CONNECTED ? F("CONNECTED") : F("DISCONNECTED"));
+          if (WiFi.status() == WL_CONNECTED) {
+            Serial.print(F("            Active SSID     : \""));
+            Serial.print(WiFi.SSID());
+            Serial.println(F("\""));
+            Serial.print(F("            IP Address      : "));
+            Serial.println(WiFi.localIP());
+            Serial.print(F("            Signal (RSSI)   : "));
+            Serial.print(WiFi.RSSI());
+            Serial.println(F(" dBm"));
+          }
+          String pSSID = wifiPrefs.getString("ssid", "");
+          Serial.print(F("            Provisioned SSID: "));
+          Serial.println(pSSID.length() > 0 ? ("\"" + pSSID + "\"") : "(none stored in NVS)");
+          Serial.print(F("            Fallback SSID   : \""));
+          Serial.print(WIFI_SSID);
+          Serial.println(F("\""));
+          Serial.print(F("            Captive Portal  : "));
+          Serial.println(captivePortalRunning ? F("ACTIVE (\"ShelfSense-Setup\" @ 192.168.4.1)") : F("INACTIVE"));
+          Serial.println(F("---------------------------------------------------"));
+          actionSummary = "Inspected live Wi-Fi connection metrics, NVS stored credentials, and Captive Portal state.";
+          serialOutput = "[WIFI-INFO] Wi-Fi Status: " + String(WiFi.status() == WL_CONNECTED ? "CONNECTED" : "DISCONNECTED") + ", SSID: '" + WiFi.SSID() + "', Provisioned: '" + pSSID + "', Portal: " + (captivePortalRunning ? "ACTIVE" : "INACTIVE");
+        } else if (cmd == "portal") {
+          Serial.println(F("[SERIAL]   Manual trigger: Starting Captive Portal 'ShelfSense-Setup'..."));
+          startProvisioningPortal();
+          actionSummary = "Manually triggered Wi-Fi Provisioning Captive Portal ('ShelfSense-Setup').";
+          serialOutput = "[PORTAL] Captive Portal started manually on 'ShelfSense-Setup' @ http://192.168.4.1.";
+        } else if (cmd == "clrwifi") {
+          Serial.println(F("[SERIAL]   Manual trigger: Clearing provisioned Wi-Fi credentials from ROM..."));
+          wifiPrefs.remove("ssid");
+          wifiPrefs.remove("pass");
+          wm.resetSettings();
+          Serial.println(F("[SERIAL]   Provisioned Wi-Fi erased from ROM. Launching Captive Portal 'ShelfSense-Setup'..."));
+          WiFi.disconnect(true);
+          startProvisioningPortal();
+          actionSummary = "Erased provisioned Wi-Fi credentials from NVS ROM and triggered Captive Portal 'ShelfSense-Setup'.";
+          serialOutput = "[PORTAL] Erased provisioned Wi-Fi from ROM; started Captive Portal 'ShelfSense-Setup'.";
+
         } else {
           Serial.print(F("[SERIAL] Unknown command: '"));
           Serial.print(serialBuffer);
@@ -3787,8 +4082,9 @@ void checkSerialCommands() {
           Serial.println(F("         Combined: 'rom', 'upt', 'clr', 'clrupt'"));
           Serial.println(F("         Students: 'roms', 'upts', 'clrs', 'clrupts'"));
           Serial.println(F("         Books:    'romb', 'uptb', 'clrb', 'clruptb'"));
+          Serial.println(F("         Wi-Fi:    'wifi', 'portal', 'clrwifi'"));
           actionSummary = "Unrecognized command received in Serial CLI.";
-          serialOutput = "[SERIAL] Unknown command: '" + serialBuffer + "'. Supported commands: 'all', 'rom', 'roms', 'romb', 'upt', 'upts', 'uptb', 'clr', 'clrs', 'clrb', 'clrupt', 'clrupts', 'clruptb'.";
+          serialOutput = "[SERIAL] Unknown command: '" + serialBuffer + "'. Supported commands: 'all', 'rom', 'roms', 'romb', 'upt', 'upts', 'uptb', 'clr', 'clrs', 'clrb', 'clrupt', 'clrupts', 'clruptb', 'wifi', 'portal', 'clrwifi'.";
           execStatus = "UNKNOWN_COMMAND";
         }
 
@@ -3810,6 +4106,9 @@ void checkSerialCommands() {
 }
 
 void loop() {
+  // Runtime Wi-Fi supervisor & non-blocking Captive Portal handler
+  handleWiFiProvisioning();
+
   // Check for interactive Serial Monitor commands (e.g. typing "all", "rom", "upt", "clr", "clrupt")
   checkSerialCommands();
 
