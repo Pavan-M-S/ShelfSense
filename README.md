@@ -144,14 +144,31 @@ stateDiagram-v2
 
 ## Interactive Serial Commands (115200 Baud)
 
-ShelfSense provides a non-blocking interactive command-line interface directly over the USB Serial link:
+ShelfSense provides a non-blocking interactive command-line interface directly over the USB Serial link (115200 baud). Commands are categorized into **Combined (Global)**, **Student-Specific (`*s`)**, and **Book-Specific (`*b`)** operations:
 
+### 1. Combined (Global) Commands
 | Command | Action & Behavior |
 | :--- | :--- |
-| `rom` | **Inspect Persistent ROM**: Dumps all cached student records (`UID`, `Name`, `Status`), registered book catalog (`UID`, `Title`, `Shelf`, `Rack`, `Status`), buffered offline logs, heap RAM, and Wi-Fi link status. |
-| `upt` | **Force Cloud Update**: Triggers an immediate, on-demand synchronization of the Firestore `student_names` and `book_names` collections to ROM and flushes offline logs. If differences are detected, schedules an auto-restart. |
-| `clr` | **Clear ROM & Enter REST Mode**: Erases all cached students, books, and offline logs from NVS flash and sets the system to REST mode. Runs silently in the background without LCD disruption. If a card or book is scanned while in REST mode, the LCD alerts `"ROM Empty / System Rest Mode"`. |
-| `clrupt`| **Clear ROM & Fresh Sync**: Clears local ROM and memory, then immediately downloads and caches a fresh student roster and book catalog from Firestore without hardware reboot. |
+| `rom` | **Inspect Full ROM**: Dumps all cached student records, registered book catalog, buffered offline logs, heap RAM, and Wi-Fi link status. |
+| `upt` | **Force Cloud Update (Both)**: Triggers an immediate, on-demand synchronization of both Firestore collections (`student_names` and `book_names`) to ROM and flushes offline logs. If differences are detected, schedules an auto-restart. |
+| `clr` | **Clear All ROM & Enter REST Mode**: Erases all cached students, books, and offline logs from NVS flash and sets the system to REST mode. Runs silently in the background without LCD disruption. If a card or book is scanned while in REST mode, the LCD alerts `"ROM Empty / System Rest Mode"`. |
+| `clrupt`| **Clear ROM & Fresh Sync Both**: Clears local ROM and memory, then immediately downloads and caches a fresh student roster and book catalog from Firestore without hardware reboot. |
+
+### 2. Student-Specific Commands (`*s`)
+| Command | Action & Behavior |
+| :--- | :--- |
+| `roms` | **Inspect Student ROM**: Dumps only the cached student roster (`[ROM-STUDENTS]`) with `UID`, `Name`, and active/suspended status. |
+| `upts` | **Force Student Sync**: Triggers an immediate on-demand synchronization of the Firestore `student_names` collection to ROM. |
+| `clrs` | **Clear Student ROM**: Erases the student roster cache (`"students"` namespace) from persistent ROM. Book catalog and offline logs remain intact. |
+| `clrupts`| **Fresh Sync Students**: Clears the student cache and immediately downloads a fresh roster from `student_names` in Firestore without reboot. |
+
+### 3. Book-Specific Commands (`*b`)
+| Command | Action & Behavior |
+| :--- | :--- |
+| `romb` | **Inspect Book ROM**: Dumps only the cached book catalog (`[ROM-BOOKS]`) with `UID`, `Title`, `Shelf`, `Rack`, and status. |
+| `uptb` | **Force Book Sync**: Triggers an immediate on-demand synchronization of the Firestore `book_names` collection to ROM. |
+| `clrb` | **Clear Book ROM**: Erases the book catalog cache (`"books"` namespace) from persistent ROM. Student roster and offline logs remain intact. |
+| `clruptb`| **Fresh Sync Books**: Clears the book cache and immediately downloads a fresh book catalog from `book_names` in Firestore without reboot. |
 
 ---
 

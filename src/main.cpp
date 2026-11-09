@@ -39,19 +39,26 @@
  * 
  * 4. INTERACTIVE SERIAL MONITOR COMMANDS (115200 Baud)
  * -----------------------------------------------------------------------------------------
- *   Command | Action & Behavior
- *  ---------+------------------------------------------------------------------------------
- *   rom     | Inspect Persistent ROM: Dumps all cached student records, registered book
- *           | catalog, active/suspended status, buffered offline logs, free heap RAM,
- *           | and Wi-Fi link status.
- *   upt     | Update & Sync Firestore: Triggers an immediate, on-demand synchronization
- *           | of Firestore 'student_names' and 'book_names' collections to ROM and flushes
- *           | offline logs. If differences are detected, triggers auto-restart countdown.
- *   clr     | Clear All ROM & Rest Mode: Erases all cached students, books, and offline
- *           | logs from persistent ROM and sets system to REST mode. If cards or books
- *           | are scanned before syncing, LCD alerts 'ROM Empty / System Rest Mode'.
- *   clrupt  | Clear ROM & Fresh Sync: Clears full ROM and memory, then immediately pulls
- *           | and caches fresh student roster and book catalog from Firestore without reboot.
+ *   Scope    | Command | Action & Behavior
+ *  ----------+---------+-------------------------------------------------------------------
+ *   Combined | rom     | Inspect Persistent ROM: Dumps both students and books, offline logs,
+ *   (Both)   |         | free heap RAM, and Wi-Fi link status.
+ *            | upt     | Update & Sync Both: Triggers on-demand sync of Firestore 'student_names'
+ *            |         | and 'book_names' collections to ROM and flushes offline logs.
+ *            | clr     | Clear All ROM & REST Mode: Erases all students, books, and offline logs
+ *            |         | from persistent ROM and enters REST mode. LCD alerts 'ROM Empty'.
+ *            | clrupt  | Clean Reset & Sync Both: Clears full ROM and memory, then pulls fresh
+ *            |         | student roster and book catalog from Firestore without reboot.
+ *  ----------+---------+-------------------------------------------------------------------
+ *   Students | roms    | Inspect Students ROM: Dumps cached student roster only ('students').
+ *   Only     | upts    | Update & Sync Students: On-demand sync of 'student_names' collection.
+ *            | clrs    | Clear Students ROM: Erases 'students' namespace from persistent ROM.
+ *            | clrupts | Clean Sync Students: Clears student ROM & pulls fresh student roster.
+ *  ----------+---------+-------------------------------------------------------------------
+ *   Books    | romb    | Inspect Books ROM: Dumps cached book catalog only ('books').
+ *   Only     | uptb    | Update & Sync Books: On-demand sync of 'book_names' collection.
+ *            | clrb    | Clear Books ROM: Erases 'books' namespace from persistent ROM.
+ *            | clruptb | Clean Sync Books: Clears book ROM & pulls fresh book catalog.
  * 
  * -----------------------------------------------------------------------------------------
  * CRITICAL ARCHITECTURAL RULES:
@@ -187,15 +194,17 @@ volatile bool pendingRestart = false;
 // Post-Round Cloud Sync Flag: triggers immediate background roster sync after completing one book round
 volatile bool triggerPostRoundSync = false;
 
-// Manual Cloud Sync Flag: triggers immediate on-demand Firestore sync via serial command 'upt'
-volatile bool triggerManualSync = false;
+// Manual Cloud Sync Flags: triggers immediate on-demand sync via 'upt', 'upts', 'uptb'
+volatile bool triggerSyncStudents = false;
+volatile bool triggerSyncBooks = false;
 
-// Clean ROM Reset & Sync Flag: triggers complete ROM clear and fresh Firestore sync via serial command 'clrupt'
-volatile bool triggerCleanSync = false;
+// Clean ROM Reset & Sync Flags: triggers ROM clear and fresh sync via 'clrupt', 'clrupts', 'clruptb'
+volatile bool triggerCleanSyncStudents = false;
+volatile bool triggerCleanSyncBooks = false;
 volatile bool cleanSyncFinished = false;
 volatile bool cleanSyncFailed = false;
 
-// System REST mode flag: set via serial command 'clr'; pauses periodic auto-sync until 'upt' or 'clrupt' is executed
+// System REST mode flag: set via serial command 'clr'; pauses periodic auto-sync until 'upt', 'upts', 'uptb', 'clrupt' etc. is executed
 volatile bool systemRestMode = false;
 
 // =========================================================================================
@@ -453,8 +462,14 @@ void saveBookToROM(const char* uid, const char* title, uint8_t shelf, uint8_t ra
 void removeBookFromROM(const char* uid);
 std::vector<String> getAllROMBookUIDs();
 void printROMCacheSummary();
+void dumpROMStudents();
+void dumpROMBooks();
 void dumpAllROMData();
+void clearStudentROMData();
+void clearBookROMData();
 void clearAllROMData();
+void executeCleanResetAndSyncStudents();
+void executeCleanResetAndSyncBooks();
 void executeCleanResetAndSync();
 void checkSerialCommands();
 
@@ -712,20 +727,34 @@ void firestoreSyncTask(void* pvParameters) {
         flushOfflineLogsFromROM();
       }
 
-      // Manual On-Demand Cloud Sync Trigger (Triggered via Serial command "upt")
-      if (triggerManualSync) {
-        triggerManualSync = false;
+      // Manual On-Demand Cloud Sync Trigger (Triggered via Serial command "upt", "upts", "uptb")
+      if (triggerSyncStudents || triggerSyncBooks) {
+        bool syncBoth = triggerSyncStudents && triggerSyncBooks;
+        bool doStudents = triggerSyncStudents;
+        bool doBooks = triggerSyncBooks;
+        triggerSyncStudents = false;
+        triggerSyncBooks = false;
         systemRestMode = false;
         lastRosterCheckTime = millis();
         Serial.println(F("---------------------------------------------------"));
-        Serial.println(F("[MANUAL-SYNC] On-demand Firestore synchronization ('upt') initiated..."));
+        if (syncBoth) {
+          Serial.println(F("[MANUAL-SYNC] On-demand sync ('upt'): students & books initiated..."));
+        } else if (doStudents) {
+          Serial.println(F("[MANUAL-SYNC] On-demand sync ('upts'): students roster initiated..."));
+        } else {
+          Serial.println(F("[MANUAL-SYNC] On-demand sync ('uptb'): book catalog initiated..."));
+        }
         flushOfflineLogsFromROM();
-        bool studentDiff = false;
-        compareAndSyncRoster(false /* periodic */, studentDiff);
-        bool bookDiff = false;
-        compareAndSyncBooks(false /* periodic */, bookDiff);
+        bool sDiff = false;
+        if (doStudents) {
+          compareAndSyncRoster(false /* periodic */, sDiff);
+        }
+        bool bDiff = false;
+        if (doBooks) {
+          compareAndSyncBooks(false /* periodic */, bDiff);
+        }
         initialSyncDone = true;
-        if (studentDiff || bookDiff) {
+        if (sDiff || bDiff) {
           pendingRestart = true;
         } else {
           Serial.println(F("[MANUAL-SYNC] Sync complete: Local ROM is fully up-to-date with Firestore."));
@@ -733,19 +762,35 @@ void firestoreSyncTask(void* pvParameters) {
         Serial.println(F("---------------------------------------------------"));
       }
 
-      // Clean Reset & Sync Trigger (Triggered via Serial command "clrupt")
-      if (triggerCleanSync) {
-        triggerCleanSync = false;
+      // Clean Reset & Sync Trigger (Triggered via Serial command "clrupt", "clrupts", "clruptb")
+      if (triggerCleanSyncStudents || triggerCleanSyncBooks) {
+        bool cleanBoth = triggerCleanSyncStudents && triggerCleanSyncBooks;
+        bool doStudents = triggerCleanSyncStudents;
+        bool doBooks = triggerCleanSyncBooks;
+        triggerCleanSyncStudents = false;
+        triggerCleanSyncBooks = false;
         systemRestMode = false;
         lastRosterCheckTime = millis();
         Serial.println(F("---------------------------------------------------"));
-        Serial.println(F("[CLRUPT]    Downloading fresh student roster & book catalog from Firestore..."));
+        if (cleanBoth) {
+          Serial.println(F("[CLRUPT]    Downloading fresh student roster & book catalog from Firestore..."));
+        } else if (doStudents) {
+          Serial.println(F("[CLRUPTS]   Downloading fresh student roster from Firestore..."));
+        } else {
+          Serial.println(F("[CLRUPTB]   Downloading fresh book catalog from Firestore..."));
+        }
         bool unusedDiff = false;
-        bool sOk = compareAndSyncRoster(true /* suppress restart countdown */, unusedDiff);
-        bool bOk = compareAndSyncBooks(true /* suppress restart countdown */, unusedDiff);
+        bool sOk = true;
+        if (doStudents) {
+          sOk = compareAndSyncRoster(true /* suppress restart countdown */, unusedDiff);
+        }
+        bool bOk = true;
+        if (doBooks) {
+          bOk = compareAndSyncBooks(true /* suppress restart countdown */, unusedDiff);
+        }
         initialSyncDone = true;
         if (sOk && bOk) {
-          Serial.println(F("[CLRUPT]    Fresh roster and book catalog successfully downloaded and cached in ROM!"));
+          Serial.println(F("[CLRUPT]    Fresh download complete and cached in ROM!"));
           cleanSyncFinished = true;
         } else {
           Serial.println(F("[CLRUPT]    ERROR: Failed to fetch documents from Firestore. Check Wi-Fi / Firebase."));
@@ -1577,6 +1622,82 @@ void printROMCacheSummary() {
   Serial.println(F("==================================================="));
 }
 
+// Dumps student roster cache ("students" namespace) to Serial Monitor
+void dumpROMStudents() {
+  Serial.println();
+  Serial.println(F("==================================================="));
+  Serial.println(F("        STUDENT ROSTER ROM CACHE ('students')      "));
+  Serial.println(F("==================================================="));
+  std::vector<String> uids = getAllROMUIDs();
+  Serial.print(F("[ROM-STUDENTS] Total Registered Students: "));
+  Serial.println(uids.size());
+  if (uids.empty()) {
+    Serial.println(F("               (No student records found in ROM)"));
+  } else {
+    for (size_t i = 0; i < uids.size(); i++) {
+      StudentRecord rec;
+      if (getStudentFromROM(uids[i].c_str(), rec)) {
+        Serial.print(F("  ["));
+        Serial.print(i + 1);
+        Serial.print(F("] UID: "));
+        Serial.print(uids[i]);
+        Serial.print(F(" | Name: \""));
+        Serial.print(rec.name);
+        Serial.print(F("\" | Status: "));
+        Serial.println(rec.active ? F("ACTIVE") : F("SUSPENDED"));
+      } else {
+        Serial.print(F("  ["));
+        Serial.print(i + 1);
+        Serial.print(F("] UID: "));
+        Serial.print(uids[i]);
+        Serial.println(F(" | Error reading record"));
+      }
+    }
+  }
+  Serial.println(F("==================================================="));
+  Serial.println();
+}
+
+// Dumps book catalog cache ("books" namespace) to Serial Monitor
+void dumpROMBooks() {
+  Serial.println();
+  Serial.println(F("==================================================="));
+  Serial.println(F("         BOOK CATALOG ROM CACHE ('books')          "));
+  Serial.println(F("==================================================="));
+  std::vector<String> bookUids = getAllROMBookUIDs();
+  Serial.print(F("[ROM-BOOKS] Total Registered Books: "));
+  Serial.println(bookUids.size());
+  if (bookUids.empty()) {
+    Serial.println(F("             (No book records found in ROM)"));
+  } else {
+    for (size_t i = 0; i < bookUids.size(); i++) {
+      BookRecord bRec;
+      if (getBookFromROM(bookUids[i].c_str(), bRec)) {
+        Serial.print(F("  ["));
+        Serial.print(i + 1);
+        Serial.print(F("] UID: "));
+        Serial.print(bookUids[i]);
+        Serial.print(F(" | Title: \""));
+        Serial.print(bRec.title);
+        Serial.print(F("\" | Shelf: "));
+        Serial.print(bRec.shelf);
+        Serial.print(F(" | Rack: "));
+        Serial.print(bRec.rack);
+        Serial.print(F(" | Status: "));
+        Serial.println(bRec.active ? F("ACTIVE") : F("SUSPENDED"));
+      } else {
+        Serial.print(F("  ["));
+        Serial.print(i + 1);
+        Serial.print(F("] UID: "));
+        Serial.print(bookUids[i]);
+        Serial.println(F(" | Error reading book record"));
+      }
+    }
+  }
+  Serial.println(F("==================================================="));
+  Serial.println();
+}
+
 // Dumps all persistent ROM data (Student Roster, Book Catalog & Offline Logs) to Serial Monitor
 void dumpAllROMData() {
   Serial.println();
@@ -1684,7 +1805,7 @@ void dumpAllROMData() {
     }
   }
 
-  // 3. System & Network State Summary
+  // 4. System & Network State Summary
   Serial.println(F("---------------------------------------------------"));
   Serial.print(F("[SYSTEM-STATUS] Free Heap RAM: "));
   Serial.print(ESP.getFreeHeap());
@@ -1695,6 +1816,41 @@ void dumpAllROMData() {
     Serial.print(F(")"));
   }
   Serial.println();
+  Serial.println(F("==================================================="));
+  Serial.println();
+}
+
+// Erases student records from persistent ROM (leaves books and offline logs intact)
+void clearStudentROMData() {
+  studentPrefs.clear();
+  activeStudentName[0] = '\0';
+  activeStudentUID[0]  = '\0';
+  activeLoginTime[0]   = '\0';
+  sessionStartTime = 0;
+  currentState = WAITING_FOR_STUDENT;
+
+  Serial.println();
+  Serial.println(F("==================================================="));
+  Serial.println(F("[ROM-CLEAR] Student Roster Cache Cleared (Background)!"));
+  Serial.println(F("            - Student roster cache ('students') erased"));
+  Serial.println(F("            - Book catalog and offline logs retained"));
+  Serial.println(F("            - Type 'upts' or 'clrupts' to sync students from Firestore"));
+  Serial.println(F("==================================================="));
+  Serial.println();
+}
+
+// Erases book records from persistent ROM (leaves students and offline logs intact)
+void clearBookROMData() {
+  bookPrefs.clear();
+  sessionStartTime = 0;
+  currentState = WAITING_FOR_STUDENT;
+
+  Serial.println();
+  Serial.println(F("==================================================="));
+  Serial.println(F("[ROM-CLEAR] Book Catalog Cache Cleared (Background)!"));
+  Serial.println(F("            - Book catalog cache ('books') erased"));
+  Serial.println(F("            - Student roster and offline logs retained"));
+  Serial.println(F("            - Type 'uptb' or 'clruptb' to sync books from Firestore"));
   Serial.println(F("==================================================="));
   Serial.println();
 }
@@ -1715,7 +1871,7 @@ void clearAllROMData() {
 
   Serial.println();
   Serial.println(F("==================================================="));
-  Serial.println(F("[ROM-CLEAR] Persistent ROM completely cleared (Background)!"));
+  Serial.println(F("[ROM-CLEAR] Full Persistent ROM Completely Cleared (Background)!"));
   Serial.println(F("            - Student roster cache ('students') erased"));
   Serial.println(F("            - Book catalog cache ('books') erased"));
   Serial.println(F("            - Offline logs buffer ('off_logs') erased"));
@@ -1726,6 +1882,41 @@ void clearAllROMData() {
   Serial.println(F("            - Type 'upt' or 'clrupt' to exit REST mode and sync from Firestore."));
   Serial.println(F("==================================================="));
   Serial.println();
+}
+
+// Clears student cache & pulls fresh student roster from Firestore without hardware reboot
+void executeCleanResetAndSyncStudents() {
+  systemRestMode = false;
+  Serial.println();
+  Serial.println(F("==================================================="));
+  Serial.println(F("[CLRUPTS]   Executing background student erase and fresh Firestore sync..."));
+  studentPrefs.clear();
+  activeStudentName[0] = '\0';
+  activeStudentUID[0]  = '\0';
+  activeLoginTime[0]   = '\0';
+  sessionStartTime = 0;
+  currentState = WAITING_FOR_STUDENT;
+
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println(F("[CLRUPTS]   WARN: Wi-Fi currently disconnected. Sync will begin upon link connect."));
+  }
+  triggerCleanSyncStudents = true;
+}
+
+// Clears book cache & pulls fresh book catalog from Firestore without hardware reboot
+void executeCleanResetAndSyncBooks() {
+  systemRestMode = false;
+  Serial.println();
+  Serial.println(F("==================================================="));
+  Serial.println(F("[CLRUPTB]   Executing background book erase and fresh Firestore sync..."));
+  bookPrefs.clear();
+  sessionStartTime = 0;
+  currentState = WAITING_FOR_STUDENT;
+
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println(F("[CLRUPTB]   WARN: Wi-Fi currently disconnected. Sync will begin upon link connect."));
+  }
+  triggerCleanSyncBooks = true;
 }
 
 // Clears ROM & memory and immediately pulls fresh student roster & books from Firestore without reboot
@@ -1749,7 +1940,8 @@ void executeCleanResetAndSync() {
     Serial.println(F("[CLRUPT]    WARN: Wi-Fi currently disconnected. Sync will begin as soon as link connects."));
   }
 
-  triggerCleanSync = true;
+  triggerCleanSyncStudents = true;
+  triggerCleanSyncBooks = true;
 }
 
 // Periodic (every 20s) & Boot-Time Roster Synchronization with Diff Detection
@@ -2821,13 +3013,24 @@ void setup() {
   resetSystem();
 
   Serial.println(F("[SERIAL]   Interactive Commands Ready:"));
-  Serial.println(F("           - Type 'rom'    + Enter: Inspect all persistent ROM data (students, books & offline logs)"));
-  Serial.println(F("           - Type 'upt'    + Enter: Force immediate on-demand Firestore synchronization (students & books)"));
-  Serial.println(F("           - Type 'clr'    + Enter: Clear all ROM data and enter REST mode"));
-  Serial.println(F("           - Type 'clrupt' + Enter: Clear ROM, reset memory, and fresh sync from Firestore (students & books)"));
+  Serial.println(F("           Combined (Both):"));
+  Serial.println(F("           - 'rom'     : Inspect all persistent ROM (students, books, logs & RAM)"));
+  Serial.println(F("           - 'upt'     : Force immediate on-demand Firestore sync of both"));
+  Serial.println(F("           - 'clr'     : Clear all ROM data and enter REST mode"));
+  Serial.println(F("           - 'clrupt'  : Clear all ROM and fresh sync both from Firestore"));
+  Serial.println(F("           Students Only:"));
+  Serial.println(F("           - 'roms'    : Inspect student roster ROM cache only"));
+  Serial.println(F("           - 'upts'    : Force immediate Firestore sync of 'student_names'"));
+  Serial.println(F("           - 'clrs'    : Clear student roster from persistent ROM"));
+  Serial.println(F("           - 'clrupts' : Clear student ROM and fresh sync from Firestore"));
+  Serial.println(F("           Books Only:"));
+  Serial.println(F("           - 'romb'    : Inspect book catalog ROM cache only"));
+  Serial.println(F("           - 'uptb'    : Force immediate Firestore sync of 'book_names'"));
+  Serial.println(F("           - 'clrb'    : Clear book catalog from persistent ROM"));
+  Serial.println(F("           - 'clruptb' : Clear book ROM and fresh sync from Firestore"));
 }
 
-// Non-blocking serial command listener for runtime diagnostics (e.g. typing "rom", "upt", "clr", "clrupt")
+// Non-blocking serial command listener for runtime diagnostics (e.g. typing "rom", "roms", "romb", "upt", "upts", "uptb", "clr", "clrs", "clrb", "clrupt", "clrupts", "clruptb")
 void checkSerialCommands() {
   static String serialBuffer = "";
   while (Serial.available() > 0) {
@@ -2837,23 +3040,62 @@ void checkSerialCommands() {
       if (serialBuffer.length() > 0) {
         String cmd = serialBuffer;
         cmd.toLowerCase();
+
+        // 1. ROM Inspection Commands
         if (cmd == "rom") {
           dumpAllROMData();
+        } else if (cmd == "roms") {
+          dumpROMStudents();
+        } else if (cmd == "romb") {
+          dumpROMBooks();
+
+        // 2. On-Demand Firestore Synchronization Commands
         } else if (cmd == "upt") {
           systemRestMode = false;
-          Serial.println(F("[SERIAL]   Manual sync command 'upt' received! Dispatching immediate Firestore sync..."));
+          Serial.println(F("[SERIAL]   Manual sync 'upt' (both students & books) received! Dispatching..."));
           if (WiFi.status() != WL_CONNECTED) {
-            Serial.println(F("[WARN]     Wi-Fi currently disconnected. Sync will execute as soon as network reconnects."));
+            Serial.println(F("[WARN]     Wi-Fi currently disconnected. Sync will execute upon reconnect."));
           }
-          triggerManualSync = true;
+          triggerSyncStudents = true;
+          triggerSyncBooks = true;
+        } else if (cmd == "upts") {
+          systemRestMode = false;
+          Serial.println(F("[SERIAL]   Manual sync 'upts' (students only) received! Dispatching..."));
+          if (WiFi.status() != WL_CONNECTED) {
+            Serial.println(F("[WARN]     Wi-Fi currently disconnected. Sync will execute upon reconnect."));
+          }
+          triggerSyncStudents = true;
+        } else if (cmd == "uptb") {
+          systemRestMode = false;
+          Serial.println(F("[SERIAL]   Manual sync 'uptb' (books only) received! Dispatching..."));
+          if (WiFi.status() != WL_CONNECTED) {
+            Serial.println(F("[WARN]     Wi-Fi currently disconnected. Sync will execute upon reconnect."));
+          }
+          triggerSyncBooks = true;
+
+        // 3. ROM Clear Commands
         } else if (cmd == "clr") {
           clearAllROMData();
+        } else if (cmd == "clrs") {
+          clearStudentROMData();
+        } else if (cmd == "clrb") {
+          clearBookROMData();
+
+        // 4. Clean ROM Reset & Fresh Sync Commands
         } else if (cmd == "clrupt") {
           executeCleanResetAndSync();
+        } else if (cmd == "clrupts") {
+          executeCleanResetAndSyncStudents();
+        } else if (cmd == "clruptb") {
+          executeCleanResetAndSyncBooks();
+
         } else {
           Serial.print(F("[SERIAL] Unknown command: '"));
           Serial.print(serialBuffer);
-          Serial.println(F("'. Supported commands: 'rom', 'upt', 'clr', 'clrupt'."));
+          Serial.println(F("'. Supported commands:"));
+          Serial.println(F("         Combined: 'rom', 'upt', 'clr', 'clrupt'"));
+          Serial.println(F("         Students: 'roms', 'upts', 'clrs', 'clrupts'"));
+          Serial.println(F("         Books:    'romb', 'uptb', 'clrb', 'clruptb'"));
         }
         serialBuffer = "";
       }
