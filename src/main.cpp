@@ -1460,39 +1460,47 @@ void dumpAllROMData() {
 }
 
 // Erases all student records and offline logs from persistent ROM and enters REST mode
+// Zero LCD disruption: runs entirely in the background and logs to Serial only
 void clearAllROMData() {
   systemRestMode = true;
   studentPrefs.clear();
   offlineLogsPrefs.clear();
-  resetSystem();
+  // Clear in-memory session credentials without disturbing the LCD display
+  activeStudentName[0] = '\0';
+  activeStudentUID[0]  = '\0';
+  activeLoginTime[0]   = '\0';
+  sessionStartTime = 0;
+  currentState = WAITING_FOR_STUDENT;
 
   Serial.println();
   Serial.println(F("==================================================="));
-  Serial.println(F("[ROM-CLEAR] Persistent ROM completely cleared!"));
+  Serial.println(F("[ROM-CLEAR] Persistent ROM completely cleared (Background)!"));
   Serial.println(F("            - Student roster cache ('students') erased"));
   Serial.println(F("            - Offline logs buffer ('off_logs') erased"));
   Serial.println(F("            - System is now in REST MODE."));
-  Serial.println(F("            - Scanning any card will display 'ROM Empty / System Rest Mode'."));
+  Serial.println(F("            - LCD display remains untouched (dedicated to user guidance)."));
+  Serial.println(F("            - If a student taps a card before sync, LCD will alert:"));
+  Serial.println(F("              Line 1: '   ROM Empty    ' | Line 2: 'System Rest Mode'"));
   Serial.println(F("            - Type 'upt' or 'clrupt' to exit REST mode and sync from Firestore."));
   Serial.println(F("==================================================="));
   Serial.println();
-
-  showMessage("   ROM Cleared  ", "System Rest Mode");
-  delay(1500);
-  resetSystem();
 }
 
 // Clears ROM & memory and immediately pulls a fresh student roster from Firestore without hardware reboot
+// Zero LCD disruption: runs entirely in the background and logs to Serial only
 void executeCleanResetAndSync() {
   systemRestMode = false;
   Serial.println();
   Serial.println(F("==================================================="));
-  Serial.println(F("[CLRUPT]    Executing complete ROM erase and fresh Firestore sync..."));
+  Serial.println(F("[CLRUPT]    Executing background ROM erase and fresh Firestore sync..."));
   studentPrefs.clear();
   offlineLogsPrefs.clear();
-  resetSystem();
-
-  showMessage("Clearing Memory ", "Syncing Cloud...");
+  // Clear in-memory session credentials without disturbing the LCD display
+  activeStudentName[0] = '\0';
+  activeStudentUID[0]  = '\0';
+  activeLoginTime[0]   = '\0';
+  sessionStartTime = 0;
+  currentState = WAITING_FOR_STUDENT;
 
   if (WiFi.status() != WL_CONNECTED) {
     Serial.println(F("[CLRUPT]    WARN: Wi-Fi currently disconnected. Sync will begin as soon as link connects."));
@@ -2251,16 +2259,11 @@ void loop() {
   // Check for interactive Serial Monitor commands (e.g. typing "rom", "upt", "clr", "clrupt")
   checkSerialCommands();
 
-  // Handle clean sync completion notice from Core 0
+  // Handle clean sync completion notice from Core 0 (silent background - zero LCD interruption)
   if (cleanSyncFinished) {
     cleanSyncFinished = false;
-    showMessage(" Sync Complete! ", "   ShelfSense   ");
-    delay(1500);
-    resetSystem();
   } else if (cleanSyncFailed) {
     cleanSyncFailed = false;
-    showError("Sync Failed!    ", "Check Wi-Fi Link", "Clean sync failed to download Firestore roster");
-    resetSystem();
   }
 
   // Auto-restart countdown if roster data was updated in Firestore (Requirement 2 & 3)
