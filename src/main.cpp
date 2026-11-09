@@ -37,6 +37,16 @@
  *   Green LED  | Anode (+) [Long leg] | GPIO 25    | YES           | Configurable (GREEN_LED_PIN)
  *              | Cathode (-)          | GND        | No (Fixed)    | Connect with 220Ω resistor
  * 
+ * 4. INTERACTIVE SERIAL MONITOR COMMANDS (115200 Baud)
+ * -----------------------------------------------------------------------------------------
+ *   Command | Action & Behavior
+ *  ---------+------------------------------------------------------------------------------
+ *   rom     | Inspect Persistent ROM: Dumps all cached student records, active/suspended
+ *           | status, buffered offline logs, free heap RAM, and Wi-Fi link status.
+ *   upt     | Update & Sync Firestore: Triggers an immediate, on-demand synchronization
+ *           | of Firestore 'student_names' collection to ROM and flushes offline logs.
+ *           | If differences are detected, triggers auto-restart countdown.
+ * 
  * -----------------------------------------------------------------------------------------
  * CRITICAL ARCHITECTURAL RULES:
  *  - SILENT BACKGROUND CLOUD SYNC: All Google Cloud Firestore synchronizations occur
@@ -167,6 +177,9 @@ volatile bool pendingRestart = false;
 
 // Post-Round Cloud Sync Flag: triggers immediate background roster sync after completing one book round
 volatile bool triggerPostRoundSync = false;
+
+// Manual Cloud Sync Flag: triggers immediate on-demand Firestore sync via serial command 'upt'
+volatile bool triggerManualSync = false;
 
 // =========================================================================================
 // SECTION 3: SYSTEM STATES & IN-MEMORY DATABASES
@@ -653,6 +666,24 @@ void firestoreSyncTask(void* pvParameters) {
       if (millis() - lastOfflineFlushTime >= OFFLINE_FLUSH_INTERVAL_MS) {
         lastOfflineFlushTime = millis();
         flushOfflineLogsFromROM();
+      }
+
+      // Manual On-Demand Cloud Sync Trigger (Triggered via Serial command "upt")
+      if (triggerManualSync) {
+        triggerManualSync = false;
+        lastRosterCheckTime = millis();
+        Serial.println(F("---------------------------------------------------"));
+        Serial.println(F("[MANUAL-SYNC] On-demand Firestore synchronization ('upt') initiated..."));
+        flushOfflineLogsFromROM();
+        bool diffDetected = false;
+        compareAndSyncRoster(false /* periodic */, diffDetected);
+        initialSyncDone = true;
+        if (diffDetected) {
+          pendingRestart = true;
+        } else {
+          Serial.println(F("[MANUAL-SYNC] Sync complete: Local ROM is fully up-to-date with Firestore."));
+        }
+        Serial.println(F("---------------------------------------------------"));
       }
 
       // Immediate Post-Round Roster Sync Trigger (Triggered after completing a student + book round)
@@ -2066,10 +2097,12 @@ void setup() {
   // Reset system to ready state (Line 1: "Please Tap Your ", Line 2: "Student ID Card ")
   resetSystem();
 
-  Serial.println(F("[SERIAL]   Interactive Command Ready: Type \"rom\" and press Enter to inspect all ROM data."));
+  Serial.println(F("[SERIAL]   Interactive Commands Ready:"));
+  Serial.println(F("           - Type 'rom' + Enter: Inspect all persistent ROM data (students & offline logs)"));
+  Serial.println(F("           - Type 'upt' + Enter: Force immediate on-demand Firestore synchronization"));
 }
 
-// Non-blocking serial command listener for runtime diagnostics (e.g. typing "rom")
+// Non-blocking serial command listener for runtime diagnostics (e.g. typing "rom" or "upt")
 void checkSerialCommands() {
   static String serialBuffer = "";
   while (Serial.available() > 0) {
@@ -2081,10 +2114,16 @@ void checkSerialCommands() {
         cmd.toLowerCase();
         if (cmd == "rom") {
           dumpAllROMData();
+        } else if (cmd == "upt") {
+          Serial.println(F("[SERIAL]   Manual sync command 'upt' received! Dispatching immediate Firestore sync..."));
+          if (WiFi.status() != WL_CONNECTED) {
+            Serial.println(F("[WARN]     Wi-Fi currently disconnected. Sync will execute as soon as network reconnects."));
+          }
+          triggerManualSync = true;
         } else {
           Serial.print(F("[SERIAL] Unknown command: '"));
           Serial.print(serialBuffer);
-          Serial.println(F("'. Type 'rom' to display all data in ROM."));
+          Serial.println(F("'. Supported commands: 'rom' (inspect ROM), 'upt' (sync Firestore)."));
         }
         serialBuffer = "";
       }
