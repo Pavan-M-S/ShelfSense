@@ -199,9 +199,9 @@ unsigned long sessionStartTime = 0;
 unsigned long lastSessionSecondLogged = 0;
 
 // Authenticated student session variables
-char activeStudentName[32] = "";
-char activeStudentUID[32]  = "";
-char activeLoginTime[25]   = "";
+char activeStudentName[128] = "";
+char activeStudentUID[32]   = "";
+char activeLoginTime[25]    = "";
 
 // Structure modeling a registered library book
 struct Book {
@@ -215,15 +215,15 @@ struct Book {
 struct FirestoreLogEvent {
   char docId[32];       // Formatted Document ID without spaces or colons: "YYYY-MM-DD_HHMMSS"
   char eventType[20];   // BOOK_PROCESSED, SESSION_TIMEOUT, SECURITY_ALERT, STUDENT_LOGIN
-  char studentName[32]; // Authenticated student name
+  char studentName[128]; // Authenticated student name (supports full names up to 127 chars)
   char studentUID[32];  // Authenticated student UID
   char loginTime[25];   // Login timestamp "YYYY-MM-DD HH:MM:SS"
-  char bookTitle[64];   // Scanned book title (or empty)
+  char bookTitle[128];  // Scanned book title (supports long titles up to 127 chars)
   char bookUID[32];     // Scanned book UID (or empty)
   uint8_t shelf;        // Physical shelf location
   uint8_t rack;         // Physical rack location
   char timestamp[25];   // Processed timestamp "YYYY-MM-DD HH:MM:SS"
-  char statusNote[96];  // Diagnostic status note
+  char statusNote[160]; // Diagnostic status note
 };
 
 // -----------------------------------------------------------------------------------------
@@ -389,7 +389,7 @@ void queueFirestoreLog(const char* eventType,
 
 // Structure representing cached student record in ROM (Preferences NVS)
 struct StudentRecord {
-  char name[32];
+  char name[128]; // Supports long full names up to 127 characters
   bool active;
 };
 
@@ -828,8 +828,8 @@ void showMessage(const char* line1, const char* line2 = "") {
   Serial.println();
 }
 
-// Scrolls line 1 smoothly from right to left if it exceeds 16 characters while keeping line 2 static
-void showMessageWithScroll(const char* line1, const char* line2 = "", int scrollSpeedMs = 280, int totalDurationMs = 3500) {
+// Scrolls line 1 smoothly from right to left so that the ENTIRE text is visible, regardless of length
+void showMessageWithScroll(const char* line1, const char* line2 = "", int defaultSpeedMs = 180, int staticDurationMs = 2500) {
   Serial.print(F("[LCD]      Line 1: \""));
   Serial.print(line1);
   Serial.print(F("\""));
@@ -853,15 +853,25 @@ void showMessageWithScroll(const char* line1, const char* line2 = "", int scroll
 
   size_t len1 = strlen(line1);
 
-  // If line 1 fits within 16 chars, simply display without scrolling
+  // If line 1 fits within 16 chars, simply display statically without scrolling
   if (len1 <= 16) {
     lcd.setCursor(0, 0);
     lcd.print(line1);
-    delay(totalDurationMs);
+    delay(staticDurationMs);
     return;
   }
 
-  // Initial view pause so patron can begin reading
+  // Adaptive speed: comfortable readability for any length without excessive waiting
+  int effectiveSpeed = defaultSpeedMs;
+  if (len1 > 40) {
+    effectiveSpeed = 150; // Smooth & responsive for extra long names (e.g. 50+ chars)
+  } else if (len1 > 25) {
+    effectiveSpeed = 180;
+  } else {
+    effectiveSpeed = 220;
+  }
+
+  // 1. Initial view pause so patron can comfortably read the beginning of the line
   char frame[17];
   strncpy(frame, line1, 16);
   frame[16] = '\0';
@@ -869,26 +879,18 @@ void showMessageWithScroll(const char* line1, const char* line2 = "", int scroll
   lcd.print(frame);
   delay(800);
 
-  // Smooth scroll using stack buffer without creating heap Strings
-  size_t padLen = len1 + 4; // virtual padded length (line1 + "    ")
-  unsigned long startTime = millis();
-
-  int offset = 0;
-  while (millis() - startTime < (unsigned long)totalDurationMs) {
-    for (int i = 0; i < 16; i++) {
-      size_t charIdx = (offset + i) % padLen;
-      if (charIdx < len1) {
-        frame[i] = line1[charIdx];
-      } else {
-        frame[i] = ' ';
-      }
-    }
+  // 2. Scroll step-by-step from beginning until the very end of the text is reached
+  int totalSteps = (int)len1 - 16;
+  for (int step = 1; step <= totalSteps; step++) {
+    strncpy(frame, line1 + step, 16);
     frame[16] = '\0';
     lcd.setCursor(0, 0);
     lcd.print(frame);
-    delay(scrollSpeedMs);
-    offset++;
+    delay(effectiveSpeed);
   }
+
+  // 3. Final pause on the last 16 characters so patron can read the end of their name
+  delay(800);
 }
 
 // Helper to handle the post-scroll 8-second shelf/rack hold and 3-second warning beeps:
@@ -1006,8 +1008,8 @@ void displayBookLocationSequence(const char* title, uint8_t shelf, uint8_t rack)
   }
 
   // Case B: Long title (> 16 characters)
-  // Adaptive scroll speed: 280ms per step if <= 30 chars; faster 180ms if > 30 chars
-  int scrollSpeedMs = (titleLen > 30) ? 180 : 280;
+  // Adaptive scroll speed: 150ms for extra long titles (>45 chars), 180ms for >25 chars, 250ms otherwise
+  int scrollSpeedMs = (titleLen > 45) ? 150 : ((titleLen > 25) ? 180 : 250);
 
   int totalSteps = (int)titleLen - 16;
   int triggerStep = totalSteps > 4 ? (totalSteps - 4) : 0;
@@ -1714,7 +1716,7 @@ int findBookIndex(const char* uid) {
 
 // Handles Student Check-In (State 1: WAITING_FOR_STUDENT)
 void handleStudentScan(const char* uid) {
-  char verifiedName[32] = "";
+  char verifiedName[128] = "";
   StudentAuthStatus authStatus = STUDENT_AUTH_NOT_FOUND;
 
   verifyStudentFromROM(uid, verifiedName, sizeof(verifiedName), authStatus);
@@ -1751,10 +1753,10 @@ void handleStudentScan(const char* uid) {
     logStateTransition(WAITING_FOR_STUDENT, WAITING_FOR_BOOK);
     currentState = WAITING_FOR_BOOK;
 
-    // Display student greeting: smoothly scroll if name > 16 characters
-    char studentLine[48];
+    // Display student greeting: smoothly scrolls full name across screen without premature cutoff
+    char studentLine[144];
     snprintf(studentLine, sizeof(studentLine), "Hi %s", activeStudentName);
-    showMessageWithScroll(studentLine, "Tap Book Tag...", 260, 2500);
+    showMessageWithScroll(studentLine, "Tap Book Tag...");
 
     // Start 18-second non-blocking session timer after greeting display
     sessionStartTime = millis();
@@ -1812,7 +1814,7 @@ void handleStudentScan(const char* uid) {
   // 5. Unrecognized tag scanned -> Emergency alarm & SECURITY_ALERT
   Serial.print(F("[ERROR]    Unrecognized tag UID: "));
   Serial.println(uid);
-  char reason[96];
+  char reason[160];
   snprintf(reason, sizeof(reason), "Unrecognized card scanned at Step 1 (UID: %s)", uid);
 
   // Silent Background Cloud Sync: Dispatch SECURITY_ALERT document to Firestore
@@ -1846,7 +1848,7 @@ void handleBookScan(const char* uid) {
     lastSessionSecondLogged = 0;
 
     // Silent Background Cloud Sync: Dispatch ONE COMBINED document to Firestore (both login and processed data)
-    char note[96];
+    char note[160];
     snprintf(note, sizeof(note), "Student authenticated & book mapped to Shelf %u, Rack %u", foundBook.shelf, foundBook.rack);
     queueFirestoreLog("BOOK_PROCESSED",
                       activeStudentName,
@@ -1871,7 +1873,7 @@ void handleBookScan(const char* uid) {
   }
 
   // 2. Student card scanned again instead of book tag
-  char checkName[32] = "";
+  char checkName[128] = "";
   if (verifyStudentWithCache(uid, checkName, sizeof(checkName))) {
     Serial.print(F("[WARN]     Student ID (\""));
     Serial.print(checkName);
@@ -1890,7 +1892,7 @@ void handleBookScan(const char* uid) {
   Serial.print(F("[ERROR]    Unrecognized tag UID: "));
   Serial.print(uid);
   Serial.println(F(" during book lookup step!"));
-  char reason[96];
+  char reason[160];
   snprintf(reason, sizeof(reason), "Unregistered tag scanned at Step 2 (UID: %s)", uid);
 
   // Silent Background Cloud Sync: Dispatch SECURITY_ALERT document to Firestore
