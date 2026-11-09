@@ -46,6 +46,11 @@
  *   upt     | Update & Sync Firestore: Triggers an immediate, on-demand synchronization
  *           | of Firestore 'student_names' collection to ROM and flushes offline logs.
  *           | If differences are detected, triggers auto-restart countdown.
+ *   clr     | Clear All ROM & Rest Mode: Erases all cached students and offline logs from
+ *           | persistent ROM and sets system to REST mode. If cards are scanned before
+ *           | syncing, LCD alerts 'ROM Empty / System Rest Mode'.
+ *   clrupt  | Clear ROM & Fresh Sync: Clears full ROM and memory, then immediately pulls
+ *           | and caches fresh student roster from Firestore without hardware reboot.
  * 
  * -----------------------------------------------------------------------------------------
  * CRITICAL ARCHITECTURAL RULES:
@@ -180,6 +185,14 @@ volatile bool triggerPostRoundSync = false;
 
 // Manual Cloud Sync Flag: triggers immediate on-demand Firestore sync via serial command 'upt'
 volatile bool triggerManualSync = false;
+
+// Clean ROM Reset & Sync Flag: triggers complete ROM clear and fresh Firestore sync via serial command 'clrupt'
+volatile bool triggerCleanSync = false;
+volatile bool cleanSyncFinished = false;
+volatile bool cleanSyncFailed = false;
+
+// System REST mode flag: set via serial command 'clr'; pauses periodic auto-sync until 'upt' or 'clrupt' is executed
+volatile bool systemRestMode = false;
 
 // =========================================================================================
 // SECTION 3: SYSTEM STATES & IN-MEMORY DATABASES
@@ -414,6 +427,8 @@ void removeStudentFromROM(const char* uid);
 std::vector<String> getAllROMUIDs();
 void printROMCacheSummary();
 void dumpAllROMData();
+void clearAllROMData();
+void executeCleanResetAndSync();
 void checkSerialCommands();
 
 // Maximum number of offline log events buffered in persistent ROM (NVS)
@@ -671,6 +686,7 @@ void firestoreSyncTask(void* pvParameters) {
       // Manual On-Demand Cloud Sync Trigger (Triggered via Serial command "upt")
       if (triggerManualSync) {
         triggerManualSync = false;
+        systemRestMode = false;
         lastRosterCheckTime = millis();
         Serial.println(F("---------------------------------------------------"));
         Serial.println(F("[MANUAL-SYNC] On-demand Firestore synchronization ('upt') initiated..."));
@@ -682,6 +698,26 @@ void firestoreSyncTask(void* pvParameters) {
           pendingRestart = true;
         } else {
           Serial.println(F("[MANUAL-SYNC] Sync complete: Local ROM is fully up-to-date with Firestore."));
+        }
+        Serial.println(F("---------------------------------------------------"));
+      }
+
+      // Clean Reset & Sync Trigger (Triggered via Serial command "clrupt")
+      if (triggerCleanSync) {
+        triggerCleanSync = false;
+        systemRestMode = false;
+        lastRosterCheckTime = millis();
+        Serial.println(F("---------------------------------------------------"));
+        Serial.println(F("[CLRUPT]    Downloading fresh student roster from Firestore..."));
+        bool unusedDiff = false;
+        bool syncOk = compareAndSyncRoster(true /* suppress restart countdown */, unusedDiff);
+        initialSyncDone = true;
+        if (syncOk) {
+          Serial.println(F("[CLRUPT]    Fresh roster successfully downloaded and cached in ROM!"));
+          cleanSyncFinished = true;
+        } else {
+          Serial.println(F("[CLRUPT]    ERROR: Failed to fetch documents from Firestore. Check Wi-Fi / Firebase."));
+          cleanSyncFailed = true;
         }
         Serial.println(F("---------------------------------------------------"));
       }
@@ -700,8 +736,8 @@ void firestoreSyncTask(void* pvParameters) {
         Serial.println(F("---------------------------------------------------"));
       }
 
-      // Periodic 20-second Roster check and diff sync (Requirement 3)
-      if (initialSyncDone && (millis() - lastRosterCheckTime >= ROSTER_CHECK_INTERVAL_MS)) {
+      // Periodic 20-second Roster check and diff sync (Requirement 3 - skipped in REST mode)
+      if (!systemRestMode && initialSyncDone && (millis() - lastRosterCheckTime >= ROSTER_CHECK_INTERVAL_MS)) {
         lastRosterCheckTime = millis();
         Serial.println(F("[AUTH-SYNC] 20s interval elapsed. Checking Firestore 'student_names' vs ROM..."));
         bool diffDetected = false;
@@ -1423,6 +1459,48 @@ void dumpAllROMData() {
   Serial.println();
 }
 
+// Erases all student records and offline logs from persistent ROM and enters REST mode
+void clearAllROMData() {
+  systemRestMode = true;
+  studentPrefs.clear();
+  offlineLogsPrefs.clear();
+  resetSystem();
+
+  Serial.println();
+  Serial.println(F("==================================================="));
+  Serial.println(F("[ROM-CLEAR] Persistent ROM completely cleared!"));
+  Serial.println(F("            - Student roster cache ('students') erased"));
+  Serial.println(F("            - Offline logs buffer ('off_logs') erased"));
+  Serial.println(F("            - System is now in REST MODE."));
+  Serial.println(F("            - Scanning any card will display 'ROM Empty / System Rest Mode'."));
+  Serial.println(F("            - Type 'upt' or 'clrupt' to exit REST mode and sync from Firestore."));
+  Serial.println(F("==================================================="));
+  Serial.println();
+
+  showMessage("   ROM Cleared  ", "System Rest Mode");
+  delay(1500);
+  resetSystem();
+}
+
+// Clears ROM & memory and immediately pulls a fresh student roster from Firestore without hardware reboot
+void executeCleanResetAndSync() {
+  systemRestMode = false;
+  Serial.println();
+  Serial.println(F("==================================================="));
+  Serial.println(F("[CLRUPT]    Executing complete ROM erase and fresh Firestore sync..."));
+  studentPrefs.clear();
+  offlineLogsPrefs.clear();
+  resetSystem();
+
+  showMessage("Clearing Memory ", "Syncing Cloud...");
+
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println(F("[CLRUPT]    WARN: Wi-Fi currently disconnected. Sync will begin as soon as link connects."));
+  }
+
+  triggerCleanSync = true;
+}
+
 // Periodic (every 20s) & Boot-Time Roster Synchronization with Diff Detection
 // First reads ROM, then reads Firestore 'student_names'. If differences exist, updates ROM.
 bool compareAndSyncRoster(bool isBoot, bool &outDiffDetected) {
@@ -1716,6 +1794,31 @@ int findBookIndex(const char* uid) {
 
 // Handles Student Check-In (State 1: WAITING_FOR_STUDENT)
 void handleStudentScan(const char* uid) {
+  // Check if ROM is empty or system is in REST mode (e.g. after 'clr' command)
+  std::vector<String> romUIDs = getAllROMUIDs();
+  if (romUIDs.empty() || systemRestMode) {
+    Serial.print(F("[AUTH]     System in REST mode / ROM is EMPTY! Card ["));
+    Serial.print(uid);
+    Serial.println(F("] scanned. Please sync from Firestore ('upt' or 'clrupt')."));
+
+    // 2 warning beeps on buzzer + Red LED
+    for (int i = 0; i < 2; i++) {
+      digitalWrite(RED_LED_PIN, HIGH);
+      digitalWrite(BUZZER_PIN, HIGH);
+      delay(150);
+      digitalWrite(RED_LED_PIN, LOW);
+      digitalWrite(BUZZER_PIN, LOW);
+      if (i < 1) delay(100);
+    }
+
+    showMessage("   ROM Empty    ", "System Rest Mode");
+    delay(1500);
+    showMessage("System Rest Mode", "Please Wait...  ");
+    delay(1500);
+    resetSystem();
+    return;
+  }
+
   char verifiedName[128] = "";
   StudentAuthStatus authStatus = STUDENT_AUTH_NOT_FOUND;
 
@@ -2100,11 +2203,13 @@ void setup() {
   resetSystem();
 
   Serial.println(F("[SERIAL]   Interactive Commands Ready:"));
-  Serial.println(F("           - Type 'rom' + Enter: Inspect all persistent ROM data (students & offline logs)"));
-  Serial.println(F("           - Type 'upt' + Enter: Force immediate on-demand Firestore synchronization"));
+  Serial.println(F("           - Type 'rom'    + Enter: Inspect all persistent ROM data (students & offline logs)"));
+  Serial.println(F("           - Type 'upt'    + Enter: Force immediate on-demand Firestore synchronization"));
+  Serial.println(F("           - Type 'clr'    + Enter: Clear all ROM data and enter REST mode"));
+  Serial.println(F("           - Type 'clrupt' + Enter: Clear ROM, reset memory, and fresh sync from Firestore"));
 }
 
-// Non-blocking serial command listener for runtime diagnostics (e.g. typing "rom" or "upt")
+// Non-blocking serial command listener for runtime diagnostics (e.g. typing "rom", "upt", "clr", "clrupt")
 void checkSerialCommands() {
   static String serialBuffer = "";
   while (Serial.available() > 0) {
@@ -2117,15 +2222,20 @@ void checkSerialCommands() {
         if (cmd == "rom") {
           dumpAllROMData();
         } else if (cmd == "upt") {
+          systemRestMode = false;
           Serial.println(F("[SERIAL]   Manual sync command 'upt' received! Dispatching immediate Firestore sync..."));
           if (WiFi.status() != WL_CONNECTED) {
             Serial.println(F("[WARN]     Wi-Fi currently disconnected. Sync will execute as soon as network reconnects."));
           }
           triggerManualSync = true;
+        } else if (cmd == "clr") {
+          clearAllROMData();
+        } else if (cmd == "clrupt") {
+          executeCleanResetAndSync();
         } else {
           Serial.print(F("[SERIAL] Unknown command: '"));
           Serial.print(serialBuffer);
-          Serial.println(F("'. Supported commands: 'rom' (inspect ROM), 'upt' (sync Firestore)."));
+          Serial.println(F("'. Supported commands: 'rom', 'upt', 'clr', 'clrupt'."));
         }
         serialBuffer = "";
       }
@@ -2138,8 +2248,21 @@ void checkSerialCommands() {
 }
 
 void loop() {
-  // Check for interactive Serial Monitor commands (e.g. typing "rom")
+  // Check for interactive Serial Monitor commands (e.g. typing "rom", "upt", "clr", "clrupt")
   checkSerialCommands();
+
+  // Handle clean sync completion notice from Core 0
+  if (cleanSyncFinished) {
+    cleanSyncFinished = false;
+    showMessage(" Sync Complete! ", "   ShelfSense   ");
+    delay(1500);
+    resetSystem();
+  } else if (cleanSyncFailed) {
+    cleanSyncFailed = false;
+    showError("Sync Failed!    ", "Check Wi-Fi Link", "Clean sync failed to download Firestore roster");
+    resetSystem();
+  }
+
   // Auto-restart countdown if roster data was updated in Firestore (Requirement 2 & 3)
   if (pendingRestart && currentState == WAITING_FOR_STUDENT) {
     pendingRestart = false;
