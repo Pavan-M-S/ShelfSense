@@ -524,6 +524,7 @@ void queueCommandLog(const String& cmd,
                      uint32_t freeHeapAfter);
 void checkSerialCommands();
 void showWiFiConnectionErrorLCD();
+void redirectToCaptivePortal();
 void startProvisioningPortal();
 void stopProvisioningPortal();
 void initWiFiConnection();
@@ -1394,6 +1395,39 @@ void showWiFiConnectionErrorLCD() {
   Serial.println(F("[LCD]      Displaying: \"wifi connection error\""));
 }
 
+// Directs all captive portal probe requests and root hits directly to the Wi-Fi scan page (/wifi)
+void redirectToCaptivePortal() {
+  String uri = wm.server->uri();
+  if (uri == "/wifi" || uri == "/wifisave" || uri == "/info" || uri == "/status") {
+    return;
+  }
+
+  Serial.print(F("[PORTAL]   Captive probe on: '"));
+  Serial.print(uri);
+  Serial.print(F("' (Host: "));
+  Serial.print(wm.server->hostHeader());
+  Serial.println(F(") -> Auto-redirecting to /wifi"));
+
+  wm.server->sendHeader(F("Location"), F("http://192.168.4.1/wifi"), true);
+  wm.server->sendHeader(F("Cache-Control"), F("no-cache, no-store, must-revalidate"));
+  wm.server->sendHeader(F("Pragma"), F("no-cache"));
+  wm.server->sendHeader(F("Expires"), F("-1"));
+
+  const char redirectBody[] =
+    "<!DOCTYPE html><html><head>"
+    "<meta http-equiv='refresh' content='0;url=http://192.168.4.1/wifi'>"
+    "<meta name='viewport' content='width=device-width, initial-scale=1.0'>"
+    "<title>ShelfSense Wi-Fi Setup</title>"
+    "<script>window.location.replace('http://192.168.4.1/wifi');</script>"
+    "</head><body style='font-family:sans-serif;text-align:center;padding:25px;'>"
+    "<h3>ShelfSense Wi-Fi Setup</h3>"
+    "<p>Loading available Wi-Fi networks...</p>"
+    "<p><a href='http://192.168.4.1/wifi' style='display:inline-block;padding:12px 24px;background:#0066cc;color:#ffffff;text-decoration:none;border-radius:6px;font-weight:bold;'>Click Here to Configure Wi-Fi</a></p>"
+    "</body></html>";
+
+  wm.server->send(302, F("text/html"), redirectBody);
+}
+
 // Starts the Wi-Fi Provisioning Captive Portal on-demand or upon connection failure
 void startProvisioningPortal() {
   if (captivePortalRunning) return;
@@ -1405,6 +1439,7 @@ void startProvisioningPortal() {
   Serial.print(PORTAL_AP_NAME);
   Serial.println(F("\" (Open - No Password)"));
   Serial.println(F("[PORTAL]   Server URL      : http://192.168.4.1"));
+  Serial.println(F("[PORTAL]   Auto-Popup      : Enabled (Android / iOS / Windows / macOS CNA probes)"));
   Serial.println(F("[PORTAL]   Capabilities    : 2.4GHz Wi-Fi scan, credential entry, ROM NVS storage"));
   Serial.println(F("[PORTAL]   LCD Notice      : Strictly suppressed (displaying 'wifi connection error')"));
   Serial.println(F("================================================================================"));
@@ -1412,11 +1447,15 @@ void startProvisioningPortal() {
   showWiFiConnectionErrorLCD();
   wifiConnectionFailedReported = true;
 
+  // Set explicit AP static IP (192.168.4.1) so DHCP server hands out 192.168.4.1 as Gateway and DNS
+  wm.setAPStaticIPConfig(IPAddress(192, 168, 4, 1), IPAddress(192, 168, 4, 1), IPAddress(255, 255, 255, 0));
   wm.setConfigPortalBlocking(false); // Non-blocking!
   wm.setConfigPortalTimeout(0);      // Keep open until configured or Wi-Fi reconnects
   wm.setConnectTimeout(15);          // 15 seconds connection timeout
   wm.setTitle("ShelfSense Wi-Fi Setup");
   wm.setScanDispPerc(true);          // Display signal strength as percentage
+  wm.setCaptivePortalEnable(true);   // Ensure captive portal redirection is enabled
+  wm.setAPClientCheck(true);         // Keep portal active while clients are connected
 
   wm.setAPCallback([](WiFiManager* myWiFiManager) {
     Serial.println(F("[PORTAL]   SoftAP Mode Active!"));
@@ -1425,6 +1464,33 @@ void startProvisioningPortal() {
     Serial.print(F("[PORTAL]   SoftAP MAC: "));
     Serial.println(WiFi.softAPmacAddress());
     Serial.println(F("[PORTAL]   Webpage hosted for 2.4GHz Wi-Fi scanning & credential configuration."));
+    Serial.println(F("[PORTAL]   Auto-popup triggers active for Android, iOS, Windows, macOS CNA."));
+  });
+
+  wm.setWebServerCallback([]() {
+    Serial.println(F("[PORTAL]   Installing Captive Portal auto-popup endpoints..."));
+
+    // 1. Root redirect directly to /wifi (scan and password page)
+    wm.server->on("/", redirectToCaptivePortal);
+
+    // 2. Android / Google / ChromeOS captive detection URLs
+    wm.server->on("/generate_204", redirectToCaptivePortal);
+    wm.server->on("/gen_204", redirectToCaptivePortal);
+    wm.server->on("/check_network_status", redirectToCaptivePortal);
+
+    // 3. Apple iOS / macOS / iPadOS Captive Network Assistant (CNA) URLs
+    wm.server->on("/hotspot-detect.html", redirectToCaptivePortal);
+    wm.server->on("/canonical.html", redirectToCaptivePortal);
+    wm.server->on("/success.html", redirectToCaptivePortal);
+    wm.server->on("/library/test/success.html", redirectToCaptivePortal);
+
+    // 4. Windows / Microsoft NCSI captive detection URLs
+    wm.server->on("/connecttest.txt", redirectToCaptivePortal);
+    wm.server->on("/ncsi.txt", redirectToCaptivePortal);
+    wm.server->on("/redirect", redirectToCaptivePortal);
+
+    // 5. Firefox / Linux captive detection URL
+    wm.server->on("/success.txt", redirectToCaptivePortal);
   });
 
   wm.setSaveConfigCallback([]() {
@@ -4190,13 +4256,13 @@ void loop() {
 
   // Check if a new RFID card is present on the reader
   if (!mfrc522.PICC_IsNewCardPresent()) {
-    delay(50);
+    delay(captivePortalRunning ? 5 : 50);
     return;
   }
 
   // Read card serial number
   if (!mfrc522.PICC_ReadCardSerial()) {
-    delay(50);
+    delay(captivePortalRunning ? 5 : 50);
     return;
   }
 
