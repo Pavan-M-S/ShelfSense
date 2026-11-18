@@ -155,7 +155,8 @@ inline esp_err_t esp_task_wdt_init(uint32_t timeout_sec, bool panic) {
 // Wi-Fi Configuration
 #define WIFI_SSID           "narzo 50A"   // Default / fallback Wi-Fi SSID
 #define WIFI_PASSWORD       "MSPP9347"    // Default / fallback Wi-Fi password
-#define PORTAL_AP_NAME      "ShelfSense-Setup" // Captive Portal Hotspot SSID (Open AP)
+#define PORTAL_AP_NAME      "ShelfSense-Setup" // Captive Portal Hotspot SSID
+#define PORTAL_AP_PASSWORD  "ShelfAdmin123"    // Captive Portal Hotspot Password (WPA2)
 
 // Firebase & Google Cloud Firestore Configuration
 #define FIREBASE_PROJECT_ID           "shelf-sense-f86ba"
@@ -1774,7 +1775,7 @@ void startProvisioningPortal() {
   Serial.println(F("[PORTAL]   >>> STARTING WI-FI PROVISIONING CAPTIVE PORTAL <<<"));
   Serial.print(F("[PORTAL]   Hotspot AP SSID : \""));
   Serial.print(PORTAL_AP_NAME);
-  Serial.println(F("\" (Open - No Password)"));
+  Serial.println(F("\" (WPA2 Password Protected)"));
   Serial.println(F("[PORTAL]   Server URL      : http://192.168.4.1"));
   Serial.println(F("[PORTAL]   Auto-Popup      : Enabled (Android / iOS / Windows / macOS CNA probes)"));
   Serial.println(F("[PORTAL]   Capabilities    : 2.4GHz Wi-Fi scan, credential entry, ROM NVS storage"));
@@ -1849,7 +1850,7 @@ void startProvisioningPortal() {
     Serial.println(F("---------------------------------------------------"));
   });
 
-  wm.startConfigPortal(PORTAL_AP_NAME);
+  wm.startConfigPortal(PORTAL_AP_NAME, "ShelfAdmin123");
   captivePortalRunning = true;
 }
 
