@@ -212,6 +212,9 @@ QueueHandle_t commandLogQueue = NULL;
 TaskHandle_t firestoreTaskHandle = NULL;
 SemaphoreHandle_t nvsMutex = NULL; // FreeRTOS Thread-Safety Mutex on NVS (Preferences)
 
+// Cloud Update Notification Flag: set when roster or book catalog diff is detected from Firestore
+volatile bool cloudDataUpdated = false;
+
 // Post-Round Cloud Sync Flag: triggers immediate background roster sync after completing one book round
 volatile bool triggerPostRoundSync = false;
 
@@ -843,7 +846,9 @@ void firestoreSyncTask(void* pvParameters) {
           vTaskDelay(pdMS_TO_TICKS(500));
         }
         initialSyncDone = true;
-        if (!sDiff && !bDiff) {
+        if (sDiff || bDiff) {
+          cloudDataUpdated = true;
+        } else {
           Serial.println(F("[MANUAL-SYNC] Sync complete: Local ROM is fully up-to-date with Firestore."));
         }
         Serial.println(F("---------------------------------------------------"));
@@ -903,6 +908,9 @@ void firestoreSyncTask(void* pvParameters) {
           bool bookDiff = false;
           compareAndSyncBooks(false /* periodic */, bookDiff);
           vTaskDelay(pdMS_TO_TICKS(500));
+          if (studentDiff || bookDiff) {
+            cloudDataUpdated = true;
+          }
           Serial.println(F("---------------------------------------------------"));
         }
       }
@@ -921,6 +929,10 @@ void firestoreSyncTask(void* pvParameters) {
         bool bookDiff = false;
         compareAndSyncBooks(false /* periodic */, bookDiff);
         vTaskDelay(pdMS_TO_TICKS(500));
+
+        if (studentDiff || bookDiff) {
+          cloudDataUpdated = true;
+        }
       }
     }
 
@@ -4673,6 +4685,19 @@ void loop() {
     cleanSyncFinished = false;
   } else if (cleanSyncFailed) {
     cleanSyncFailed = false;
+  }
+
+  // Cloud update notification on LCD and Serial (hot-reload notice without ESP restart)
+  if (cloudDataUpdated && currentState == WAITING_FOR_STUDENT) {
+    cloudDataUpdated = false;
+    Serial.println(F("[SYSTEM]   Roster or Book catalog update detected in Firestore! Data updated in NVS (no reboot required)."));
+    showMessage(" Data Updated!  ", " Sync Complete! ");
+    delay(2000);
+    if (WiFi.status() != WL_CONNECTED && (captivePortalRunning || wifiConnectionFailedReported)) {
+      showWiFiConnectionErrorLCD();
+    } else {
+      showMessage("Please Tap Your ", "Student ID Card ");
+    }
   }
 
   // LCD Backlight Auto-Dim / Sleep Timer (5-minute inactivity in WAITING_FOR_STUDENT)
