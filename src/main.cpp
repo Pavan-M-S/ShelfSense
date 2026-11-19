@@ -1892,7 +1892,7 @@ void startProvisioningPortal() {
     Serial.println(F("---------------------------------------------------"));
   });
 
-  wm.startConfigPortal(PORTAL_AP_NAME, "ShelfAdmin123");
+  wm.startConfigPortal(PORTAL_AP_NAME, PORTAL_AP_PASSWORD);
   captivePortalRunning = true;
 }
 
