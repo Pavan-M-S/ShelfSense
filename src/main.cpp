@@ -206,13 +206,11 @@ bool wifiConnectionFailedReported = false;
 unsigned long wifiDisconnectedStartTime = 0;
 const unsigned long WIFI_DISCONNECT_GRACE_PERIOD_MS = 10000; // 10-second grace period before starting captive portal
 
-// FreeRTOS Queue & Task handles for background Firestore sync
+// FreeRTOS Queue, Task & Mutex handles for background Firestore sync & thread-safe NVS
 QueueHandle_t firestoreQueue = NULL;
 QueueHandle_t commandLogQueue = NULL;
 TaskHandle_t firestoreTaskHandle = NULL;
-
-// System Restart Flag for automatic restart when cloud roster diff is detected
-volatile bool pendingRestart = false;
+SemaphoreHandle_t nvsMutex = NULL; // FreeRTOS Thread-Safety Mutex on NVS (Preferences)
 
 // Post-Round Cloud Sync Flag: triggers immediate background roster sync after completing one book round
 volatile bool triggerPostRoundSync = false;
@@ -230,6 +228,12 @@ volatile bool cleanSyncFailed = false;
 // System REST mode flag: set via serial command 'clr'; pauses periodic auto-sync until 'upt', 'upts', 'uptb', 'clrupt' etc. is executed
 volatile bool systemRestMode = false;
 
+// LCD Backlight Auto-Dim / Sleep Timer (5-minute inactivity in WAITING_FOR_STUDENT)
+#define LCD_BACKLIGHT_TIMEOUT_MS  300000  // 5-minute inactivity timer (300,000 ms)
+unsigned long lastUserActivityTime = 0;
+bool lcdBacklightOn = true;
+void wakeLcdBacklight();
+
 // =========================================================================================
 // SECTION 3: SYSTEM STATES & IN-MEMORY DATABASES
 // =========================================================================================
@@ -240,8 +244,8 @@ enum SystemState {
   WAITING_FOR_BOOK      // Authenticated state: Waiting for book tag to be scanned
 };
 
-// Variable holding the current system state
-SystemState currentState = WAITING_FOR_STUDENT;
+// Variable holding the current system state (cross-core shared, marked volatile)
+volatile SystemState currentState = WAITING_FOR_STUDENT;
 
 // Session timer tracking (inactivity detection in WAITING_FOR_BOOK)
 unsigned long sessionStartTime = 0;
@@ -363,6 +367,7 @@ void logError(const char* message) {
 
 // Log state machine transitions
 void logStateTransition(SystemState fromState, SystemState toState) {
+  wakeLcdBacklight();
   Serial.print(F("[STATE]    Transition: "));
   Serial.print(getStateName(fromState));
   Serial.print(F(" -> "));
@@ -484,6 +489,7 @@ enum BookAuthStatus {
 };
 
 // Forward declarations for offline caching & roster/catalog synchronization
+void wakeLcdBacklight();
 bool saveOfflineLogToROM(const FirestoreLogEvent& event);
 void flushOfflineLogsFromROM();
 bool compareAndSyncRoster(bool isBoot, bool &outDiffDetected);
@@ -537,6 +543,7 @@ const uint16_t MAX_OFFLINE_LOGS = 20;
 
 // Temporarily stores an unsent Firestore log event in ROM if Wi-Fi drops or upload fails
 bool saveOfflineLogToROM(const FirestoreLogEvent& event) {
+  xSemaphoreTake(nvsMutex, portMAX_DELAY);
   uint16_t count = offlineLogsPrefs.getUShort("count", 0);
   if (count >= MAX_OFFLINE_LOGS) {
     Serial.println(F("[OFFLINE-ROM] Warning: ROM offline log buffer full. Overwriting oldest log."));
@@ -553,8 +560,14 @@ bool saveOfflineLogToROM(const FirestoreLogEvent& event) {
 
   String key = "l_" + String(count);
   size_t written = offlineLogsPrefs.putBytes(key.c_str(), &event, sizeof(FirestoreLogEvent));
+  bool success = false;
   if (written == sizeof(FirestoreLogEvent)) {
     offlineLogsPrefs.putUShort("count", count + 1);
+    success = true;
+  }
+  xSemaphoreGive(nvsMutex);
+
+  if (success) {
     Serial.print(F("[OFFLINE-ROM] Event cached in ROM (Pending offline logs: "));
     Serial.print(count + 1);
     Serial.print(F("). Doc ID: '"));
@@ -572,7 +585,9 @@ void flushOfflineLogsFromROM() {
     return;
   }
 
+  xSemaphoreTake(nvsMutex, portMAX_DELAY);
   uint16_t count = offlineLogsPrefs.getUShort("count", 0);
+  xSemaphoreGive(nvsMutex);
   if (count == 0) {
     return;
   }
@@ -592,12 +607,17 @@ void flushOfflineLogsFromROM() {
 
     String key = "l_" + String(i);
     FirestoreLogEvent offEvent;
+    xSemaphoreTake(nvsMutex, portMAX_DELAY);
     size_t readLen = offlineLogsPrefs.getBytes(key.c_str(), &offEvent, sizeof(offEvent));
+    xSemaphoreGive(nvsMutex);
+
     if (readLen != sizeof(offEvent)) {
       Serial.print(F("[OFFLINE-ROM] Invalid ROM entry at index "));
       Serial.print(i);
       Serial.println(F(". Removing."));
+      xSemaphoreTake(nvsMutex, portMAX_DELAY);
       offlineLogsPrefs.remove(key.c_str());
+      xSemaphoreGive(nvsMutex);
       syncedCount++;
       continue;
     }
@@ -626,7 +646,9 @@ void flushOfflineLogsFromROM() {
       Serial.print(F("[OFFLINE-ROM] Document sync SUCCESS! Doc ID: '"));
       Serial.print(offEvent.docId);
       Serial.println(F("'. Deleted from ROM."));
+      xSemaphoreTake(nvsMutex, portMAX_DELAY);
       offlineLogsPrefs.remove(key.c_str());
+      xSemaphoreGive(nvsMutex);
       syncedCount++;
     } else {
       Serial.print(F("[OFFLINE-ROM] Document sync FAILED! HTTP: "));
@@ -642,6 +664,7 @@ void flushOfflineLogsFromROM() {
 
   if (syncedCount > 0) {
     uint16_t remaining = (count >= syncedCount) ? (count - syncedCount) : 0;
+    xSemaphoreTake(nvsMutex, portMAX_DELAY);
     if (remaining > 0) {
       for (uint16_t i = 0; i < remaining; i++) {
         String srcKey = "l_" + String(i + syncedCount);
@@ -654,6 +677,7 @@ void flushOfflineLogsFromROM() {
       }
     }
     offlineLogsPrefs.putUShort("count", remaining);
+    xSemaphoreGive(nvsMutex);
     Serial.print(F("[OFFLINE-ROM] Flush progress: "));
     Serial.print(syncedCount);
     Serial.print(F(" synced, "));
@@ -819,9 +843,7 @@ void firestoreSyncTask(void* pvParameters) {
           vTaskDelay(pdMS_TO_TICKS(500));
         }
         initialSyncDone = true;
-        if (sDiff || bDiff) {
-          pendingRestart = true;
-        } else {
+        if (!sDiff && !bDiff) {
           Serial.println(F("[MANUAL-SYNC] Sync complete: Local ROM is fully up-to-date with Firestore."));
         }
         Serial.println(F("---------------------------------------------------"));
@@ -881,9 +903,6 @@ void firestoreSyncTask(void* pvParameters) {
           bool bookDiff = false;
           compareAndSyncBooks(false /* periodic */, bookDiff);
           vTaskDelay(pdMS_TO_TICKS(500));
-          if (studentDiff || bookDiff) {
-            pendingRestart = true;
-          }
           Serial.println(F("---------------------------------------------------"));
         }
       }
@@ -902,10 +921,6 @@ void firestoreSyncTask(void* pvParameters) {
         bool bookDiff = false;
         compareAndSyncBooks(false /* periodic */, bookDiff);
         vTaskDelay(pdMS_TO_TICKS(500));
-
-        if (studentDiff || bookDiff) {
-          pendingRestart = true;
-        }
       }
     }
 
@@ -1119,8 +1134,18 @@ void onWiFiEvent(WiFiEvent_t event) {
 // SECTION 7: HARDWARE FEEDBACK & LCD DISPLAY HELPERS
 // =========================================================================================
 
+// Wakes LCD backlight and resets the 5-minute user activity sleep timer
+void wakeLcdBacklight() {
+  lastUserActivityTime = millis();
+  if (!lcdBacklightOn) {
+    lcd.backlight();
+    lcdBacklightOn = true;
+  }
+}
+
 // Displays a message on the LCD and mirrors it to the Serial Monitor
 void showMessage(const char* line1, const char* line2 = "") {
+  wakeLcdBacklight();
   lcd.clear();
   lcd.setCursor(0, 0);
 
@@ -1147,6 +1172,7 @@ void showMessage(const char* line1, const char* line2 = "") {
 
 // Scrolls line 1 smoothly from right to left so that the ENTIRE text is visible, regardless of length
 void showMessageWithScroll(const char* line1, const char* line2 = "", int defaultSpeedMs = 180, int staticDurationMs = 2500) {
+  wakeLcdBacklight();
   Serial.print(F("[LCD]      Line 1: \""));
   Serial.print(line1);
   Serial.print(F("\""));
@@ -1294,6 +1320,7 @@ void holdLocationWait(const char* locationLine) {
 // 5. Once scrolling completes, holds display for 8 seconds (0-4s solid Green, 4-8s prompt scroll).
 // 6. 3-second warning phase: 3 medium beeps + simultaneous Green LED flashes with "Session Ending..".
 void displayBookLocationSequence(const char* title, uint8_t shelf, uint8_t rack) {
+  wakeLcdBacklight();
   char locationLine[32];
   snprintf(locationLine, sizeof(locationLine), "Shelf:%u  Rack:%u", (unsigned int)shelf, (unsigned int)rack);
 
@@ -1388,6 +1415,7 @@ void displayBookLocationSequence(const char* title, uint8_t shelf, uint8_t rack)
 
 // Displays strict single-line Wi-Fi error on LCD as required (suppressing all portal/IP/SSID info)
 void showWiFiConnectionErrorLCD() {
+  wakeLcdBacklight();
   lcd.clear();
   lcd.setCursor(0, 0);
   lcd.print("wifi connection ");
@@ -1843,8 +1871,10 @@ void startProvisioningPortal() {
     Serial.println(F("\""));
 
     // Save permanently to persistent ROM (NVS)
+    xSemaphoreTake(nvsMutex, portMAX_DELAY);
     wifiPrefs.putString("ssid", newSSID);
     wifiPrefs.putString("pass", newPass);
+    xSemaphoreGive(nvsMutex);
     Serial.println(F("[NVS]      Saved new Wi-Fi credentials to persistent ROM (namespace 'wifi_cred')"));
     Serial.println(F("[WIFI]     ESP32 attempting connection to new network..."));
     Serial.println(F("---------------------------------------------------"));
@@ -1872,8 +1902,10 @@ void initWiFiConnection() {
   WiFi.setSleep(false);
   WiFi.setAutoReconnect(true);
 
+  xSemaphoreTake(nvsMutex, portMAX_DELAY);
   String provSSID = wifiPrefs.getString("ssid", "");
   String provPass = wifiPrefs.getString("pass", "");
+  xSemaphoreGive(nvsMutex);
 
   bool connected = false;
 
@@ -2133,12 +2165,19 @@ bool getStudentFromROM(const char* uid, StudentRecord& outRecord) {
   cleanUID.trim();
   cleanUID.toUpperCase();
 
-  if (!studentPrefs.isKey(cleanUID.c_str())) {
+  String val = "";
+  bool found = false;
+
+  xSemaphoreTake(nvsMutex, portMAX_DELAY);
+  if (studentPrefs.isKey(cleanUID.c_str())) {
+    val = studentPrefs.getString(cleanUID.c_str(), "");
+    found = (val.length() > 0);
+  }
+  xSemaphoreGive(nvsMutex);
+
+  if (!found) {
     return false;
   }
-
-  String val = studentPrefs.getString(cleanUID.c_str(), "");
-  if (val.length() == 0) return false;
 
   int sep = val.indexOf('|');
   if (sep >= 0) {
@@ -2165,6 +2204,8 @@ void saveStudentToROM(const char* uid, const char* name, bool active) {
   cleanUID.toUpperCase();
 
   String val = String(name) + "|" + (active ? "1" : "0");
+
+  xSemaphoreTake(nvsMutex, portMAX_DELAY);
   studentPrefs.putString(cleanUID.c_str(), val);
 
   // Maintain UID in __uids__ list
@@ -2187,6 +2228,7 @@ void saveStudentToROM(const char* uid, const char* name, bool active) {
     uids += cleanUID;
     studentPrefs.putString("__uids__", uids);
   }
+  xSemaphoreGive(nvsMutex);
 }
 
 // Removes a student from persistent ROM (NVS)
@@ -2196,6 +2238,7 @@ void removeStudentFromROM(const char* uid) {
   cleanUID.trim();
   cleanUID.toUpperCase();
 
+  xSemaphoreTake(nvsMutex, portMAX_DELAY);
   studentPrefs.remove(cleanUID.c_str());
 
   String uids = studentPrefs.getString("__uids__", "");
@@ -2215,12 +2258,15 @@ void removeStudentFromROM(const char* uid) {
     }
     studentPrefs.putString("__uids__", newUids);
   }
+  xSemaphoreGive(nvsMutex);
 }
 
 // Reads all student UIDs currently indexed in persistent ROM (NVS)
 std::vector<String> getAllROMUIDs() {
   std::vector<String> list;
+  xSemaphoreTake(nvsMutex, portMAX_DELAY);
   String uids = studentPrefs.getString("__uids__", "");
+  xSemaphoreGive(nvsMutex);
   int start = 0;
   while (start < uids.length()) {
     int comma = uids.indexOf(',', start);
@@ -2242,44 +2288,51 @@ bool getBookFromROM(const char* uid, BookRecord& outRecord) {
   cleanUID.trim();
   cleanUID.toUpperCase();
 
+  String val = "";
+  bool foundInNVS = false;
+
+  xSemaphoreTake(nvsMutex, portMAX_DELAY);
   if (bookPrefs.isKey(cleanUID.c_str())) {
-    String val = bookPrefs.getString(cleanUID.c_str(), "");
-    if (val.length() > 0) {
-      // Parse format: title|shelf|rack|active from right to left
-      int p3 = val.lastIndexOf('|');
-      if (p3 >= 0) {
-        String actStr = val.substring(p3 + 1);
-        actStr.trim();
-        outRecord.active = (actStr == "1" || actStr == "true");
+    val = bookPrefs.getString(cleanUID.c_str(), "");
+    foundInNVS = (val.length() > 0);
+  }
+  xSemaphoreGive(nvsMutex);
 
-        int p2 = val.lastIndexOf('|', p3 - 1);
-        if (p2 >= 0) {
-          String rackStr = val.substring(p2 + 1, p3);
-          rackStr.trim();
-          outRecord.rack = (uint8_t)rackStr.toInt();
+  if (foundInNVS) {
+    // Parse format: title|shelf|rack|active from right to left
+    int p3 = val.lastIndexOf('|');
+    if (p3 >= 0) {
+      String actStr = val.substring(p3 + 1);
+      actStr.trim();
+      outRecord.active = (actStr == "1" || actStr == "true");
 
-          int p1 = val.lastIndexOf('|', p2 - 1);
-          if (p1 >= 0) {
-            String shelfStr = val.substring(p1 + 1, p2);
-            shelfStr.trim();
-            outRecord.shelf = (uint8_t)shelfStr.toInt();
+      int p2 = val.lastIndexOf('|', p3 - 1);
+      if (p2 >= 0) {
+        String rackStr = val.substring(p2 + 1, p3);
+        rackStr.trim();
+        outRecord.rack = (uint8_t)rackStr.toInt();
 
-            String titleStr = val.substring(0, p1);
-            titleStr.trim();
-            strncpy(outRecord.title, titleStr.c_str(), sizeof(outRecord.title) - 1);
-            outRecord.title[sizeof(outRecord.title) - 1] = '\0';
-            return true;
-          }
+        int p1 = val.lastIndexOf('|', p2 - 1);
+        if (p1 >= 0) {
+          String shelfStr = val.substring(p1 + 1, p2);
+          shelfStr.trim();
+          outRecord.shelf = (uint8_t)shelfStr.toInt();
+
+          String titleStr = val.substring(0, p1);
+          titleStr.trim();
+          strncpy(outRecord.title, titleStr.c_str(), sizeof(outRecord.title) - 1);
+          outRecord.title[sizeof(outRecord.title) - 1] = '\0';
+          return true;
         }
       }
-      // Fallback if unexpected format
-      strncpy(outRecord.title, val.c_str(), sizeof(outRecord.title) - 1);
-      outRecord.title[sizeof(outRecord.title) - 1] = '\0';
-      outRecord.shelf = 1;
-      outRecord.rack = 1;
-      outRecord.active = true;
-      return true;
     }
+    // Fallback if unexpected format
+    strncpy(outRecord.title, val.c_str(), sizeof(outRecord.title) - 1);
+    outRecord.title[sizeof(outRecord.title) - 1] = '\0';
+    outRecord.shelf = 1;
+    outRecord.rack = 1;
+    outRecord.active = true;
+    return true;
   }
 
   // Fallback to static registeredBooks array if not in REST mode and not found in bookPrefs
@@ -2307,6 +2360,8 @@ void saveBookToROM(const char* uid, const char* title, uint8_t shelf, uint8_t ra
   cleanUID.toUpperCase();
 
   String val = String(title) + "|" + String(shelf) + "|" + String(rack) + "|" + (active ? "1" : "0");
+
+  xSemaphoreTake(nvsMutex, portMAX_DELAY);
   bookPrefs.putString(cleanUID.c_str(), val);
 
   // Maintain UID in __uids__ list
@@ -2329,6 +2384,7 @@ void saveBookToROM(const char* uid, const char* title, uint8_t shelf, uint8_t ra
     uids += cleanUID;
     bookPrefs.putString("__uids__", uids);
   }
+  xSemaphoreGive(nvsMutex);
 }
 
 // Removes a book from persistent ROM (NVS)
@@ -2338,6 +2394,7 @@ void removeBookFromROM(const char* uid) {
   cleanUID.trim();
   cleanUID.toUpperCase();
 
+  xSemaphoreTake(nvsMutex, portMAX_DELAY);
   bookPrefs.remove(cleanUID.c_str());
 
   String uids = bookPrefs.getString("__uids__", "");
@@ -2357,12 +2414,15 @@ void removeBookFromROM(const char* uid) {
     }
     bookPrefs.putString("__uids__", newUids);
   }
+  xSemaphoreGive(nvsMutex);
 }
 
 // Reads all book UIDs currently indexed in persistent ROM (NVS)
 std::vector<String> getAllROMBookUIDs() {
   std::vector<String> list;
+  xSemaphoreTake(nvsMutex, portMAX_DELAY);
   String uids = bookPrefs.getString("__uids__", "");
+  xSemaphoreGive(nvsMutex);
   int start = 0;
   while (start < uids.length()) {
     int comma = uids.indexOf(',', start);
@@ -2575,7 +2635,9 @@ void dumpAllROMData() {
   Serial.println(F("---------------------------------------------------"));
 
   // 3. Offline Logs Buffer ("off_logs" namespace)
+  xSemaphoreTake(nvsMutex, portMAX_DELAY);
   uint16_t offCount = offlineLogsPrefs.getUShort("count", 0);
+  xSemaphoreGive(nvsMutex);
   Serial.print(F("[ROM-OFFLINE-LOGS] Total Buffered Offline Logs: "));
   Serial.println(offCount);
   if (offCount == 0) {
@@ -2584,7 +2646,9 @@ void dumpAllROMData() {
     for (uint16_t i = 0; i < offCount; i++) {
       String key = "l_" + String(i);
       FirestoreLogEvent offEvent;
+      xSemaphoreTake(nvsMutex, portMAX_DELAY);
       size_t readLen = offlineLogsPrefs.getBytes(key.c_str(), &offEvent, sizeof(offEvent));
+      xSemaphoreGive(nvsMutex);
       if (readLen == sizeof(offEvent)) {
         Serial.print(F("  [Log #"));
         Serial.print(i + 1);
@@ -2629,7 +2693,9 @@ void dumpAllROMData() {
 
 // Erases student records from persistent ROM (leaves books and offline logs intact)
 void clearStudentROMData() {
+  xSemaphoreTake(nvsMutex, portMAX_DELAY);
   studentPrefs.clear();
+  xSemaphoreGive(nvsMutex);
   activeStudentName[0] = '\0';
   activeStudentUID[0]  = '\0';
   activeLoginTime[0]   = '\0';
@@ -2648,7 +2714,9 @@ void clearStudentROMData() {
 
 // Erases book records from persistent ROM (leaves students and offline logs intact)
 void clearBookROMData() {
+  xSemaphoreTake(nvsMutex, portMAX_DELAY);
   bookPrefs.clear();
+  xSemaphoreGive(nvsMutex);
   sessionStartTime = 0;
   currentState = WAITING_FOR_STUDENT;
 
@@ -2666,9 +2734,11 @@ void clearBookROMData() {
 // Zero LCD disruption: runs entirely in the background and logs to Serial only
 void clearAllROMData() {
   systemRestMode = true;
+  xSemaphoreTake(nvsMutex, portMAX_DELAY);
   studentPrefs.clear();
   bookPrefs.clear();
   offlineLogsPrefs.clear();
+  xSemaphoreGive(nvsMutex);
   // Clear in-memory session credentials without disturbing the LCD display
   activeStudentName[0] = '\0';
   activeStudentUID[0]  = '\0';
@@ -2697,7 +2767,9 @@ void executeCleanResetAndSyncStudents() {
   Serial.println();
   Serial.println(F("==================================================="));
   Serial.println(F("[CLRUPTS]   Executing background student erase and fresh Firestore sync..."));
+  xSemaphoreTake(nvsMutex, portMAX_DELAY);
   studentPrefs.clear();
+  xSemaphoreGive(nvsMutex);
   activeStudentName[0] = '\0';
   activeStudentUID[0]  = '\0';
   activeLoginTime[0]   = '\0';
@@ -2716,7 +2788,9 @@ void executeCleanResetAndSyncBooks() {
   Serial.println();
   Serial.println(F("==================================================="));
   Serial.println(F("[CLRUPTB]   Executing background book erase and fresh Firestore sync..."));
+  xSemaphoreTake(nvsMutex, portMAX_DELAY);
   bookPrefs.clear();
+  xSemaphoreGive(nvsMutex);
   sessionStartTime = 0;
   currentState = WAITING_FOR_STUDENT;
 
@@ -2733,9 +2807,11 @@ void executeCleanResetAndSync() {
   Serial.println();
   Serial.println(F("==================================================="));
   Serial.println(F("[CLRUPT]    Executing background ROM erase and fresh Firestore sync (students & books)..."));
+  xSemaphoreTake(nvsMutex, portMAX_DELAY);
   studentPrefs.clear();
   bookPrefs.clear();
   offlineLogsPrefs.clear();
+  xSemaphoreGive(nvsMutex);
   // Clear in-memory session credentials without disturbing the LCD display
   activeStudentName[0] = '\0';
   activeStudentUID[0]  = '\0';
@@ -2786,7 +2862,9 @@ String captureDetailedStateSummary() {
     }
   }
 
+  xSemaphoreTake(nvsMutex, portMAX_DELAY);
   uint16_t offCount = offlineLogsPrefs.getUShort("count", 0);
+  xSemaphoreGive(nvsMutex);
   out += " | Offline Logs: " + String(offCount);
   out += " | Free Heap: " + String(ESP.getFreeHeap()) + " B";
   out += " | Mode: " + String(systemRestMode ? "REST_MODE" : "NORMAL_STANDBY");
@@ -3191,7 +3269,9 @@ void dumpTaskManagerAll() {
   }
 
   // 3. Offline Logs Buffer in ROM
+  xSemaphoreTake(nvsMutex, portMAX_DELAY);
   uint16_t offCount = offlineLogsPrefs.getUShort("count", 0);
+  xSemaphoreGive(nvsMutex);
   Serial.print(F("    ► Persistent 'off_logs' Namespace: Total Buffered Offline Logs: "));
   Serial.println(offCount);
   if (offCount == 0) {
@@ -3200,7 +3280,9 @@ void dumpTaskManagerAll() {
     for (uint16_t i = 0; i < offCount; i++) {
       String key = "l_" + String(i);
       FirestoreLogEvent offEvent;
+      xSemaphoreTake(nvsMutex, portMAX_DELAY);
       size_t readLen = offlineLogsPrefs.getBytes(key.c_str(), &offEvent, sizeof(offEvent));
+      xSemaphoreGive(nvsMutex);
       if (readLen == sizeof(offEvent)) {
         Serial.print(F("        [Log #")); Serial.print(i + 1);
         Serial.print(F("] Doc ID: '")); Serial.print(offEvent.docId);
@@ -3216,7 +3298,9 @@ void dumpTaskManagerAll() {
   }
 
   // 4. Provisioned Wi-Fi Credentials in ROM
+  xSemaphoreTake(nvsMutex, portMAX_DELAY);
   String provSSID = wifiPrefs.getString("ssid", "");
+  xSemaphoreGive(nvsMutex);
   Serial.print(F("    ► Persistent 'wifi_cred' Namespace: Provisioned SSID: "));
   if (provSSID.length() > 0) {
     Serial.print(F("\""));
@@ -3261,99 +3345,121 @@ bool compareAndSyncRoster(bool isBoot, bool &outDiffDetected) {
     }
   }
 
-  // 2. Fetch Firestore student_names collection on Core 0
-  Serial.println(F("[AUTH-SYNC] Sending GET collection request to Firestore..."));
-  bool getOk = Firebase.Firestore.getDocuments(&fbdo, FIREBASE_PROJECT_ID, "(default)", FIRESTORE_STUDENTS);
-  int httpCode = fbdo.httpCode();
-  String payload = "";
-  String errorReason = "";
-
-  if (getOk && httpCode == 200) {
-    payload = fbdo.payload();
-    Serial.print(F("[AUTH-SYNC] Received collection response (HTTP 200). Size: "));
-    Serial.print(payload.length());
-    Serial.println(F(" bytes. Comparing with ROM cache..."));
-  } else {
-    errorReason = fbdo.errorReason();
-    Serial.print(F("[AUTH-SYNC] Failed to fetch documents from Firestore. HTTP: "));
-    Serial.print(httpCode);
-    Serial.print(F(" | Error: "));
-    Serial.println(errorReason);
-    fbdo.clear();
-    vTaskDelay(pdMS_TO_TICKS(1000));
-    return false;
-  }
-
-  FirebaseJson json;
-  json.setJsonData(payload);
-  FirebaseJsonData docsData;
-  json.get(docsData, "documents");
-
+  // 2. Fetch Firestore student_names collection on Core 0 with pagination support
   std::vector<RosterEntry> cloudList;
-  if (docsData.success && docsData.type == "array") {
-    FirebaseJsonArray arr;
-    docsData.getArray(arr);
-    size_t numDocs = arr.size();
+  String pageToken = "";
+  bool fetchFailed = false;
 
-    for (size_t i = 0; i < numDocs; i++) {
-      FirebaseJsonData itemData;
-      arr.get(itemData, i);
-      if (itemData.success) {
-        FirebaseJson docJson;
-        itemData.getJSON(docJson);
+  do {
+    Serial.println(F("[AUTH-SYNC] Sending GET collection request to Firestore..."));
+    bool getOk = Firebase.Firestore.listDocuments(&fbdo, FIREBASE_PROJECT_ID, "(default)", FIRESTORE_STUDENTS, 100, pageToken, "", "", false);
+    int httpCode = fbdo.httpCode();
+    String payload = "";
+    String errorReason = "";
 
-        FirebaseJsonData resNameData, nameData;
-        docJson.get(resNameData, "name");
-        docJson.get(nameData, "fields/name/stringValue");
+    if (getOk && httpCode == 200) {
+      payload = fbdo.payload();
+      Serial.print(F("[AUTH-SYNC] Received collection response (HTTP 200). Size: "));
+      Serial.print(payload.length());
+      Serial.println(F(" bytes. Parsing page data..."));
+    } else {
+      errorReason = fbdo.errorReason();
+      Serial.print(F("[AUTH-SYNC] Failed to fetch documents from Firestore. HTTP: "));
+      Serial.print(httpCode);
+      Serial.print(F(" | Error: "));
+      Serial.println(errorReason);
+      fbdo.clear();
+      vTaskDelay(pdMS_TO_TICKS(1000));
+      fetchFailed = true;
+      break;
+    }
 
-        // Parse active status supporting booleanValue, stringValue ("true"/"false"), integerValue (1/0), and raw active object
-        bool isActive = true;
-        FirebaseJsonData bVal, sVal, iVal, rawActive;
-        if (docJson.get(bVal, "fields/active/booleanValue") && bVal.success) {
-          String bStr = bVal.stringValue;
-          bStr.trim();
-          bStr.toLowerCase();
-          if (bStr == "false" || bStr == "0") {
-            isActive = false;
-          } else {
-            isActive = bVal.boolValue;
+    FirebaseJson json;
+    json.setJsonData(payload);
+    fbdo.clear();
+    payload = "";
+
+    // Extract nextPageToken if present
+    FirebaseJsonData nextTokenData;
+    if (json.get(nextTokenData, "nextPageToken") && nextTokenData.success) {
+      pageToken = nextTokenData.stringValue;
+      pageToken.trim();
+    } else {
+      pageToken = "";
+    }
+
+    FirebaseJsonData docsData;
+    json.get(docsData, "documents");
+
+    if (docsData.success && docsData.type == "array") {
+      FirebaseJsonArray arr;
+      docsData.getArray(arr);
+      size_t numDocs = arr.size();
+
+      for (size_t i = 0; i < numDocs; i++) {
+        FirebaseJsonData itemData;
+        arr.get(itemData, i);
+        if (itemData.success) {
+          FirebaseJson docJson;
+          itemData.getJSON(docJson);
+
+          FirebaseJsonData resNameData, nameData;
+          docJson.get(resNameData, "name");
+          docJson.get(nameData, "fields/name/stringValue");
+
+          // Parse active status supporting booleanValue, stringValue ("true"/"false"), integerValue (1/0), and raw active object
+          bool isActive = true;
+          FirebaseJsonData bVal, sVal, iVal, rawActive;
+          if (docJson.get(bVal, "fields/active/booleanValue") && bVal.success) {
+            String bStr = bVal.stringValue;
+            bStr.trim();
+            bStr.toLowerCase();
+            if (bStr == "false" || bStr == "0") {
+              isActive = false;
+            } else {
+              isActive = bVal.boolValue;
+            }
+          } else if (docJson.get(sVal, "fields/active/stringValue") && sVal.success) {
+            String s = sVal.stringValue;
+            s.trim();
+            s.toLowerCase();
+            isActive = (s == "true" || s == "1");
+          } else if (docJson.get(iVal, "fields/active/integerValue") && iVal.success) {
+            isActive = (iVal.intValue != 0);
+          } else if (docJson.get(rawActive, "fields/active") && rawActive.success) {
+            String raw = rawActive.stringValue;
+            raw.trim();
+            raw.toLowerCase();
+            if (raw == "false" || raw == "0" || raw.indexOf("false") >= 0) {
+              isActive = false;
+            }
           }
-        } else if (docJson.get(sVal, "fields/active/stringValue") && sVal.success) {
-          String s = sVal.stringValue;
-          s.trim();
-          s.toLowerCase();
-          isActive = (s == "true" || s == "1");
-        } else if (docJson.get(iVal, "fields/active/integerValue") && iVal.success) {
-          isActive = (iVal.intValue != 0);
-        } else if (docJson.get(rawActive, "fields/active") && rawActive.success) {
-          String raw = rawActive.stringValue;
-          raw.trim();
-          raw.toLowerCase();
-          if (raw == "false" || raw == "0" || raw.indexOf("false") >= 0) {
-            isActive = false;
-          }
-        }
 
-        if (resNameData.success && nameData.success) {
-          String fullPath = resNameData.stringValue;
-          int lastSlash = fullPath.lastIndexOf('/');
-          String uid = (lastSlash >= 0) ? fullPath.substring(lastSlash + 1) : fullPath;
-          uid.trim();
-          uid.toUpperCase();
+          if (resNameData.success && nameData.success) {
+            String fullPath = resNameData.stringValue;
+            int lastSlash = fullPath.lastIndexOf('/');
+            String uid = (lastSlash >= 0) ? fullPath.substring(lastSlash + 1) : fullPath;
+            uid.trim();
+            uid.toUpperCase();
 
-          String studentName = nameData.stringValue;
-          studentName.trim();
+            String studentName = nameData.stringValue;
+            studentName.trim();
 
-          if (uid.length() > 0 && studentName.length() > 0) {
-            RosterEntry e;
-            e.uid = uid;
-            e.name = studentName;
-            e.active = isActive;
-            cloudList.push_back(e);
+            if (uid.length() > 0 && studentName.length() > 0) {
+              RosterEntry e;
+              e.uid = uid;
+              e.name = studentName;
+              e.active = isActive;
+              cloudList.push_back(e);
+            }
           }
         }
       }
     }
+  } while (pageToken.length() > 0);
+
+  if (fetchFailed) {
+    return false;
   }
 
   // 3. Compare romList with cloudList
@@ -3406,6 +3512,7 @@ bool compareAndSyncRoster(bool isBoot, bool &outDiffDetected) {
 
   if (diff) {
     Serial.println(F("[AUTH-SYNC] Updating ROM cache with fresh Firestore roster..."));
+    xSemaphoreTake(nvsMutex, portMAX_DELAY);
     studentPrefs.clear();
     String newUids = "";
     for (size_t i = 0; i < cloudList.size(); i++) {
@@ -3422,12 +3529,13 @@ bool compareAndSyncRoster(bool isBoot, bool &outDiffDetected) {
       Serial.println(F("]"));
     }
     studentPrefs.putString("__uids__", newUids);
+    xSemaphoreGive(nvsMutex);
     Serial.print(F("[AUTH-SYNC] ROM update complete. Total students cached: "));
     Serial.println(cloudList.size());
 
     if (!isBoot) {
       outDiffDetected = true;
-      Serial.println(F("[AUTH-SYNC] Differences detected! Roster updated. Scheduling restart countdown..."));
+      Serial.println(F("[AUTH-SYNC] Roster hot-reloaded in NVS (no reboot required)."));
     }
   } else {
     Serial.println(F("[AUTH-SYNC] Periodic 20s check: ROM cache and Firestore match perfectly. No changes."));
@@ -3475,127 +3583,149 @@ bool compareAndSyncBooks(bool isBoot, bool &outDiffDetected) {
     }
   }
 
-  // 2. Fetch Firestore book_names collection on Core 0
-  Serial.println(F("[BOOK-SYNC] Sending GET collection request to Firestore (book_names)..."));
-  bool getOk = Firebase.Firestore.getDocuments(&fbdo, FIREBASE_PROJECT_ID, "(default)", FIRESTORE_BOOKS);
-  int httpCode = fbdo.httpCode();
-  String payload = "";
-  String errorReason = "";
-
-  if (getOk && httpCode == 200) {
-    payload = fbdo.payload();
-    Serial.print(F("[BOOK-SYNC] Received collection response (HTTP 200). Size: "));
-    Serial.print(payload.length());
-    Serial.println(F(" bytes. Comparing with ROM cache..."));
-  } else {
-    errorReason = fbdo.errorReason();
-    Serial.print(F("[BOOK-SYNC] Failed to fetch documents from Firestore. HTTP: "));
-    Serial.print(httpCode);
-    Serial.print(F(" | Error: "));
-    Serial.println(errorReason);
-    fbdo.clear();
-    vTaskDelay(pdMS_TO_TICKS(1000));
-    return false;
-  }
-
-  FirebaseJson json;
-  json.setJsonData(payload);
-  FirebaseJsonData docsData;
-  json.get(docsData, "documents");
-
+  // 2. Fetch Firestore book_names collection on Core 0 with pagination support
   std::vector<BookEntry> cloudList;
-  if (docsData.success && docsData.type == "array") {
-    FirebaseJsonArray arr;
-    docsData.getArray(arr);
-    size_t numDocs = arr.size();
+  String pageToken = "";
+  bool fetchFailed = false;
 
-    for (size_t i = 0; i < numDocs; i++) {
-      FirebaseJsonData itemData;
-      arr.get(itemData, i);
-      if (itemData.success) {
-        FirebaseJson docJson;
-        itemData.getJSON(docJson);
+  do {
+    Serial.println(F("[BOOK-SYNC] Sending GET collection request to Firestore (book_names)..."));
+    bool getOk = Firebase.Firestore.listDocuments(&fbdo, FIREBASE_PROJECT_ID, "(default)", FIRESTORE_BOOKS, 100, pageToken, "", "", false);
+    int httpCode = fbdo.httpCode();
+    String payload = "";
+    String errorReason = "";
 
-        FirebaseJsonData resNameData, titleData, nameData;
-        docJson.get(resNameData, "name");
+    if (getOk && httpCode == 200) {
+      payload = fbdo.payload();
+      Serial.print(F("[BOOK-SYNC] Received collection response (HTTP 200). Size: "));
+      Serial.print(payload.length());
+      Serial.println(F(" bytes. Parsing page data..."));
+    } else {
+      errorReason = fbdo.errorReason();
+      Serial.print(F("[BOOK-SYNC] Failed to fetch documents from Firestore. HTTP: "));
+      Serial.print(httpCode);
+      Serial.print(F(" | Error: "));
+      Serial.println(errorReason);
+      fbdo.clear();
+      vTaskDelay(pdMS_TO_TICKS(1000));
+      fetchFailed = true;
+      break;
+    }
 
-        String bookTitle = "";
-        if (docJson.get(titleData, "fields/title/stringValue") && titleData.success) {
-          bookTitle = titleData.stringValue;
-        } else if (docJson.get(nameData, "fields/name/stringValue") && nameData.success) {
-          bookTitle = nameData.stringValue;
-        }
-        bookTitle.trim();
+    FirebaseJson json;
+    json.setJsonData(payload);
+    fbdo.clear();
+    payload = "";
 
-        // Shelf parsing
-        uint8_t shelf = 1;
-        FirebaseJsonData shelfData;
-        if (docJson.get(shelfData, "fields/shelf/integerValue") && shelfData.success) {
-          shelf = (uint8_t)shelfData.intValue;
-        } else if (docJson.get(shelfData, "fields/shelf/stringValue") && shelfData.success) {
-          shelf = (uint8_t)shelfData.stringValue.toInt();
-        } else if (docJson.get(shelfData, "fields/shelfNumber/integerValue") && shelfData.success) {
-          shelf = (uint8_t)shelfData.intValue;
-        }
+    // Extract nextPageToken if present
+    FirebaseJsonData nextTokenData;
+    if (json.get(nextTokenData, "nextPageToken") && nextTokenData.success) {
+      pageToken = nextTokenData.stringValue;
+      pageToken.trim();
+    } else {
+      pageToken = "";
+    }
 
-        // Rack parsing
-        uint8_t rack = 1;
-        FirebaseJsonData rackData;
-        if (docJson.get(rackData, "fields/rack/integerValue") && rackData.success) {
-          rack = (uint8_t)rackData.intValue;
-        } else if (docJson.get(rackData, "fields/rack/stringValue") && rackData.success) {
-          rack = (uint8_t)rackData.stringValue.toInt();
-        } else if (docJson.get(rackData, "fields/rackNumber/integerValue") && rackData.success) {
-          rack = (uint8_t)rackData.intValue;
-        }
+    FirebaseJsonData docsData;
+    json.get(docsData, "documents");
 
-        // Active parsing
-        bool isActive = true;
-        FirebaseJsonData bVal, sVal, iVal, rawActive;
-        if (docJson.get(bVal, "fields/active/booleanValue") && bVal.success) {
-          String bStr = bVal.stringValue;
-          bStr.trim();
-          bStr.toLowerCase();
-          if (bStr == "false" || bStr == "0") {
-            isActive = false;
-          } else {
-            isActive = bVal.boolValue;
+    if (docsData.success && docsData.type == "array") {
+      FirebaseJsonArray arr;
+      docsData.getArray(arr);
+      size_t numDocs = arr.size();
+
+      for (size_t i = 0; i < numDocs; i++) {
+        FirebaseJsonData itemData;
+        arr.get(itemData, i);
+        if (itemData.success) {
+          FirebaseJson docJson;
+          itemData.getJSON(docJson);
+
+          FirebaseJsonData resNameData, titleData, nameData;
+          docJson.get(resNameData, "name");
+
+          String bookTitle = "";
+          if (docJson.get(titleData, "fields/title/stringValue") && titleData.success) {
+            bookTitle = titleData.stringValue;
+          } else if (docJson.get(nameData, "fields/name/stringValue") && nameData.success) {
+            bookTitle = nameData.stringValue;
           }
-        } else if (docJson.get(sVal, "fields/active/stringValue") && sVal.success) {
-          String s = sVal.stringValue;
-          s.trim();
-          s.toLowerCase();
-          isActive = (s == "true" || s == "1");
-        } else if (docJson.get(iVal, "fields/active/integerValue") && iVal.success) {
-          isActive = (iVal.intValue != 0);
-        } else if (docJson.get(rawActive, "fields/active") && rawActive.success) {
-          String raw = rawActive.stringValue;
-          raw.trim();
-          raw.toLowerCase();
-          if (raw == "false" || raw == "0" || raw.indexOf("false") >= 0) {
-            isActive = false;
+          bookTitle.trim();
+
+          // Shelf parsing
+          uint8_t shelf = 1;
+          FirebaseJsonData shelfData;
+          if (docJson.get(shelfData, "fields/shelf/integerValue") && shelfData.success) {
+            shelf = (uint8_t)shelfData.intValue;
+          } else if (docJson.get(shelfData, "fields/shelf/stringValue") && shelfData.success) {
+            shelf = (uint8_t)shelfData.stringValue.toInt();
+          } else if (docJson.get(shelfData, "fields/shelfNumber/integerValue") && shelfData.success) {
+            shelf = (uint8_t)shelfData.intValue;
           }
-        }
 
-        if (resNameData.success) {
-          String fullPath = resNameData.stringValue;
-          int lastSlash = fullPath.lastIndexOf('/');
-          String uid = (lastSlash >= 0) ? fullPath.substring(lastSlash + 1) : fullPath;
-          uid.trim();
-          uid.toUpperCase();
+          // Rack parsing
+          uint8_t rack = 1;
+          FirebaseJsonData rackData;
+          if (docJson.get(rackData, "fields/rack/integerValue") && rackData.success) {
+            rack = (uint8_t)rackData.intValue;
+          } else if (docJson.get(rackData, "fields/rack/stringValue") && rackData.success) {
+            rack = (uint8_t)rackData.stringValue.toInt();
+          } else if (docJson.get(rackData, "fields/rackNumber/integerValue") && rackData.success) {
+            rack = (uint8_t)rackData.intValue;
+          }
 
-          if (uid.length() > 0 && bookTitle.length() > 0) {
-            BookEntry e;
-            e.uid = uid;
-            e.title = bookTitle;
-            e.shelf = shelf;
-            e.rack = rack;
-            e.active = isActive;
-            cloudList.push_back(e);
+          // Active parsing
+          bool isActive = true;
+          FirebaseJsonData bVal, sVal, iVal, rawActive;
+          if (docJson.get(bVal, "fields/active/booleanValue") && bVal.success) {
+            String bStr = bVal.stringValue;
+            bStr.trim();
+            bStr.toLowerCase();
+            if (bStr == "false" || bStr == "0") {
+              isActive = false;
+            } else {
+              isActive = bVal.boolValue;
+            }
+          } else if (docJson.get(sVal, "fields/active/stringValue") && sVal.success) {
+            String s = sVal.stringValue;
+            s.trim();
+            s.toLowerCase();
+            isActive = (s == "true" || s == "1");
+          } else if (docJson.get(iVal, "fields/active/integerValue") && iVal.success) {
+            isActive = (iVal.intValue != 0);
+          } else if (docJson.get(rawActive, "fields/active") && rawActive.success) {
+            String raw = rawActive.stringValue;
+            raw.trim();
+            raw.toLowerCase();
+            if (raw == "false" || raw == "0" || raw.indexOf("false") >= 0) {
+              isActive = false;
+            }
+          }
+
+          if (resNameData.success) {
+            String fullPath = resNameData.stringValue;
+            int lastSlash = fullPath.lastIndexOf('/');
+            String uid = (lastSlash >= 0) ? fullPath.substring(lastSlash + 1) : fullPath;
+            uid.trim();
+            uid.toUpperCase();
+
+            if (uid.length() > 0 && bookTitle.length() > 0) {
+              BookEntry e;
+              e.uid = uid;
+              e.title = bookTitle;
+              e.shelf = shelf;
+              e.rack = rack;
+              e.active = isActive;
+              cloudList.push_back(e);
+            }
           }
         }
       }
     }
+  } while (pageToken.length() > 0);
+
+  if (fetchFailed) {
+    return false;
   }
 
   // 3. Compare romList with cloudList
@@ -3668,6 +3798,7 @@ bool compareAndSyncBooks(bool isBoot, bool &outDiffDetected) {
 
   if (diff) {
     Serial.println(F("[BOOK-SYNC] Updating ROM book cache with fresh Firestore catalog..."));
+    xSemaphoreTake(nvsMutex, portMAX_DELAY);
     bookPrefs.clear();
     String newUids = "";
     for (size_t i = 0; i < cloudList.size(); i++) {
@@ -3688,12 +3819,13 @@ bool compareAndSyncBooks(bool isBoot, bool &outDiffDetected) {
       Serial.println(F("]"));
     }
     bookPrefs.putString("__uids__", newUids);
+    xSemaphoreGive(nvsMutex);
     Serial.print(F("[BOOK-SYNC] ROM book update complete. Total books cached: "));
     Serial.println(cloudList.size());
 
     if (!isBoot) {
       outDiffDetected = true;
-      Serial.println(F("[BOOK-SYNC] Differences detected! Book catalog updated. Scheduling restart countdown..."));
+      Serial.println(F("[BOOK-SYNC] Book catalog hot-reloaded in NVS (no reboot required)."));
     }
   } else {
     Serial.println(F("[BOOK-SYNC] Periodic 20s check: ROM book cache and Firestore match perfectly. No changes."));
@@ -4150,6 +4282,8 @@ void runHardwareDiagnostics() {
     lcd = LiquidCrystal_I2C(targetAddr, LCD_COLUMNS, LCD_ROWS);
     lcd.init();
     lcd.backlight();
+    lcdBacklightOn = true;
+    lastUserActivityTime = millis();
     lcd.clear();
 
     // Welcome splash screens (ABPS Nandyal Branding)
@@ -4254,6 +4388,12 @@ void setup() {
 
   // Initialize Task Watchdog with an extended 30-second window and disable panic reset during cryptographic operations
   esp_task_wdt_init(30, false);
+
+  // Initialize FreeRTOS Mutex for thread-safe NVS (Preferences) operations across Core 0 and Core 1
+  nvsMutex = xSemaphoreCreateMutex();
+  if (nvsMutex == NULL) {
+    Serial.println(F("[NVS]      FATAL: Failed to create NVS mutex!"));
+  }
 
   // Initialize NVS Preferences for offline-first student roster, book catalog & offline log buffering
   studentPrefs.begin("students", false);
@@ -4452,7 +4592,9 @@ void checkSerialCommands() {
             Serial.print(WiFi.RSSI());
             Serial.println(F(" dBm"));
           }
+          xSemaphoreTake(nvsMutex, portMAX_DELAY);
           String pSSID = wifiPrefs.getString("ssid", "");
+          xSemaphoreGive(nvsMutex);
           Serial.print(F("            Provisioned SSID: "));
           Serial.println(pSSID.length() > 0 ? ("\"" + pSSID + "\"") : "(none stored in NVS)");
           Serial.print(F("            Fallback SSID   : \""));
@@ -4470,8 +4612,10 @@ void checkSerialCommands() {
           serialOutput = "[PORTAL] Captive Portal started manually on 'ShelfSense-Setup' @ http://192.168.4.1.";
         } else if (cmd == "clrwifi") {
           Serial.println(F("[SERIAL]   Manual trigger: Clearing provisioned Wi-Fi credentials from ROM..."));
+          xSemaphoreTake(nvsMutex, portMAX_DELAY);
           wifiPrefs.remove("ssid");
           wifiPrefs.remove("pass");
+          xSemaphoreGive(nvsMutex);
           wm.resetSettings();
           Serial.println(F("[SERIAL]   Provisioned Wi-Fi erased from ROM. Launching Captive Portal 'ShelfSense-Setup'..."));
           WiFi.disconnect(true);
@@ -4531,19 +4675,12 @@ void loop() {
     cleanSyncFailed = false;
   }
 
-  // Auto-restart countdown if roster or book data was updated in Firestore (Requirement 2 & 3)
-  if (pendingRestart && currentState == WAITING_FOR_STUDENT) {
-    pendingRestart = false;
-    Serial.println(F("[SYSTEM]   Roster or Book catalog update detected in Firestore! Starting restart sequence..."));
-    showMessage(" Data Updated!  ", "Restarting in 3.");
-    delay(1000);
-    showMessage(" Data Updated!  ", "Restarting in 2.");
-    delay(1000);
-    showMessage(" Data Updated!  ", "Restarting in 1.");
-    delay(1000);
-    showMessage("  Restarting... ", "   ShelfSense   ");
-    delay(500);
-    ESP.restart();
+  // LCD Backlight Auto-Dim / Sleep Timer (5-minute inactivity in WAITING_FOR_STUDENT)
+  if (currentState == WAITING_FOR_STUDENT && !captivePortalRunning) {
+    if (lcdBacklightOn && (millis() - lastUserActivityTime >= LCD_BACKLIGHT_TIMEOUT_MS)) {
+      lcd.noBacklight();
+      lcdBacklightOn = false;
+    }
   }
 
   // Non-blocking inactivity detection in WAITING_FOR_BOOK (18-second timeout)
@@ -4604,6 +4741,9 @@ void loop() {
     delay(captivePortalRunning ? 5 : 50);
     return;
   }
+
+  // Wakes LCD backlight and resets activity timer on card tap without dropping read
+  wakeLcdBacklight();
 
   // Retrieve formatted UID into stack buffer (prevents dynamic heap fragmentation)
   char scannedUID[32];
