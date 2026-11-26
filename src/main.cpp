@@ -1454,25 +1454,126 @@ void redirectToCaptivePortal() {
   wm.server->sendHeader(F("Pragma"), F("no-cache"));
   wm.server->sendHeader(F("Expires"), F("-1"));
 
-  const char redirectBody[] PROGMEM =
-    "<!DOCTYPE html><html><head>"
-    "<meta http-equiv='refresh' content='0;url=http://192.168.4.1/wifi'>"
-    "<meta name='viewport' content='width=device-width, initial-scale=1.0'>"
-    "<title>ShelfSense Wi-Fi Setup</title>"
-    "<style>"
-    "body{background:radial-gradient(circle at 50% 0%,#1e1b4b 0%,#0f172a 60%,#020617 100%);color:#f8fafc;font-family:system-ui,-apple-system,sans-serif;display:flex;justify-content:center;align-items:center;min-height:100vh;margin:0;padding:16px;text-align:center;}"
-    ".c{background:rgba(15,23,42,0.8);backdrop-filter:blur(16px);border:1px solid rgba(255,255,255,0.12);padding:24px;border-radius:20px;max-width:360px;width:100%;box-shadow:0 15px 35px rgba(0,0,0,0.6);animation:pop 0.4s ease-out;}"
-    ".i{width:52px;height:52px;margin:0 auto 12px;border-radius:50%;background:rgba(99,102,241,0.25);border:1px solid #818cf8;display:flex;align-items:center;justify-content:center;animation:pulse 2.5s infinite;}"
-    "@keyframes pulse{0%,100%{transform:scale(1);box-shadow:0 0 15px rgba(99,102,241,0.3);}50%{transform:scale(1.06);box-shadow:0 0 25px rgba(6,182,212,0.6);}}"
-    "@keyframes pop{from{opacity:0;transform:scale(0.95);}to{opacity:1;transform:scale(1);}}"
-    "h3{margin:0 0 6px;color:#ffffff;font-size:1.25rem;font-weight:700;}"
-    "p{margin:0 0 18px;color:#94a3b8;font-size:0.85rem;}"
-    "a{display:inline-block;padding:12px 24px;background:linear-gradient(135deg,#6366f1,#06b6d4);color:#ffffff;text-decoration:none;border-radius:12px;font-weight:700;font-size:0.9rem;box-shadow:0 8px 20px rgba(99,102,241,0.4);}"
-    "</style>"
-    "<script>window.location.replace('http://192.168.4.1/wifi');</script>"
-    "</head><body><div class='c'><div class='i'>"
-    "<svg width='28' height='28' viewBox='0 0 24 24' fill='none' stroke='#818cf8' stroke-width='2.2' stroke-linecap='round' stroke-linejoin='round'><path d='M5 12.55a11 11 0 0 1 14.08 0'></path><path d='M1.42 9a16 16 0 0 1 21.16 0'></path><path d='M8.53 16.11a6 6 0 0 1 6.95 0'></path><line x1='12' y1='20' x2='12.01' y2='20'></line></svg>"
-    "</div><h3>ShelfSense</h3><p>Connecting to Wi-Fi Setup...</p><a href='http://192.168.4.1/wifi'>Click to Continue</a></div></body></html>";
+  const char redirectBody[] PROGMEM = R"rawliteral(<!DOCTYPE html>
+<html lang='en'><head>
+<meta charset='utf-8'>
+<meta http-equiv='refresh' content='0;url=http://192.168.4.1/wifi'>
+<meta name='viewport' content='width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no'>
+<title>ShelfSense Wi-Fi Setup</title>
+<style>
+* { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+body {
+  background: radial-gradient(circle at 50% 0%, #1e1b4b 0%, #0f172a 60%, #020617 100%);
+  color: #f8fafc;
+  font-family: system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  min-height: 100vh;
+  margin: 0;
+  padding: 16px;
+  text-align: center;
+}
+.c {
+  background: rgba(15, 23, 42, 0.85);
+  backdrop-filter: blur(20px);
+  -webkit-backdrop-filter: blur(20px);
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  padding: 30px 22px;
+  border-radius: 24px;
+  max-width: 380px;
+  width: 100%;
+  box-shadow: 0 20px 45px -10px rgba(0, 0, 0, 0.75), 0 0 28px -5px rgba(99, 102, 241, 0.35);
+  animation: pop 0.4s ease-out;
+}
+@keyframes pop {
+  from { opacity: 0; transform: translateY(14px) scale(0.97); }
+  to { opacity: 1; transform: translateY(0) scale(1); }
+}
+@keyframes pulseGlow {
+  0%, 100% { box-shadow: 0 0 16px rgba(99,102,241,0.3); transform: scale(1); }
+  50% { box-shadow: 0 0 30px rgba(6,182,212,0.6); transform: scale(1.05); }
+}
+.i {
+  width: 58px;
+  height: 58px;
+  margin: 0 auto 14px;
+  border-radius: 50%;
+  background: linear-gradient(135deg, rgba(99, 102, 241, 0.25), rgba(6, 182, 212, 0.25));
+  border: 1px solid rgba(129, 140, 248, 0.5);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  animation: pulseGlow 2.6s infinite ease-in-out;
+}
+h2 {
+  margin: 0 0 4px;
+  color: #ffffff;
+  font-size: 1.35rem;
+  font-weight: 800;
+  letter-spacing: -0.5px;
+}
+.sub {
+  color: #94a3b8;
+  font-size: 0.85rem;
+  margin: 0 0 10px;
+}
+.badge {
+  display: inline-block;
+  padding: 3px 12px;
+  background: rgba(99, 102, 241, 0.2);
+  border: 1px solid rgba(99, 102, 241, 0.4);
+  border-radius: 20px;
+  color: #a5b4fc;
+  font-size: 0.72rem;
+  font-weight: 700;
+  letter-spacing: 0.8px;
+  text-transform: uppercase;
+  margin-bottom: 16px;
+}
+p {
+  margin: 0 0 20px;
+  color: #cbd5e1;
+  font-size: 0.9rem;
+  line-height: 1.45;
+}
+a.btn {
+  display: inline-block;
+  width: 100%;
+  padding: 13px;
+  background: linear-gradient(135deg, #6366f1 0%, #4f46e5 50%, #06b6d4 100%);
+  color: #ffffff;
+  text-decoration: none;
+  border-radius: 14px;
+  font-weight: 700;
+  font-size: 0.95rem;
+  box-shadow: 0 10px 25px -5px rgba(99, 102, 241, 0.5);
+  transition: all 0.25s ease;
+}
+a.btn:hover {
+  filter: brightness(1.08);
+  transform: translateY(-1px);
+}
+</style>
+<script>window.location.replace('http://192.168.4.1/wifi');</script>
+</head>
+<body>
+<div class='c'>
+  <div class='i'>
+    <svg width='30' height='30' viewBox='0 0 24 24' fill='none' stroke='#818cf8' stroke-width='2.2' stroke-linecap='round' stroke-linejoin='round'>
+      <path d='M5 12.55a11 11 0 0 1 14.08 0'></path>
+      <path d='M1.42 9a16 16 0 0 1 21.16 0'></path>
+      <path d='M8.53 16.11a6 6 0 0 1 6.95 0'></path>
+      <line x1='12' y1='20' x2='12.01' y2='20'></line>
+    </svg>
+  </div>
+  <h2>ShelfSense</h2>
+  <div class='sub'>Smart Library Setup</div>
+  <div class='badge'>2.4 GHz Networks Only</div>
+  <p>Connecting to Wi-Fi Setup Portal...</p>
+  <a class='btn' href='http://192.168.4.1/wifi'>Open Wi-Fi Settings</a>
+</div>
+</body></html>)rawliteral";
 
   wm.server->send(302, F("text/html"), redirectBody);
 }
@@ -1489,7 +1590,7 @@ const char PORTAL_STYLE_AND_SCRIPT[] PROGMEM = R"rawliteral(
   100% { transform: translate(25px, 20px) scale(1.12); }
 }
 @keyframes cardAppear {
-  from { opacity: 0; transform: translateY(18px); }
+  from { opacity: 0; transform: translateY(16px); }
   to { opacity: 1; transform: translateY(0); }
 }
 @keyframes spin {
@@ -1503,7 +1604,7 @@ body {
   color: #f8fafc !important;
   font-family: system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif !important;
   margin: 0 !important;
-  padding: 16px 12px 36px !important;
+  padding: 16px 12px 40px !important;
   min-height: 100vh !important;
   display: flex !important;
   justify-content: center !important;
@@ -1513,64 +1614,48 @@ body {
 body::before, body::after {
   content: '';
   position: fixed;
-  width: 280px;
-  height: 280px;
+  width: 260px;
+  height: 260px;
   border-radius: 50%;
   filter: blur(80px);
   z-index: -1;
-  opacity: 0.35;
+  opacity: 0.3;
   pointer-events: none;
   animation: floatOrb 10s infinite alternate ease-in-out;
 }
-body::before { background: #6366f1; top: -40px; left: -40px; }
-body::after { background: #06b6d4; bottom: -40px; right: -40px; animation-delay: -5s; }
+body::before { background: #6366f1; top: -30px; left: -30px; }
+body::after { background: #06b6d4; bottom: -30px; right: -30px; animation-delay: -5s; }
 
 .wrap {
   width: 100% !important;
   max-width: 420px !important;
-  background: rgba(15, 23, 42, 0.82) !important;
+  background: rgba(15, 23, 42, 0.85) !important;
   backdrop-filter: blur(20px) !important;
   -webkit-backdrop-filter: blur(20px) !important;
   border: 1px solid rgba(255, 255, 255, 0.12) !important;
   box-shadow: 0 20px 45px -10px rgba(0, 0, 0, 0.75), 0 0 28px -5px rgba(99, 102, 241, 0.35) !important;
   border-radius: 24px !important;
   padding: 24px 18px !important;
-  animation: cardAppear 0.5s cubic-bezier(0.16, 1, 0.3, 1) !important;
+  animation: cardAppear 0.4s cubic-bezier(0.16, 1, 0.3, 1) !important;
   text-align: left !important;
+  margin: 0 auto !important;
 }
 
 h1 {
-  font-size: 1.4rem !important;
-  font-weight: 800 !important;
-  text-align: center !important;
-  background: linear-gradient(135deg, #ffffff 30%, #a5b4fc 100%) !important;
-  -webkit-background-clip: text !important;
-  -webkit-text-fill-color: transparent !important;
-  margin: 8px 0 4px !important;
-  letter-spacing: -0.5px !important;
+  display: none !important;
 }
 
 .portal-hero {
-  text-align: center;
-  margin-bottom: 18px;
+  text-align: center !important;
+  margin-bottom: 20px !important;
+  padding-bottom: 16px !important;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.08) !important;
 }
-.portal-badge {
-  display: inline-block;
-  padding: 3px 10px;
-  background: rgba(99, 102, 241, 0.2);
-  border: 1px solid rgba(99, 102, 241, 0.4);
-  border-radius: 20px;
-  color: #a5b4fc;
-  font-size: 0.72rem;
-  font-weight: 700;
-  letter-spacing: 1px;
-  text-transform: uppercase;
-  margin-bottom: 10px;
-}
+
 .portal-icon {
-  width: 54px;
-  height: 54px;
-  margin: 0 auto 10px;
+  width: 56px;
+  height: 56px;
+  margin: 0 auto 12px;
   display: flex;
   align-items: center;
   justify-content: center;
@@ -1579,48 +1664,84 @@ h1 {
   border-radius: 50%;
   animation: pulseGlow 2.8s infinite ease-in-out;
 }
+
+.portal-title {
+  font-size: 1.45rem;
+  font-weight: 800;
+  letter-spacing: -0.5px;
+  background: linear-gradient(135deg, #ffffff 40%, #a5b4fc 100%);
+  -webkit-background-clip: text;
+  -webkit-text-fill-color: transparent;
+  margin: 0 0 2px;
+}
+
 .portal-sub {
   color: #94a3b8;
+  font-size: 0.86rem;
+  font-weight: 500;
+  margin: 0 0 10px;
+}
+
+.portal-badge {
+  display: inline-block;
+  padding: 3px 12px;
+  background: rgba(99, 102, 241, 0.2);
+  border: 1px solid rgba(99, 102, 241, 0.4);
+  border-radius: 20px;
+  color: #a5b4fc;
+  font-size: 0.72rem;
+  font-weight: 700;
+  letter-spacing: 0.8px;
+  text-transform: uppercase;
+}
+
+.portal-desc {
+  color: #cbd5e1;
   font-size: 0.84rem;
-  margin: 4px 0 0;
+  margin: 10px 0 0;
   line-height: 1.4;
 }
 
 /* Wi-Fi Scanned Network Cards */
-.wrap > div {
+.wrap > div:not(.portal-hero) {
   background: rgba(30, 41, 59, 0.55) !important;
   border: 1px solid rgba(255, 255, 255, 0.08) !important;
   border-radius: 14px !important;
   margin: 8px 0 !important;
-  padding: 10px 14px !important;
+  padding: 12px 14px !important;
   display: flex !important;
   align-items: center !important;
   justify-content: space-between !important;
-  transition: all 0.25s cubic-bezier(0.4, 0, 0.2, 1) !important;
+  transition: all 0.2s cubic-bezier(0.4, 0, 0.2, 1) !important;
   cursor: pointer !important;
+  user-select: none !important;
+  -webkit-user-select: none !important;
 }
 
-.wrap > div:hover, .wrap > div:active, .wrap > div.selected-net {
+.wrap > div:not(.portal-hero):hover,
+.wrap > div:not(.portal-hero):active,
+.wrap > div:not(.portal-hero).selected-net {
   background: rgba(99, 102, 241, 0.22) !important;
   border-color: #818cf8 !important;
   transform: translateY(-2px) !important;
   box-shadow: 0 6px 18px rgba(99, 102, 241, 0.25) !important;
 }
 
-.wrap > div > a {
+.wrap > div:not(.portal-hero) > a {
   color: #f8fafc !important;
-  font-size: 0.92rem !important;
+  font-size: 0.94rem !important;
   font-weight: 600 !important;
   text-decoration: none !important;
   flex: 1 !important;
   overflow: hidden !important;
   text-overflow: ellipsis !important;
   white-space: nowrap !important;
-  padding-right: 8px !important;
+  padding-right: 10px !important;
 }
 
+/* Signal Badges */
 .q {
-  font-size: 0.75rem !important;
+  font-size: 0.74rem !important;
   font-weight: 700 !important;
   color: #38bdf8 !important;
   background: rgba(56, 189, 248, 0.14) !important;
@@ -1629,7 +1750,27 @@ h1 {
   border-radius: 8px !important;
   display: inline-block !important;
   float: none !important;
-  min-width: unset !important;
+  min-width: 44px !important;
+  text-align: center !important;
+  white-space: nowrap !important;
+}
+
+.sig-strong {
+  color: #34d399 !important;
+  background: rgba(16, 185, 129, 0.16) !important;
+  border-color: rgba(52, 211, 153, 0.35) !important;
+}
+
+.sig-med {
+  color: #38bdf8 !important;
+  background: rgba(56, 189, 248, 0.16) !important;
+  border-color: rgba(56, 189, 248, 0.35) !important;
+}
+
+.sig-weak {
+  color: #f87171 !important;
+  background: rgba(239, 68, 68, 0.16) !important;
+  border-color: rgba(248, 113, 113, 0.35) !important;
 }
 
 form {
@@ -1645,45 +1786,50 @@ label {
   font-weight: 700 !important;
   text-transform: uppercase !important;
   letter-spacing: 0.8px !important;
-  margin: 10px 0 4px !important;
+  margin: 12px 0 4px !important;
 }
 
 input[type='text'], input[type='password'], input#s, input#p {
   width: 100% !important;
-  background: rgba(2, 6, 23, 0.65) !important;
-  border: 1px solid rgba(255, 255, 255, 0.15) !important;
+  background: rgba(2, 6, 23, 0.7) !important;
+  border: 1px solid rgba(255, 255, 255, 0.16) !important;
   border-radius: 12px !important;
   color: #ffffff !important;
-  font-size: 0.95rem !important;
+  font-size: 16px !important;
   padding: 12px 14px !important;
-  margin: 4px 0 8px !important;
+  margin: 4px 0 6px !important;
   outline: none !important;
   transition: all 0.25s ease !important;
 }
 
 input[type='text']:focus, input[type='password']:focus, input#s:focus, input#p:focus {
   border-color: #6366f1 !important;
-  box-shadow: 0 0 0 3px rgba(99, 102, 241, 0.25) !important;
-  background: rgba(2, 6, 23, 0.85) !important;
+  box-shadow: 0 0 0 3px rgba(99, 102, 241, 0.28) !important;
+  background: rgba(2, 6, 23, 0.9) !important;
 }
 
 input[type='checkbox']#showpass {
-  width: 16px !important;
-  height: 16px !important;
-  margin-right: 6px !important;
+  width: 18px !important;
+  height: 18px !important;
+  margin: 0 8px 0 0 !important;
   vertical-align: middle !important;
   accent-color: #6366f1 !important;
   cursor: pointer !important;
 }
 
 label[for='showpass'] {
-  display: inline !important;
+  display: inline-flex !important;
+  align-items: center !important;
   color: #cbd5e1 !important;
-  font-size: 0.82rem !important;
+  font-size: 0.86rem !important;
   font-weight: 500 !important;
   text-transform: none !important;
   letter-spacing: normal !important;
   cursor: pointer !important;
+  margin: 8px 0 4px !important;
+  padding: 4px 0 !important;
+  user-select: none !important;
+  -webkit-user-select: none !important;
 }
 
 button[type='submit'], input[type='submit'] {
@@ -1712,94 +1858,146 @@ button[type='submit']:active, input[type='submit']:active {
   transform: translateY(1px) !important;
 }
 
-a[href*='wifi?refresh'] {
-  display: block !important;
-  text-align: center !important;
-  margin-top: 14px !important;
-  color: #38bdf8 !important;
-  font-size: 0.82rem !important;
-  font-weight: 600 !important;
-  text-decoration: none !important;
-}
-a[href*='wifi?refresh']:hover {
-  text-decoration: underline !important;
+button[type='submit']:disabled, input[type='submit']:disabled {
+  opacity: 0.6 !important;
+  cursor: not-allowed !important;
+  transform: none !important;
 }
 
+/* Secondary Button Refresh */
+a[href*='wifi?refresh'] {
+  display: flex !important;
+  align-items: center !important;
+  justify-content: center !important;
+  gap: 8px !important;
+  padding: 12px 16px !important;
+  margin-top: 14px !important;
+  background: rgba(255, 255, 255, 0.06) !important;
+  border: 1px solid rgba(255, 255, 255, 0.14) !important;
+  border-radius: 12px !important;
+  color: #cbd5e1 !important;
+  font-size: 0.85rem !important;
+  font-weight: 600 !important;
+  text-decoration: none !important;
+  transition: all 0.2s ease !important;
+}
+
+a[href*='wifi?refresh']:hover {
+  background: rgba(255, 255, 255, 0.12) !important;
+  color: #ffffff !important;
+  border-color: rgba(255, 255, 255, 0.3) !important;
+  text-decoration: none !important;
+}
+
+/* Loading & Connecting Feedback Banner */
 .connecting-banner {
   display: none;
-  background: rgba(99, 102, 241, 0.15);
-  border: 1px solid rgba(99, 102, 241, 0.35);
+  background: rgba(99, 102, 241, 0.18);
+  border: 1px solid rgba(129, 140, 248, 0.4);
   border-radius: 12px;
-  padding: 12px;
+  padding: 14px;
   margin-top: 14px;
   text-align: center;
-  font-size: 0.85rem;
-  color: #c7d2fe;
+  font-size: 0.88rem;
+  font-weight: 600;
+  color: #e0e7ff;
+  box-shadow: 0 4px 15px rgba(0, 0, 0, 0.3);
+  animation: cardAppear 0.3s ease-out;
 }
-.spinner-dot {
+
+.spinner {
   display: inline-block;
-  width: 14px;
-  height: 14px;
-  border: 2px solid rgba(255,255,255,0.3);
+  width: 18px;
+  height: 18px;
+  border: 2.5px solid rgba(255, 255, 255, 0.25);
   border-top-color: #38bdf8;
   border-radius: 50%;
-  animation: spin 0.8s linear infinite;
+  animation: spin 0.75s linear infinite;
   vertical-align: middle;
-  margin-right: 6px;
+  margin-right: 8px;
 }
 </style>
 <script>
 window.addEventListener('DOMContentLoaded', function() {
   var wrap = document.querySelector('.wrap');
-  if (wrap) {
-    var hero = document.createElement('div');
-    hero.className = 'portal-hero';
-    hero.innerHTML = 
-      "<div class='portal-icon'>" +
-      "<svg width='28' height='28' viewBox='0 0 24 24' fill='none' stroke='#818cf8' stroke-width='2.2' stroke-linecap='round' stroke-linejoin='round'>" +
-      "<path d='M5 12.55a11 11 0 0 1 14.08 0'></path>" +
-      "<path d='M1.42 9a16 16 0 0 1 21.16 0'></path>" +
-      "<path d='M8.53 16.11a6 6 0 0 1 6.95 0'></path>" +
-      "<line x1='12' y1='20' x2='12.01' y2='20'></line>" +
-      "</svg></div>" +
-      "<div><span class='portal-badge'>ShelfSense Smart Library</span></div>" +
-      "<p class='portal-sub'>Tap your 2.4 GHz network below or enter details to configure.</p>";
-    wrap.insertBefore(hero, wrap.firstChild);
+  if (!wrap) return;
 
-    var form = wrap.querySelector('form');
-    if (form) {
-      var banner = document.createElement('div');
-      banner.className = 'connecting-banner';
-      banner.id = 'connBanner';
-      banner.innerHTML = "<span class='spinner-dot'></span> Saving credentials & connecting to Wi-Fi... Please wait!";
-      form.appendChild(banner);
+  // Insert branded ShelfSense Smart Library header with 2.4 GHz badge
+  var hero = document.createElement('div');
+  hero.className = 'portal-hero';
+  hero.innerHTML = 
+    "<div class='portal-icon'>" +
+    "<svg width='30' height='30' viewBox='0 0 24 24' fill='none' stroke='#818cf8' stroke-width='2.2' stroke-linecap='round' stroke-linejoin='round'>" +
+    "<path d='M5 12.55a11 11 0 0 1 14.08 0'></path>" +
+    "<path d='M1.42 9a16 16 0 0 1 21.16 0'></path>" +
+    "<path d='M8.53 16.11a6 6 0 0 1 6.95 0'></path>" +
+    "<line x1='12' y1='20' x2='12.01' y2='20'></line>" +
+    "</svg></div>" +
+    "<div class='portal-title'>ShelfSense</div>" +
+    "<div class='portal-sub'>Smart Library Management</div>" +
+    "<div style='margin-bottom:12px;'><span class='portal-badge'>2.4 GHz Networks Only</span></div>" +
+    "<p class='portal-desc'>Select your library Wi-Fi network below or enter credentials manually.</p>";
+  wrap.insertBefore(hero, wrap.firstChild);
 
-      var btn = form.querySelector('button[type="submit"], input[type="submit"]');
-      if (btn) {
-        if (btn.tagName === 'BUTTON') btn.innerText = 'Connect & Save to ROM';
-        else btn.value = 'Connect & Save to ROM';
+  // Format .q signal percentage badges into color-coded tiers
+  var qElements = wrap.querySelectorAll('.q');
+  qElements.forEach(function(el) {
+    var val = parseInt(el.textContent, 10);
+    if (!isNaN(val)) {
+      if (val >= 65) el.classList.add('sig-strong');
+      else if (val >= 40) el.classList.add('sig-med');
+      else el.classList.add('sig-weak');
+    }
+  });
+
+  // Enhance refresh link with SVG icon
+  var refLink = wrap.querySelector("a[href*='wifi?refresh']");
+  if (refLink) {
+    refLink.innerHTML = "<svg width='15' height='15' viewBox='0 0 24 24' fill='none' stroke='currentColor' stroke-width='2.2' stroke-linecap='round' stroke-linejoin='round'><path d='M21.5 2v6h-6M21.34 15.57a10 10 0 1 1-.57-8.38l5.67-5.67'/></svg> Rescan Wi-Fi Networks";
+  }
+
+  // Scanned network row selection, highlighting, and auto-scroll to #p
+  var rows = wrap.querySelectorAll('.wrap > div:not(.portal-hero)');
+  rows.forEach(function(row) {
+    row.addEventListener('click', function(e) {
+      wrap.querySelectorAll('.wrap > div').forEach(function(d) { d.classList.remove('selected-net'); });
+      row.classList.add('selected-net');
+      var a = row.querySelector('a');
+      if (a) {
+        var ssid = (a.innerText || a.textContent).trim();
+        var sInput = document.getElementById('s');
+        if (sInput) sInput.value = ssid;
       }
+      var pInput = document.getElementById('p');
+      if (pInput) {
+        pInput.scrollIntoView({ behavior: 'smooth', block: 'center' });
+        setTimeout(function() { pInput.focus(); }, 250);
+      }
+    });
+  });
 
-      form.addEventListener('submit', function() {
-        if (banner) banner.style.display = 'block';
-        if (btn) {
-          btn.disabled = true;
-          if (btn.tagName === 'BUTTON') btn.innerText = 'Connecting to Wi-Fi...';
-          else btn.value = 'Connecting to Wi-Fi...';
-        }
-      });
+  // Connecting banner and form submit button lock
+  var form = wrap.querySelector('form');
+  if (form) {
+    var banner = document.createElement('div');
+    banner.className = 'connecting-banner';
+    banner.id = 'connBanner';
+    banner.innerHTML = "<span class='spinner'></span> Saving to ROM & Connecting...";
+    form.appendChild(banner);
+
+    var btn = form.querySelector('button[type="submit"], input[type="submit"]');
+    if (btn) {
+      if (btn.tagName === 'BUTTON') btn.innerText = 'Connect & Save to ROM';
+      else btn.value = 'Connect & Save to ROM';
     }
 
-    var netLinks = wrap.querySelectorAll('div > a');
-    netLinks.forEach(function(a) {
-      a.parentElement.addEventListener('click', function() {
-        wrap.querySelectorAll('div').forEach(function(d) { d.classList.remove('selected-net'); });
-        a.parentElement.classList.add('selected-net');
-        var pInput = document.getElementById('p');
-        if (pInput) {
-          setTimeout(function() { pInput.focus(); }, 150);
-        }
-      });
+    form.addEventListener('submit', function() {
+      if (banner) banner.style.display = 'block';
+      if (btn) {
+        setTimeout(function() {
+          btn.disabled = true;
+        }, 20);
+      }
     });
   }
 });
