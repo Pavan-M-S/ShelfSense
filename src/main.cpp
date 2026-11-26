@@ -1889,7 +1889,21 @@ a[href*='wifi?refresh']:hover {
   text-decoration: none !important;
 }
 
-/* Loading & Connecting Feedback Banner */
+/* Inline Validation Error & Connecting Feedback Banners */
+.err-banner {
+  display: none;
+  background: rgba(239, 68, 68, 0.16);
+  border: 1px solid rgba(248, 113, 113, 0.45);
+  border-radius: 12px;
+  padding: 10px 12px;
+  margin-top: 12px;
+  text-align: center;
+  font-size: 0.84rem;
+  font-weight: 600;
+  color: #fecaca;
+  animation: cardAppear 0.25s ease-out;
+}
+
 .connecting-banner {
   display: none;
   background: rgba(99, 102, 241, 0.18);
@@ -1916,6 +1930,25 @@ a[href*='wifi?refresh']:hover {
   vertical-align: middle;
   margin-right: 8px;
 }
+
+.portal-footer {
+  margin-top: 18px;
+  padding-top: 12px;
+  border-top: 1px solid rgba(255, 255, 255, 0.08);
+  text-align: center;
+  color: #64748b;
+  font-size: 0.76rem;
+  line-height: 1.45;
+}
+
+.portal-footer code {
+  color: #94a3b8;
+  background: rgba(255, 255, 255, 0.06);
+  padding: 2px 6px;
+  border-radius: 6px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 0.75rem;
+}
 </style>
 <script>
 window.addEventListener('DOMContentLoaded', function() {
@@ -1940,8 +1973,7 @@ window.addEventListener('DOMContentLoaded', function() {
   wrap.insertBefore(hero, wrap.firstChild);
 
   // Format .q signal percentage badges into color-coded tiers
-  var qElements = wrap.querySelectorAll('.q');
-  qElements.forEach(function(el) {
+  wrap.querySelectorAll('.q').forEach(function(el) {
     var val = parseInt(el.textContent, 10);
     if (!isNaN(val)) {
       if (val >= 65) el.classList.add('sig-strong');
@@ -1956,19 +1988,29 @@ window.addEventListener('DOMContentLoaded', function() {
     refLink.innerHTML = "<svg width='15' height='15' viewBox='0 0 24 24' fill='none' stroke='currentColor' stroke-width='2.2' stroke-linecap='round' stroke-linejoin='round'><path d='M21.5 2v6h-6M21.34 15.57a10 10 0 1 1-.57-8.38l5.67-5.67'/></svg> Rescan Wi-Fi Networks";
   }
 
+  var sInput = document.getElementById('s');
+  var pInput = document.getElementById('p');
+  var errBanner = document.createElement('div');
+  errBanner.className = 'err-banner';
+  errBanner.id = 'errBanner';
+  errBanner.textContent = 'Please select or enter a Wi-Fi network name (SSID).';
+
+  if (sInput) {
+    sInput.addEventListener('input', function() {
+      if (sInput.value.trim()) errBanner.style.display = 'none';
+    });
+  }
+
   // Scanned network row selection, highlighting, and auto-scroll to #p
-  var rows = wrap.querySelectorAll('.wrap > div:not(.portal-hero)');
-  rows.forEach(function(row) {
-    row.addEventListener('click', function(e) {
+  wrap.querySelectorAll('.wrap > div:not(.portal-hero)').forEach(function(row) {
+    row.addEventListener('click', function() {
       wrap.querySelectorAll('.wrap > div').forEach(function(d) { d.classList.remove('selected-net'); });
       row.classList.add('selected-net');
+      errBanner.style.display = 'none';
       var a = row.querySelector('a');
-      if (a) {
-        var ssid = (a.innerText || a.textContent).trim();
-        var sInput = document.getElementById('s');
-        if (sInput) sInput.value = ssid;
+      if (a && sInput) {
+        sInput.value = (a.innerText || a.textContent).trim();
       }
-      var pInput = document.getElementById('p');
       if (pInput) {
         pInput.scrollIntoView({ behavior: 'smooth', block: 'center' });
         setTimeout(function() { pInput.focus(); }, 250);
@@ -1976,23 +2018,38 @@ window.addEventListener('DOMContentLoaded', function() {
     });
   });
 
-  // Connecting banner and form submit button lock
+  // Empty-SSID validation, connecting banner, and submit button lock
   var form = wrap.querySelector('form');
   if (form) {
+    var btn = form.querySelector('button[type="submit"], input[type="submit"]');
+    if (btn) {
+      if (btn.tagName === 'BUTTON') btn.innerText = 'Connect & Save to ROM';
+      else btn.value = 'Connect & Save to ROM';
+      form.insertBefore(errBanner, btn);
+    } else {
+      form.appendChild(errBanner);
+    }
+
     var banner = document.createElement('div');
     banner.className = 'connecting-banner';
     banner.id = 'connBanner';
     banner.innerHTML = "<span class='spinner'></span> Saving to ROM & Connecting...";
     form.appendChild(banner);
 
-    var btn = form.querySelector('button[type="submit"], input[type="submit"]');
-    if (btn) {
-      if (btn.tagName === 'BUTTON') btn.innerText = 'Connect & Save to ROM';
-      else btn.value = 'Connect & Save to ROM';
-    }
-
-    form.addEventListener('submit', function() {
-      if (banner) banner.style.display = 'block';
+    form.addEventListener('submit', function(e) {
+      var ssidVal = sInput ? sInput.value.trim() : '';
+      if (!ssidVal) {
+        e.preventDefault();
+        errBanner.style.display = 'block';
+        banner.style.display = 'none';
+        if (sInput) {
+          sInput.scrollIntoView({ behavior: 'smooth', block: 'center' });
+          setTimeout(function() { sInput.focus(); }, 200);
+        }
+        return false;
+      }
+      errBanner.style.display = 'none';
+      banner.style.display = 'block';
       if (btn) {
         setTimeout(function() {
           btn.disabled = true;
@@ -2000,6 +2057,12 @@ window.addEventListener('DOMContentLoaded', function() {
       }
     });
   }
+
+  // Fallback IP footer hint
+  var footer = document.createElement('div');
+  footer.className = 'portal-footer';
+  footer.innerHTML = "Portal popup delayed or closed? Visit <code>http://192.168.4.1</code>";
+  wrap.appendChild(footer);
 });
 </script>
 )rawliteral";
@@ -2030,6 +2093,10 @@ void startProvisioningPortal() {
   wm.setConnectTimeout(15);          // 15 seconds connection timeout
   wm.setTitle("ShelfSense Wi-Fi Setup");
   wm.setScanDispPerc(true);          // Display signal strength as percentage
+  wm.setRemoveDuplicateAPs(true);    // Filter duplicate SSIDs to keep scan list clean
+  wm.setMinimumSignalQuality(10);    // Filter out weak (<10%) networks
+  std::vector<const char *> menu = {"wifi"};
+  wm.setMenu(menu);                  // Lock WiFiManager menu to Wi-Fi setup only
   wm.setCaptivePortalEnable(true);   // Ensure captive portal redirection is enabled
   wm.setAPClientCheck(true);         // Keep portal active while clients are connected
   wm.setCustomHeadElement(PORTAL_STYLE_AND_SCRIPT); // Inject aesthetic glassmorphism styling & animations
