@@ -100,6 +100,7 @@
 #include <esp_task_wdt.h>
 #include <esp_idf_version.h>
 #include <vector>
+#include "secrets.h"
 
 // Expand Arduino loopTask stack size on Core 1 from default 8KB to 16KB to support BearSSL HTTPS operations
 SET_LOOP_TASK_STACK_SIZE(16384);
@@ -152,17 +153,7 @@ inline esp_err_t esp_task_wdt_init(uint32_t timeout_sec, bool panic) {
 // Baud Rate for USB Serial Debugging
 #define SERIAL_BAUD         115200
 
-// Wi-Fi Configuration
-#define WIFI_SSID           "narzo 50A"   // Default / fallback Wi-Fi SSID
-#define WIFI_PASSWORD       "MSPP9347"    // Default / fallback Wi-Fi password
-#define PORTAL_AP_NAME      "ShelfSense-Setup" // Captive Portal Hotspot SSID
-#define PORTAL_AP_PASSWORD  "ShelfAdmin123"    // Captive Portal Hotspot Password (WPA2)
-
-// Firebase & Google Cloud Firestore Configuration
-#define FIREBASE_PROJECT_ID           "shelf-sense-f86ba"
-#define FIREBASE_API_KEY              "AIzaSyDHboFG0dyoMTLCH0bkZ85OkWk2yxBXVRQ"
-#define FIREBASE_USER_EMAIL           "esp32@shelfsense.local"
-#define FIREBASE_USER_PASSWORD        "ShelfSense@2026"
+// Google Cloud Firestore Collection Names (credentials defined in include/secrets.h)
 #define FIRESTORE_COLLECTION          "library_logs"
 #define FIRESTORE_COMMANDS_COLLECTION "commands-log"
 #define FIRESTORE_STUDENTS            "student_names"
