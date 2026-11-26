@@ -37,12 +37,31 @@
  *   Green LED  | Anode (+) [Long leg] | GPIO 25    | YES           | Configurable (GREEN_LED_PIN)
  *              | Cathode (-)          | GND        | No (Fixed)    | Connect with 220Ω resistor
  * 
- * 4. INTERACTIVE SERIAL MONITOR COMMANDS (115200 Baud)
+ * 4. WS2812B ADDRESSABLE LED STRIP (60 LEDs, Adafruit_NeoPixel)
+ * -----------------------------------------------------------------------------------------
+ *   Strip Pin  | ESP32 / Power        | Configurable? | Notes
+ *  ------------+----------------------+---------------+----------------------------------
+ *   DIN (Data) | GPIO 13              | YES           | Configurable (LED_STRIP_PIN)
+ *   5V (VCC)   | External 5V / MB102  | No (Power)    | Brightness capped at 60/255 for MB102
+ *   GND        | Common GND           | No (Fixed)    | Must share common GND with ESP32
+ * 
+ * 5. LEVER MICRO LIMIT SWITCHES (3-Pin, Shelf Placement Verification)
+ * -----------------------------------------------------------------------------------------
+ *   Terminal   | Connection           | Configurable? | Notes
+ *  ------------+----------------------+---------------+----------------------------------
+ *   COM        | GND                  | No (Fixed)    | Common Ground
+ *   NO         | GPIO 32, 33, 14, 12  | YES           | INPUT_PULLUP (LOW = book placed)
+ *              |                      |               | GPIO 32 = Primary Shelf 1 / Rack 1
+ *   NC         | Not Connected        | -             | Leave unconnected
+ * 
+ * 6. INTERACTIVE SERIAL MONITOR COMMANDS (115200 Baud)
  * -----------------------------------------------------------------------------------------
  *   Scope    | Command | Action & Behavior
  *  ----------+---------+-------------------------------------------------------------------
  *   System   | all     | ESP32 Task Manager: Displays live FreeRTOS tasks on Core 0 & 1,
  *            |         | RAM heap/stack metrics, ROM NVS namespaces, and system state.
+ *            | testled | Runs calibrated 60-LED WS2812B color test (using stripColor).
+ *            | switches| Prints live state (PRESSED/OPEN) of all configured limit switches.
  *  ----------+---------+-------------------------------------------------------------------
  *   Combined | rom     | Inspect Persistent ROM: Dumps both students and books, offline logs,
  *   (Both)   |         | free heap RAM, and Wi-Fi link status.
@@ -90,6 +109,7 @@
 #include <MFRC522.h>
 #include <Wire.h>
 #include <LiquidCrystal_I2C.h>
+#include <Adafruit_NeoPixel.h>
 #include <Firebase_ESP_Client.h>
 #include <addons/TokenHelper.h>
 #include <freertos/FreeRTOS.h>
@@ -138,17 +158,28 @@ inline esp_err_t esp_task_wdt_init(uint32_t timeout_sec, bool panic) {
 #define SS_PIN              5       // Slave Select / SDA pin for RC522
 
 // Feedback Peripherals
-#define BUZZER_PIN          27      // Active Buzzer positive pin
-#define RED_LED_PIN         26      // Error / Alert Red LED pin (220Ω resistor)
-#define GREEN_LED_PIN       25      // Success / Location Green LED pin (220Ω resistor)
+#define BUZZER_PIN            27      // Active Buzzer positive pin
+#define RED_LED_PIN           26      // Error / Alert Red LED pin (220Ω resistor)
+#define GREEN_LED_PIN         25      // Success / Location Green LED pin (220Ω resistor)
+
+// WS2812B Addressable LED Strip Configuration (60 LEDs)
+#define LED_STRIP_PIN         13      // Data In (DIN) pin for WS2812B LED strip
+#define NUM_LEDS              60      // Total LEDs on strip (indices 0-59)
+#define LED_STRIP_BRIGHTNESS  60      // Safe brightness cap (0-255) for MB102 breadboard power supply
+
+// Lever Micro Limit Switches (3-pin: COM -> GND, NO -> GPIO with INPUT_PULLUP, LOW = book placed)
+#define SWITCH_DEBOUNCE_MS    50      // 50ms debounce window for limit switch polling
+const uint8_t LIMIT_SWITCH_PINS[] = { 32, 33, 14, 12 }; // GPIO 32 = primary Shelf 1 / Rack 1 switch
+const size_t NUM_LIMIT_SWITCHES = sizeof(LIMIT_SWITCH_PINS) / sizeof(LIMIT_SWITCH_PINS[0]);
 
 // LCD I2C Configuration
-#define LCD_I2C_ADDR        0x27    // Standard I2C address (0x27 or 0x3F)
-#define LCD_COLUMNS         16      // 16 characters wide
-#define LCD_ROWS            2       // 2 lines high
+#define LCD_I2C_ADDR          0x27    // Standard I2C address (0x27 or 0x3F)
+#define LCD_COLUMNS           16      // 16 characters wide
+#define LCD_ROWS              2       // 2 lines high
 
-// Session Timeout Configuration
-#define SESSION_TIMEOUT_MS  18000   // 18-second non-blocking inactivity window for book scanning
+// Session & Placement Timeout Configuration
+#define SESSION_TIMEOUT_MS    18000   // 18-second non-blocking inactivity window for book scanning
+#define PLACEMENT_TIMEOUT_MS  20000   // 20-second non-blocking window for physical book placement
 
 // Baud Rate for USB Serial Debugging
 #define SERIAL_BAUD         115200
@@ -176,6 +207,9 @@ MFRC522 mfrc522(SS_PIN, RST_PIN);
 
 // LiquidCrystal_I2C instance communicating over standard I2C (SDA=21, SCL=22)
 LiquidCrystal_I2C lcd(LCD_I2C_ADDR, LCD_COLUMNS, LCD_ROWS);
+
+// Adafruit_NeoPixel instance for 60-LED WS2812B shelf guidance strip (GPIO 13)
+Adafruit_NeoPixel strip(NUM_LEDS, LED_STRIP_PIN, NEO_GRB + NEO_KHZ800);
 
 // Mobizt Firebase Data Objects (Dedicated to Core 0 background Firestore worker)
 FirebaseData fbdo;     // Core 0: Background Firestore worker (20s roster sync, log queue, offline flush)
@@ -234,8 +268,9 @@ void wakeLcdBacklight();
 
 // Finite State Machine (FSM) States
 enum SystemState {
-  WAITING_FOR_STUDENT,  // Ready state: Waiting for student ID card to be scanned
-  WAITING_FOR_BOOK      // Authenticated state: Waiting for book tag to be scanned
+  WAITING_FOR_STUDENT,   // Ready state: Waiting for student ID card to be scanned
+  WAITING_FOR_BOOK,      // Authenticated state: Waiting for book tag to be scanned
+  WAITING_FOR_PLACEMENT  // Guidance state: Waiting for physical book placement on target shelf/rack
 };
 
 // Variable holding the current system state (cross-core shared, marked volatile)
@@ -249,6 +284,42 @@ unsigned long lastSessionSecondLogged = 0;
 char activeStudentName[128] = "";
 char activeStudentUID[32]   = "";
 char activeLoginTime[25]    = "";
+
+// Active book placement tracking (used in WAITING_FOR_PLACEMENT)
+char activeBookTitle[128]       = "";
+char activeBookUID[32]          = "";
+uint8_t activeBookShelf         = 0;
+uint8_t activeBookRack          = 0;
+int activeTargetZoneIndex       = -1;
+unsigned long placementStartTime        = 0;
+unsigned long lastPlacementSecondLogged = 0;
+
+// Structure mapping a physical shelf & rack to a WS2812B LED strip zone and limit switch
+struct ShelfZone {
+  uint8_t shelf;        // Shelf number
+  uint8_t rack;         // Rack number
+  uint16_t startLed;    // Inclusive start LED index (0..59)
+  uint16_t endLed;      // Inclusive end LED index (0..59)
+  uint8_t switchPin;    // Limit switch GPIO (COM -> GND, NO -> GPIO, INPUT_PULLUP)
+};
+
+// 4 shelf/rack zones dividing the 60 LEDs into 15-LED segments (0-14, 15-29, 30-44, 45-59)
+const ShelfZone shelfZones[] = {
+  { 1, 1,  0, 14, LIMIT_SWITCH_PINS[0] }, // Zone 0: Shelf 1, Rack 1 (LEDs  0-14, GPIO 32 - primary)
+  { 2, 1, 15, 29, LIMIT_SWITCH_PINS[1] }, // Zone 1: Shelf 2, Rack 1 (LEDs 15-29, GPIO 33)
+  { 3, 1, 30, 44, LIMIT_SWITCH_PINS[2] }, // Zone 2: Shelf 3, Rack 1 (LEDs 30-44, GPIO 14)
+  { 4, 3, 45, 59, LIMIT_SWITCH_PINS[3] }  // Zone 3: Shelf 4, Rack 3 (LEDs 45-59, GPIO 12)
+};
+const size_t NUM_SHELF_ZONES = sizeof(shelfZones) / sizeof(shelfZones[0]);
+
+// Debounce tracking state for each shelf limit switch
+struct SwitchDebounceState {
+  int lastReading;
+  int stableState;
+  unsigned long lastChangeMs;
+  bool pressConsumed; // Prevents repeated alerts while a book rests on the switch
+};
+SwitchDebounceState switchStates[NUM_SHELF_ZONES];
 
 // Structure modeling a registered library book
 struct Book {
@@ -313,9 +384,10 @@ const size_t NUM_BOOKS = sizeof(registeredBooks) / sizeof(registeredBooks[0]);
 // Returns human-readable state string
 const char* getStateName(SystemState state) {
   switch (state) {
-    case WAITING_FOR_STUDENT: return "WAITING_FOR_STUDENT";
-    case WAITING_FOR_BOOK:    return "WAITING_FOR_BOOK";
-    default:                  return "UNKNOWN_STATE";
+    case WAITING_FOR_STUDENT:   return "WAITING_FOR_STUDENT";
+    case WAITING_FOR_BOOK:      return "WAITING_FOR_BOOK";
+    case WAITING_FOR_PLACEMENT: return "WAITING_FOR_PLACEMENT";
+    default:                    return "UNKNOWN_STATE";
   }
 }
 
@@ -531,6 +603,15 @@ void stopProvisioningPortal();
 void initWiFiConnection();
 void handleWiFiProvisioning();
 void resetSystem();
+uint32_t stripColor(uint8_t r, uint8_t g, uint8_t b);
+void clearLedStrip();
+int findShelfZoneIndex(uint8_t shelf, uint8_t rack);
+void highlightShelfZone(int zoneIndex, uint32_t color, bool clearOthers = true);
+void initPlacementSwitchStates();
+int pollLimitSwitches();
+void displayBookLocationGuidance(const char* title, uint8_t shelf, uint8_t rack);
+void runLedColorTest();
+void printLimitSwitchStates(String& outSummary);
 
 // Maximum number of offline log events buffered in persistent ROM (NVS)
 const uint16_t MAX_OFFLINE_LOGS = 20;
@@ -1239,92 +1320,111 @@ void showMessageWithScroll(const char* line1, const char* line2 = "", int defaul
   delay(800);
 }
 
-// Helper to handle the post-scroll 8-second shelf/rack hold and 3-second warning beeps:
-// 1. Initial 4 seconds (0 - 4s): Displays original screen with Green LED solid ON.
-// 2. Next 4 seconds (4s - 8s):
-//    - Line 1 becomes the shelf/rack info (locationLine)
-//    - Line 2 continuously scrolls "Please place it in given shelf" at 280ms speed, repeating until the end.
-// 3. 3-second warning phase:
-//    - 3 medium beeps spaced evenly across 3 seconds (500ms ON / 500ms OFF), while Green LED blinks simultaneously.
-// 4. Green LED turns OFF and returns to normal standby.
-void holdLocationWait(const char* locationLine) {
-  // Phase 1: First 4 seconds (0 - 4000ms) with Green LED solid ON
-  digitalWrite(GREEN_LED_PIN, HIGH);
-  Serial.println(F("[TIMER]    Holding book view (0-4s) with solid Green LED..."));
-  for (int sec = 1; sec <= 4; sec++) {
-    delay(1000);
-    Serial.print(F("[TIMER]    Hold elapsed: "));
-    Serial.print(sec);
-    Serial.println(F("s / 8s [View: Title + Shelf & Rack]"));
-  }
+// =========================================================================================
+// WS2812B LED STRIP & LIMIT SWITCH HELPERS
+// =========================================================================================
 
-  // Phase 2: After 4 seconds, move shelf/rack to Line 1; display prompt on Line 2
-  Serial.println(F("[STATE]    4 seconds elapsed. Moving shelf/rack to Line 1; scrolling prompt on Line 2..."));
-  lcd.clear();
-  lcd.setCursor(0, 0);
-  char locBuf[17];
-  strncpy(locBuf, locationLine, 16);
-  locBuf[16] = '\0';
-  lcd.print(locBuf);
-
-  // Smooth readable scrolling for "Please place it in given shelf"
-  const char promptMsg[] = "Please place it in given shelf    ";
-  const int promptLen = sizeof(promptMsg) - 1;
-  int promptOffset = 0;
-
-  // Run remaining 4 seconds (4000ms) with relaxed, easy-to-read scroll speed (280ms per character)
-  unsigned long startPhase2 = millis();
-  while (millis() - startPhase2 < 4000) {
-    char frame[17];
-    for (int i = 0; i < 16; i++) {
-      frame[i] = promptMsg[(promptOffset + i) % promptLen];
-    }
-    frame[16] = '\0';
-    lcd.setCursor(0, 1);
-    lcd.print(frame);
-    delay(280);
-    promptOffset++;
-  }
-  Serial.println(F("[TIMER]    Hold elapsed: 8s / 8s [Line 2: \"Please place it in given shelf\"]"));
-
-  // Phase 3: 3-second warning phase (3000ms total) -> 3 medium beeps with simultaneous LED blink
-  Serial.println(F("[STATE]    8-second hold completed. Starting 3-second warning alert (3 beeps + LED flashes)..."));
-  lcd.setCursor(0, 1);
-  lcd.print(F("Session Ending.."));
-
-  for (int b = 0; b < 3; b++) {
-    Serial.print(F("[WARN]     Warning beep "));
-    Serial.print(b + 1);
-    Serial.print(F(" of 3 (Warning second "));
-    Serial.print(b + 1);
-    Serial.println(F("/3s)"));
-
-    // 500ms BEEP + LED ON
-    digitalWrite(BUZZER_PIN, HIGH);
-    digitalWrite(GREEN_LED_PIN, HIGH);
-    delay(500);
-
-    // 500ms SILENCE + LED OFF
-    digitalWrite(BUZZER_PIN, LOW);
-    digitalWrite(GREEN_LED_PIN, LOW);
-    delay(500);
-  }
-
-  digitalWrite(BUZZER_PIN, LOW);
-  digitalWrite(GREEN_LED_PIN, LOW);
-  Serial.println(F("[FEEDBACK] Warning complete. Green LED OFF. Returning to standby."));
+// Red-channel calibration helper: scales Red to 75% so whites and mixed colors look balanced
+uint32_t stripColor(uint8_t r, uint8_t g, uint8_t b) {
+  uint8_t calibratedR = (uint8_t)(((uint16_t)r * 75) / 100);
+  return strip.Color(calibratedR, g, b);
 }
 
-// Dedicated animated handler for displaying book title, shelf, and rack:
-// 1. Line 2 remains empty while scrolling the book title.
-// 2. Adaptive scroll speed: 280ms if <= 30 characters, faster (180ms) if > 30 characters.
-// 3. Green LED blinks rhythmically during title scroll: ON for 2 characters, OFF for 1 character.
-// 4. Exactly 4 characters before scroll ends, Line 2 appears showing "Shelf:X  Rack:Y" and chirps once immediately.
-// 5. Once scrolling completes, holds display for 8 seconds (0-4s solid Green, 4-8s prompt scroll).
-// 6. 3-second warning phase: 3 medium beeps + simultaneous Green LED flashes with "Session Ending..".
-void displayBookLocationSequence(const char* title, uint8_t shelf, uint8_t rack) {
+// Turns off all 60 LEDs on the WS2812B strip
+void clearLedStrip() {
+  strip.clear();
+  strip.show();
+}
+
+// Maps a book's shelf & rack to a configured ShelfZone index
+int findShelfZoneIndex(uint8_t shelf, uint8_t rack) {
+  // 1. Exact match on both shelf and rack
+  for (size_t i = 0; i < NUM_SHELF_ZONES; i++) {
+    if (shelfZones[i].shelf == shelf && shelfZones[i].rack == rack) {
+      return (int)i;
+    }
+  }
+  // 2. Fallback: match by shelf number
+  for (size_t i = 0; i < NUM_SHELF_ZONES; i++) {
+    if (shelfZones[i].shelf == shelf) {
+      Serial.print(F("[LED-STRIP] WARN: Exact Rack "));
+      Serial.print(rack);
+      Serial.print(F(" not mapped for Shelf "));
+      Serial.print(shelf);
+      Serial.print(F("; using Zone "));
+      Serial.println(i + 1);
+      return (int)i;
+    }
+  }
+  // 3. Fallback: modulo zone mapping
+  int fallbackIdx = (shelf > 0) ? (int)((shelf - 1) % NUM_SHELF_ZONES) : 0;
+  Serial.print(F("[LED-STRIP] WARN: Unmapped Shelf "));
+  Serial.print(shelf);
+  Serial.print(F(" Rack "));
+  Serial.print(rack);
+  Serial.print(F("; falling back to Zone "));
+  Serial.println(fallbackIdx + 1);
+  return fallbackIdx;
+}
+
+// Lights up the specified ShelfZone (startLed..endLed) with the given calibrated color
+void highlightShelfZone(int zoneIndex, uint32_t color, bool clearOthers) {
+  if (clearOthers) {
+    strip.clear();
+  }
+  if (zoneIndex >= 0 && zoneIndex < (int)NUM_SHELF_ZONES) {
+    uint16_t startIdx = shelfZones[zoneIndex].startLed;
+    uint16_t endIdx   = shelfZones[zoneIndex].endLed;
+    if (endIdx >= NUM_LEDS) endIdx = NUM_LEDS - 1;
+    for (uint16_t i = startIdx; i <= endIdx; i++) {
+      strip.setPixelColor(i, color);
+    }
+  }
+  strip.show();
+}
+
+// Initializes/resets limit switch debounce states when entering WAITING_FOR_PLACEMENT
+void initPlacementSwitchStates() {
+  unsigned long now = millis();
+  for (size_t i = 0; i < NUM_SHELF_ZONES; i++) {
+    int reading = digitalRead(shelfZones[i].switchPin);
+    switchStates[i].lastReading   = reading;
+    switchStates[i].stableState   = reading;
+    switchStates[i].lastChangeMs  = now;
+    // Ignore switches already held LOW at entry so existing books do not misfire
+    switchStates[i].pressConsumed = (reading == LOW);
+  }
+}
+
+// Polls all configured limit switches with 50ms debounce; returns triggered zone index or -1
+int pollLimitSwitches() {
+  unsigned long now = millis();
+  for (size_t i = 0; i < NUM_SHELF_ZONES; i++) {
+    int reading = digitalRead(shelfZones[i].switchPin);
+    if (reading != switchStates[i].lastReading) {
+      switchStates[i].lastChangeMs = now;
+      switchStates[i].lastReading  = reading;
+    }
+
+    if ((now - switchStates[i].lastChangeMs) >= SWITCH_DEBOUNCE_MS) {
+      if (reading != switchStates[i].stableState) {
+        switchStates[i].stableState = reading;
+        if (reading == LOW && !switchStates[i].pressConsumed) {
+          switchStates[i].pressConsumed = true;
+          return (int)i;
+        } else if (reading == HIGH) {
+          switchStates[i].pressConsumed = false;
+        }
+      }
+    }
+  }
+  return -1;
+}
+
+// Displays book title + "Shelf:X  Rack:Y" on the 16x2 LCD (scrolls long titles once)
+void displayBookLocationGuidance(const char* title, uint8_t shelf, uint8_t rack) {
   wakeLcdBacklight();
-  char locationLine[32];
+  char locationLine[24];
   snprintf(locationLine, sizeof(locationLine), "Shelf:%u  Rack:%u", (unsigned int)shelf, (unsigned int)rack);
 
   Serial.print(F("[LCD]      Book Title: \""));
@@ -1334,86 +1434,101 @@ void displayBookLocationSequence(const char* title, uint8_t shelf, uint8_t rack)
   Serial.println(F("\""));
 
   lcd.clear();
+  lcd.setCursor(0, 1);
+  lcd.print(locationLine);
 
   size_t titleLen = strlen(title);
-
-  // Case A: Short title (<= 16 characters) - No scrolling needed
-  if (titleLen <= 16) {
-    lcd.setCursor(0, 0);
-    lcd.print(title);
-    lcd.setCursor(0, 1);
-    lcd.print(locationLine);
-
-    // Beep once when showing shelf and rack info
-    digitalWrite(BUZZER_PIN, HIGH);
-    delay(100);
-    digitalWrite(BUZZER_PIN, LOW);
-
-    // Wait 8 seconds followed by 3-second warning beeps/blinks
-    holdLocationWait(locationLine);
-    return;
-  }
-
-  // Case B: Long title (> 16 characters)
-  // Adaptive scroll speed: 150ms for extra long titles (>45 chars), 180ms for >25 chars, 250ms otherwise
-  int scrollSpeedMs = (titleLen > 45) ? 150 : ((titleLen > 25) ? 180 : 250);
-
-  int totalSteps = (int)titleLen - 16;
-  int triggerStep = totalSteps > 4 ? (totalSteps - 4) : 0;
-  bool locationShown = false;
-
-  // Initial pause on the first 16 characters so user can start reading
   char frame[17];
   strncpy(frame, title, 16);
   frame[16] = '\0';
   lcd.setCursor(0, 0);
   lcd.print(frame);
-  digitalWrite(GREEN_LED_PIN, HIGH);
-  delay(800);
 
-  // Scroll step by step from offset 0 to totalSteps
-  for (int step = 0; step <= totalSteps; step++) {
-    // Exactly 4 characters before finishing scroll, reveal Shelf and Rack on line 2!
-    if (step >= triggerStep && !locationShown) {
-      lcd.setCursor(0, 1);
-      lcd.print(locationLine);
-      locationShown = true;
-      Serial.print(F("[LCD]      Line 2 revealed (4 chars before end): \""));
-      Serial.print(locationLine);
-      Serial.println(F("\""));
-
-      // Audio chime chirp immediately when shelf & rack appears
-      digitalWrite(BUZZER_PIN, HIGH);
-      delay(100);
-      digitalWrite(BUZZER_PIN, LOW);
+  if (titleLen > 16) {
+    int scrollSpeedMs = (titleLen > 45) ? 140 : ((titleLen > 25) ? 170 : 210);
+    int totalSteps = (int)titleLen - 16;
+    delay(600);
+    for (int step = 1; step <= totalSteps; step++) {
+      strncpy(frame, title + step, 16);
+      frame[16] = '\0';
+      lcd.setCursor(0, 0);
+      lcd.print(frame);
+      delay(scrollSpeedMs);
     }
-
-    // Green LED rhythmic blinking pattern: ON for 2 chars, OFF for 1 char
-    if (step % 3 == 2) {
-      digitalWrite(GREEN_LED_PIN, LOW);
-    } else {
-      digitalWrite(GREEN_LED_PIN, HIGH);
-    }
-
-    // Render 16 characters on Line 1 starting at current offset
-    strncpy(frame, title + step, 16);
+    delay(500);
+    strncpy(frame, title, 16);
     frame[16] = '\0';
     lcd.setCursor(0, 0);
     lcd.print(frame);
-    delay(scrollSpeedMs);
+  }
+}
+
+// Runs a quick calibrated 60-LED color check (Red, Green, Blue, White) for the 'testled' CLI command
+void runLedColorTest() {
+  struct TestColor {
+    const char* name;
+    uint8_t r;
+    uint8_t g;
+    uint8_t b;
+  };
+  const TestColor colors[] = {
+    { "CALIBRATED RED (75%)",   255,   0,   0 },
+    { "GREEN",                    0, 255,   0 },
+    { "BLUE",                     0,   0, 255 },
+    { "CALIBRATED WHITE (75% R)", 255, 255, 255 }
+  };
+
+  Serial.println(F("---------------------------------------------------"));
+  Serial.println(F("[TEST-LED] Running 60-LED WS2812B calibrated color test (Brightness: 60/255)..."));
+  for (size_t c = 0; c < sizeof(colors) / sizeof(colors[0]); c++) {
+    Serial.print(F("           -> Filling all 60 LEDs: "));
+    Serial.println(colors[c].name);
+    uint32_t col = stripColor(colors[c].r, colors[c].g, colors[c].b);
+    for (uint16_t i = 0; i < NUM_LEDS; i++) {
+      strip.setPixelColor(i, col);
+    }
+    strip.show();
+    delay(450);
   }
 
-  // Ensure Line 2 is displayed if it was triggered late
-  if (!locationShown) {
-    lcd.setCursor(0, 1);
-    lcd.print(locationLine);
-    digitalWrite(BUZZER_PIN, HIGH);
-    delay(100);
-    digitalWrite(BUZZER_PIN, LOW);
+  if (currentState == WAITING_FOR_PLACEMENT && activeTargetZoneIndex >= 0) {
+    highlightShelfZone(activeTargetZoneIndex, stripColor(0, 255, 0), true);
+    Serial.println(F("[TEST-LED] Test complete. Restored active target zone Green."));
+  } else {
+    clearLedStrip();
+    Serial.println(F("[TEST-LED] Test complete. LED strip cleared."));
   }
+  Serial.println(F("---------------------------------------------------"));
+}
 
-  // After scrolling completes: wait 8 seconds with solid LED, followed by 3 warning beeps/blinks over 3 seconds
-  holdLocationWait(locationLine);
+// Prints live PRESSED / OPEN state of all configured shelf limit switches
+void printLimitSwitchStates(String& outSummary) {
+  Serial.println(F("---------------------------------------------------"));
+  Serial.println(F("[SWITCHES] Live Lever Micro Limit Switch States (INPUT_PULLUP, LOW = PRESSED):"));
+  outSummary = "[SWITCHES] ";
+  for (size_t i = 0; i < NUM_SHELF_ZONES; i++) {
+    int val = digitalRead(shelfZones[i].switchPin);
+    const char* stateLabel = (val == LOW) ? "PRESSED" : "OPEN";
+
+    Serial.print(F("           Zone "));
+    Serial.print(i + 1);
+    Serial.print(F(" | Shelf "));
+    Serial.print(shelfZones[i].shelf);
+    Serial.print(F(", Rack "));
+    Serial.print(shelfZones[i].rack);
+    Serial.print(F(" | LEDs "));
+    Serial.print(shelfZones[i].startLed);
+    Serial.print(F("-"));
+    Serial.print(shelfZones[i].endLed);
+    Serial.print(F(" | GPIO "));
+    Serial.print(shelfZones[i].switchPin);
+    Serial.print(F(" : "));
+    Serial.println(stateLabel);
+
+    if (i > 0) outSummary += " | ";
+    outSummary += "Z" + String(i + 1) + "(S" + String(shelfZones[i].shelf) + "R" + String(shelfZones[i].rack) + ",GPIO" + String(shelfZones[i].switchPin) + ")=" + String(stateLabel);
+  }
+  Serial.println(F("---------------------------------------------------"));
 }
 
 // Displays strict single-line Wi-Fi error on LCD as required (suppressing all portal/IP/SSID info)
@@ -2291,21 +2406,29 @@ void handleWiFiProvisioning() {
   }
 }
 
-// Resets system back to the default student check-in state (turns off all LEDs)
+// Resets system back to the default student check-in state (turns off all LEDs & LED strip)
 void resetSystem() {
   SystemState previousState = currentState;
   currentState = WAITING_FOR_STUDENT;
   sessionStartTime = 0; // Reset session inactivity timer
   lastSessionSecondLogged = 0;
+  placementStartTime = 0; // Reset placement timer
+  lastPlacementSecondLogged = 0;
 
-  // Clear active authenticated student session credentials
+  // Clear active authenticated student & pending book placement credentials
   activeStudentName[0] = '\0';
   activeStudentUID[0]  = '\0';
   activeLoginTime[0]   = '\0';
+  activeBookTitle[0]   = '\0';
+  activeBookUID[0]     = '\0';
+  activeBookShelf      = 0;
+  activeBookRack       = 0;
+  activeTargetZoneIndex = -1;
 
-  // Ensure both indicator LEDs are OFF in standby
+  // Ensure indicator LEDs and WS2812B LED strip are OFF in standby
   digitalWrite(RED_LED_PIN, LOW);
   digitalWrite(GREEN_LED_PIN, LOW);
+  clearLedStrip();
 
   if (previousState != WAITING_FOR_STUDENT) {
     logStateTransition(previousState, WAITING_FOR_STUDENT);
@@ -2959,16 +3082,32 @@ void dumpAllROMData() {
   Serial.println();
 }
 
+// Clears in-memory session/placement state and turns off LED strip without disturbing LCD
+void clearActiveSessionStateOnly() {
+  activeStudentName[0] = '\0';
+  activeStudentUID[0]  = '\0';
+  activeLoginTime[0]   = '\0';
+  activeBookTitle[0]   = '\0';
+  activeBookUID[0]     = '\0';
+  activeBookShelf      = 0;
+  activeBookRack       = 0;
+  activeTargetZoneIndex = -1;
+  sessionStartTime     = 0;
+  lastSessionSecondLogged = 0;
+  placementStartTime   = 0;
+  lastPlacementSecondLogged = 0;
+  currentState         = WAITING_FOR_STUDENT;
+  digitalWrite(RED_LED_PIN, LOW);
+  digitalWrite(GREEN_LED_PIN, LOW);
+  clearLedStrip();
+}
+
 // Erases student records from persistent ROM (leaves books and offline logs intact)
 void clearStudentROMData() {
   xSemaphoreTake(nvsMutex, portMAX_DELAY);
   studentPrefs.clear();
   xSemaphoreGive(nvsMutex);
-  activeStudentName[0] = '\0';
-  activeStudentUID[0]  = '\0';
-  activeLoginTime[0]   = '\0';
-  sessionStartTime = 0;
-  currentState = WAITING_FOR_STUDENT;
+  clearActiveSessionStateOnly();
 
   Serial.println();
   Serial.println(F("==================================================="));
@@ -2985,8 +3124,7 @@ void clearBookROMData() {
   xSemaphoreTake(nvsMutex, portMAX_DELAY);
   bookPrefs.clear();
   xSemaphoreGive(nvsMutex);
-  sessionStartTime = 0;
-  currentState = WAITING_FOR_STUDENT;
+  clearActiveSessionStateOnly();
 
   Serial.println();
   Serial.println(F("==================================================="));
@@ -3008,11 +3146,7 @@ void clearAllROMData() {
   offlineLogsPrefs.clear();
   xSemaphoreGive(nvsMutex);
   // Clear in-memory session credentials without disturbing the LCD display
-  activeStudentName[0] = '\0';
-  activeStudentUID[0]  = '\0';
-  activeLoginTime[0]   = '\0';
-  sessionStartTime = 0;
-  currentState = WAITING_FOR_STUDENT;
+  clearActiveSessionStateOnly();
 
   Serial.println();
   Serial.println(F("==================================================="));
@@ -3038,11 +3172,7 @@ void executeCleanResetAndSyncStudents() {
   xSemaphoreTake(nvsMutex, portMAX_DELAY);
   studentPrefs.clear();
   xSemaphoreGive(nvsMutex);
-  activeStudentName[0] = '\0';
-  activeStudentUID[0]  = '\0';
-  activeLoginTime[0]   = '\0';
-  sessionStartTime = 0;
-  currentState = WAITING_FOR_STUDENT;
+  clearActiveSessionStateOnly();
 
   if (WiFi.status() != WL_CONNECTED) {
     Serial.println(F("[CLRUPTS]   WARN: Wi-Fi currently disconnected. Sync will begin upon link connect."));
@@ -3059,8 +3189,7 @@ void executeCleanResetAndSyncBooks() {
   xSemaphoreTake(nvsMutex, portMAX_DELAY);
   bookPrefs.clear();
   xSemaphoreGive(nvsMutex);
-  sessionStartTime = 0;
-  currentState = WAITING_FOR_STUDENT;
+  clearActiveSessionStateOnly();
 
   if (WiFi.status() != WL_CONNECTED) {
     Serial.println(F("[CLRUPTB]   WARN: Wi-Fi currently disconnected. Sync will begin upon link connect."));
@@ -3081,11 +3210,7 @@ void executeCleanResetAndSync() {
   offlineLogsPrefs.clear();
   xSemaphoreGive(nvsMutex);
   // Clear in-memory session credentials without disturbing the LCD display
-  activeStudentName[0] = '\0';
-  activeStudentUID[0]  = '\0';
-  activeLoginTime[0]   = '\0';
-  sessionStartTime = 0;
-  currentState = WAITING_FOR_STUDENT;
+  clearActiveSessionStateOnly();
 
   if (WiFi.status() != WL_CONNECTED) {
     Serial.println(F("[CLRUPT]    WARN: Wi-Fi currently disconnected. Sync will begin as soon as link connects."));
@@ -3136,7 +3261,7 @@ String captureDetailedStateSummary() {
   out += " | Offline Logs: " + String(offCount);
   out += " | Free Heap: " + String(ESP.getFreeHeap()) + " B";
   out += " | Mode: " + String(systemRestMode ? "REST_MODE" : "NORMAL_STANDBY");
-  out += " | State: " + String(currentState == WAITING_FOR_STUDENT ? "WAITING_FOR_STUDENT" : "WAITING_FOR_BOOK");
+  out += " | State: " + String(getStateName(currentState));
   out += " | Wi-Fi: " + String(WiFi.status() == WL_CONNECTED ? "CONNECTED" : "DISCONNECTED");
 
   return out;
@@ -3357,9 +3482,9 @@ void dumpTaskManagerAll() {
   Serial.println(F("        - Dedicated Task    : 'loopTask' (Pinned to Core 1, Priority 3 - TOP REAL-TIME PRIORITY)"));
   Serial.println(F("        - RFID Sensing      : RC522 SPI high-frequency polling loop (Zero Latency)"));
   Serial.println(F("        - Display Actuation : LiquidCrystal I2C 16x2 real-time guidance & animated titles"));
-  Serial.println(F("        - Peripherals       : Buzzer acoustic chirps/alarms, Green/Red LED indicators"));
+  Serial.println(F("        - Peripherals       : Buzzer, Red/Green LEDs, 60-LED WS2812B strip & limit switches"));
   Serial.println(F("        - Interactive CLI   : Non-blocking Serial Monitor command listener"));
-  Serial.println(F("        - Timers & Security : 18s inactivity watchdog, 30s clock broadcaster, state machine"));
+  Serial.println(F("        - Timers & Security : 18s scan / 20s placement watchdogs, 30s clock, state machine"));
 
   // --- SECTION 3: FREERTOS ACTIVE TASK MANAGER TABLE ---
   Serial.println(F("--------------------------------------------------------------------------------"));
@@ -3463,7 +3588,7 @@ void dumpTaskManagerAll() {
 
   // In-Memory Active Session Variables
   Serial.print(F("    • Active State in RAM   : "));
-  Serial.print(currentState == WAITING_FOR_STUDENT ? F("WAITING_FOR_STUDENT") : F("WAITING_FOR_BOOK"));
+  Serial.print(getStateName(currentState));
   Serial.print(F(" | System Mode: "));
   Serial.println(systemRestMode ? F("REST MODE (Active)") : F("NORMAL STANDBY"));
   if (activeStudentName[0] != '\0') {
@@ -4407,32 +4532,45 @@ void handleBookScan(const char* uid) {
     // Immediate confirmation chirp + green LED flash
     indicateSuccess(1, 150);
 
-    // Stop session timer
+    // Stop book-scan inactivity timer
     sessionStartTime = 0;
     lastSessionSecondLogged = 0;
 
-    // Silent Background Cloud Sync: Dispatch ONE COMBINED document to Firestore (both login and processed data)
-    char note[160];
-    snprintf(note, sizeof(note), "Student authenticated & book mapped to Shelf %u, Rack %u", foundBook.shelf, foundBook.rack);
-    queueFirestoreLog("BOOK_PROCESSED",
-                      activeStudentName,
-                      activeStudentUID,
-                      activeLoginTime,
-                      foundBook.title,
-                      uid,
-                      foundBook.shelf,
-                      foundBook.rack,
-                      note);
+    // Store active book details & resolve target ShelfZone
+    strncpy(activeBookTitle, foundBook.title, sizeof(activeBookTitle) - 1);
+    activeBookTitle[sizeof(activeBookTitle) - 1] = '\0';
+    strncpy(activeBookUID, uid, sizeof(activeBookUID) - 1);
+    activeBookUID[sizeof(activeBookUID) - 1] = '\0';
+    activeBookShelf       = foundBook.shelf;
+    activeBookRack        = foundBook.rack;
+    activeTargetZoneIndex = findShelfZoneIndex(foundBook.shelf, foundBook.rack);
 
-    // Run custom animated display sequence (title scroll, reveal, 8s hold, 3s warning)
-    displayBookLocationSequence(foundBook.title, foundBook.shelf, foundBook.rack);
+    // Highlight target shelf zone in bright Green while keeping all other zones off
+    highlightShelfZone(activeTargetZoneIndex, stripColor(0, 255, 0), true);
+    digitalWrite(GREEN_LED_PIN, HIGH);
+    Serial.print(F("[LED-STRIP] Highlighting Zone "));
+    Serial.print(activeTargetZoneIndex + 1);
+    Serial.print(F(" (LEDs "));
+    Serial.print(shelfZones[activeTargetZoneIndex].startLed);
+    Serial.print(F("-"));
+    Serial.print(shelfZones[activeTargetZoneIndex].endLed);
+    Serial.print(F(", Switch GPIO "));
+    Serial.print(shelfZones[activeTargetZoneIndex].switchPin);
+    Serial.println(F(") in GREEN"));
 
-    Serial.println(F("[INFO]     Book sequence completed. Resetting for next patron..."));
-    resetSystem();
+    // Display book title + "Shelf:X  Rack:Y" on 16x2 LCD
+    displayBookLocationGuidance(foundBook.title, foundBook.shelf, foundBook.rack);
 
-    // Trigger immediate background sync after completing round (Student + Book successfully logged)
-    triggerPostRoundSync = true;
-    Serial.println(F("[AUTH-SYNC] Completed one full book round. Scheduled immediate background cloud sync."));
+    // Prepare switch debounce states and transition to WAITING_FOR_PLACEMENT
+    initPlacementSwitchStates();
+    logStateTransition(WAITING_FOR_BOOK, WAITING_FOR_PLACEMENT);
+    currentState = WAITING_FOR_PLACEMENT;
+
+    placementStartTime = millis();
+    lastPlacementSecondLogged = 0;
+    Serial.print(F("[TIMER]    Placement timer started ("));
+    Serial.print(PLACEMENT_TIMEOUT_MS / 1000);
+    Serial.println(F("s window for physical book placement)"));
     return;
   }
 
@@ -4500,6 +4638,177 @@ void handleBookScan(const char* uid) {
   lastSessionSecondLogged = 0;
   Serial.println(F("[INFO]     Session timer renewed (+18s). Ready for book tag retry..."));
   showMessage("Tap Your Book...");
+}
+
+// Handles Physical Book Placement Verification (State 3: WAITING_FOR_PLACEMENT)
+void handleBookPlacementStep() {
+  int triggeredZone = pollLimitSwitches();
+
+  // Case 1: Correct Shelf Limit Switch Triggered (LOW)
+  if (triggeredZone != -1 && triggeredZone == activeTargetZoneIndex) {
+    Serial.print(F("[SUCCESS]  Physical book placement confirmed on Shelf "));
+    Serial.print(activeBookShelf);
+    Serial.print(F(", Rack "));
+    Serial.print(activeBookRack);
+    Serial.print(F(" (Zone "));
+    Serial.print(triggeredZone + 1);
+    Serial.print(F(", GPIO "));
+    Serial.print(shelfZones[triggeredZone].switchPin);
+    Serial.println(F(")"));
+
+    // Flash target LED zone bright Green
+    for (int f = 0; f < 2; f++) {
+      clearLedStrip();
+      delay(80);
+      highlightShelfZone(activeTargetZoneIndex, stripColor(0, 255, 0), true);
+      delay(120);
+    }
+
+    // Play success chime + Green LED pulses
+    indicateSuccess(2, 100);
+
+    // Show confirmation on LCD for 2 seconds
+    showMessage("Book Placed!", "Thank You!");
+    delay(2000);
+
+    // Queue BOOK_PROCESSED to Firestore confirming physical placement
+    char note[160];
+    snprintf(note, sizeof(note), "Student authenticated & book physically placed on Shelf %u, Rack %u (GPIO %u)",
+             activeBookShelf, activeBookRack, shelfZones[activeTargetZoneIndex].switchPin);
+    queueFirestoreLog("BOOK_PROCESSED",
+                      activeStudentName,
+                      activeStudentUID,
+                      activeLoginTime,
+                      activeBookTitle,
+                      activeBookUID,
+                      activeBookShelf,
+                      activeBookRack,
+                      note);
+
+    // Turn off LED strip, schedule immediate post-round sync, and reset to ready state
+    clearLedStrip();
+    triggerPostRoundSync = true;
+    Serial.println(F("[AUTH-SYNC] Completed one full book round. Scheduled immediate background cloud sync."));
+    resetSystem();
+    return;
+  }
+
+  // Case 2: Wrong Shelf Limit Switch Triggered (LOW)
+  if (triggeredZone != -1) {
+    char note[160];
+    snprintf(note, sizeof(note), "Book placed on WRONG Shelf %u, Rack %u (GPIO %u); expected Shelf %u, Rack %u",
+             shelfZones[triggeredZone].shelf,
+             shelfZones[triggeredZone].rack,
+             shelfZones[triggeredZone].switchPin,
+             activeBookShelf,
+             activeBookRack);
+
+    char moveLine[24];
+    snprintf(moveLine, sizeof(moveLine), "Move to S:%u R:%u",
+             (unsigned int)activeBookShelf, (unsigned int)activeBookRack);
+
+    // Queue MISPLACED_ALERT event to Firestore
+    queueFirestoreLog("MISPLACED_ALERT",
+                      activeStudentName,
+                      activeStudentUID,
+                      activeLoginTime,
+                      activeBookTitle,
+                      activeBookUID,
+                      shelfZones[triggeredZone].shelf,
+                      shelfZones[triggeredZone].rack,
+                      note);
+
+    // Flash wrong shelf's LED zone Red while keeping the correct shelf's zone Green
+    for (int f = 0; f < 3; f++) {
+      strip.clear();
+      highlightShelfZone(activeTargetZoneIndex, stripColor(0, 255, 0), false);
+      highlightShelfZone(triggeredZone, stripColor(255, 0, 0), false);
+      delay(120);
+      highlightShelfZone(activeTargetZoneIndex, stripColor(0, 255, 0), true);
+      delay(100);
+    }
+
+    // Keep wrong zone Red & target zone Green during warning buzzer + Red LED error display
+    strip.clear();
+    highlightShelfZone(activeTargetZoneIndex, stripColor(0, 255, 0), false);
+    highlightShelfZone(triggeredZone, stripColor(255, 0, 0), false);
+    showError("Wrong Shelf!", moveLine, note);
+
+    // Restore clean guidance: only target zone Green, wrong zone off, and restore book title + Shelf/Rack on LCD
+    highlightShelfZone(activeTargetZoneIndex, stripColor(0, 255, 0), true);
+    digitalWrite(GREEN_LED_PIN, HIGH);
+
+    char locationLine[24];
+    snprintf(locationLine, sizeof(locationLine), "Shelf:%u  Rack:%u",
+             (unsigned int)activeBookShelf, (unsigned int)activeBookRack);
+    char titlePreview[17];
+    strncpy(titlePreview, activeBookTitle, 16);
+    titlePreview[16] = '\0';
+    showMessage(titlePreview, locationLine);
+
+    // Renew placement timer so student can move the book to the correct shelf
+    placementStartTime = millis();
+    lastPlacementSecondLogged = 0;
+    Serial.print(F("[TIMER]    Placement timer renewed ("));
+    Serial.print(PLACEMENT_TIMEOUT_MS / 1000);
+    Serial.println(F("s) after wrong-shelf alert. Waiting for correct placement..."));
+    return;
+  }
+
+  // Case 3: Placement Timeout Monitoring (20 seconds)
+  unsigned long elapsedMs = millis() - placementStartTime;
+  unsigned long elapsedSec = elapsedMs / 1000;
+
+  if (elapsedSec > lastPlacementSecondLogged && elapsedSec <= (PLACEMENT_TIMEOUT_MS / 1000)) {
+    lastPlacementSecondLogged = elapsedSec;
+    Serial.print(F("[TIMER]    Waiting for book placement: Second "));
+    Serial.print(elapsedSec);
+    Serial.print(F(" of "));
+    Serial.print(PLACEMENT_TIMEOUT_MS / 1000);
+    Serial.println(F("s"));
+  }
+
+  if (elapsedMs >= PLACEMENT_TIMEOUT_MS) {
+    Serial.print(F("[WARN]     Placement timed out: No switch triggered within "));
+    Serial.print(PLACEMENT_TIMEOUT_MS / 1000);
+    Serial.println(F(" seconds."));
+
+    showMessage("Placement Time", "Please Retry");
+
+    // Flash target LED zone Red + play 2 warning beeps simultaneously with Red LED
+    digitalWrite(GREEN_LED_PIN, LOW);
+    for (int i = 0; i < 2; i++) {
+      highlightShelfZone(activeTargetZoneIndex, stripColor(255, 0, 0), true);
+      digitalWrite(RED_LED_PIN, HIGH);
+      digitalWrite(BUZZER_PIN, HIGH);
+      delay(180);
+
+      clearLedStrip();
+      digitalWrite(RED_LED_PIN, LOW);
+      digitalWrite(BUZZER_PIN, LOW);
+      if (i < 1) {
+        delay(140);
+      }
+    }
+    delay(1200);
+
+    // Queue PLACEMENT_TIMEOUT event to Firestore
+    char timeoutNote[160];
+    snprintf(timeoutNote, sizeof(timeoutNote), "Book placement timed out after %u seconds (expected Shelf %u, Rack %u)",
+             (unsigned int)(PLACEMENT_TIMEOUT_MS / 1000), activeBookShelf, activeBookRack);
+    queueFirestoreLog("PLACEMENT_TIMEOUT",
+                      activeStudentName,
+                      activeStudentUID,
+                      activeLoginTime,
+                      activeBookTitle,
+                      activeBookUID,
+                      activeBookShelf,
+                      activeBookRack,
+                      timeoutNote);
+
+    clearLedStrip();
+    resetSystem();
+  }
 }
 
 // =========================================================================================
@@ -4610,6 +4919,55 @@ void runHardwareDiagnostics() {
 
   logSuccess(F("Buzzer and Dual-LED hardware diagnostic test passed"));
 
+  // 3b. Initialize WS2812B 60-LED Strip & Run Quick Startup Sweep
+  Serial.print(F("[BOOT]     Initializing WS2812B LED Strip (GPIO "));
+  Serial.print(LED_STRIP_PIN);
+  Serial.print(F(", "));
+  Serial.print(NUM_LEDS);
+  Serial.print(F(" LEDs, Brightness "));
+  Serial.print(LED_STRIP_BRIGHTNESS);
+  Serial.println(F("/255)..."));
+
+  strip.begin();
+  strip.setBrightness(LED_STRIP_BRIGHTNESS);
+  clearLedStrip();
+
+  // Quick non-glaring startup sweep across all 60 LEDs
+  uint32_t sweepColor = stripColor(0, 200, 120);
+  for (uint16_t i = 0; i < NUM_LEDS; i++) {
+    strip.clear();
+    strip.setPixelColor(i, sweepColor);
+    strip.show();
+    delay(12);
+  }
+  clearLedStrip();
+  logSuccess(F("WS2812B 60-LED strip startup sweep complete (strip cleared)"));
+
+  // 3c. Configure Lever Micro Limit Switches (INPUT_PULLUP, LOW = book placed)
+  Serial.println(F("[BOOT]     Configuring Shelf Lever Micro Limit Switches (INPUT_PULLUP)..."));
+  for (size_t i = 0; i < NUM_LIMIT_SWITCHES; i++) {
+    pinMode(LIMIT_SWITCH_PINS[i], INPUT_PULLUP);
+  }
+  initPlacementSwitchStates();
+  for (size_t i = 0; i < NUM_SHELF_ZONES; i++) {
+    int state = digitalRead(shelfZones[i].switchPin);
+    Serial.print(F("           - Zone "));
+    Serial.print(i + 1);
+    Serial.print(F(" (Shelf "));
+    Serial.print(shelfZones[i].shelf);
+    Serial.print(F(", Rack "));
+    Serial.print(shelfZones[i].rack);
+    Serial.print(F(" | LEDs "));
+    Serial.print(shelfZones[i].startLed);
+    Serial.print(F("-"));
+    Serial.print(shelfZones[i].endLed);
+    Serial.print(F(" | GPIO "));
+    Serial.print(shelfZones[i].switchPin);
+    Serial.print(F("): "));
+    Serial.println(state == LOW ? F("PRESSED (LOW)") : F("OPEN (HIGH)"));
+  }
+  logSuccess(F("Shelf limit switches configured and initial states logged"));
+
   // 4. Print Database Configuration Summary
   Serial.println(F("[BOOT]     Database Configuration:"));
   Serial.println(F("           - Student Roster: Offline-First Cloud Cache (Firestore: student_names / NVS: \"students\")"));
@@ -4719,7 +5077,9 @@ void setup() {
 
   Serial.println(F("[SERIAL]   Interactive Commands Ready:"));
   Serial.println(F("           System & Task Manager:"));
-  Serial.println(F("           - 'all'     : ESP32 Task Manager (RAM, ROM, Core 0 & Core 1 tasks)"));
+  Serial.println(F("           - 'all'      : ESP32 Task Manager (RAM, ROM, Core 0 & Core 1 tasks)"));
+  Serial.println(F("           - 'testled'  : Run calibrated 60-LED WS2812B color test"));
+  Serial.println(F("           - 'switches' : Print live state (PRESSED/OPEN) of all limit switches"));
   Serial.println(F("           Combined (Both):"));
   Serial.println(F("           - 'rom'     : Inspect all persistent ROM (students, books, logs & RAM)"));
   Serial.println(F("           - 'upt'     : Force immediate on-demand Firestore sync of both"));
@@ -4891,17 +5251,26 @@ void checkSerialCommands() {
           actionSummary = "Erased provisioned Wi-Fi credentials from NVS ROM and triggered Captive Portal 'ShelfSense-Setup'.";
           serialOutput = "[PORTAL] Erased provisioned Wi-Fi from ROM; started Captive Portal 'ShelfSense-Setup'.";
 
+        // 6. Hardware Diagnostics CLI Commands (LED Strip & Limit Switches)
+        } else if (cmd == "testled") {
+          runLedColorTest();
+          actionSummary = "Executed calibrated 60-LED WS2812B color test (Red at 75%, Green, Blue, White).";
+          serialOutput = "[TEST-LED] Executed calibrated 60-LED WS2812B color test using stripColor().";
+        } else if (cmd == "switches") {
+          printLimitSwitchStates(serialOutput);
+          actionSummary = "Inspected live PRESSED/OPEN states of all configured shelf lever micro limit switches.";
+
         } else {
           Serial.print(F("[SERIAL] Unknown command: '"));
           Serial.print(serialBuffer);
           Serial.println(F("'. Supported commands:"));
-          Serial.println(F("         System:   'all'"));
+          Serial.println(F("         System:   'all', 'testled', 'switches'"));
           Serial.println(F("         Combined: 'rom', 'upt', 'clr', 'clrupt'"));
           Serial.println(F("         Students: 'roms', 'upts', 'clrs', 'clrupts'"));
           Serial.println(F("         Books:    'romb', 'uptb', 'clrb', 'clruptb'"));
           Serial.println(F("         Wi-Fi:    'wifi', 'portal', 'clrwifi'"));
           actionSummary = "Unrecognized command received in Serial CLI.";
-          serialOutput = "[SERIAL] Unknown command: '" + serialBuffer + "'. Supported commands: 'all', 'rom', 'roms', 'romb', 'upt', 'upts', 'uptb', 'clr', 'clrs', 'clrb', 'clrupt', 'clrupts', 'clruptb', 'wifi', 'portal', 'clrwifi'.";
+          serialOutput = "[SERIAL] Unknown command: '" + serialBuffer + "'. Supported commands: 'all', 'testled', 'switches', 'rom', 'roms', 'romb', 'upt', 'upts', 'uptb', 'clr', 'clrs', 'clrb', 'clrupt', 'clrupts', 'clruptb', 'wifi', 'portal', 'clrwifi'.";
           execStatus = "UNKNOWN_COMMAND";
         }
 
@@ -5009,6 +5378,13 @@ void loop() {
       resetSystem();
       return;
     }
+  }
+
+  // Non-blocking physical book placement verification in WAITING_FOR_PLACEMENT (20-second timeout)
+  if (currentState == WAITING_FOR_PLACEMENT) {
+    handleBookPlacementStep();
+    delay(captivePortalRunning ? 5 : 10);
+    return;
   }
 
   // Check if a new RFID card is present on the reader
