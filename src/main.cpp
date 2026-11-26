@@ -1703,7 +1703,7 @@ h1 {
 }
 
 /* Wi-Fi Scanned Network Cards */
-.wrap > div:not(.portal-hero) {
+.wrap > div:not(.portal-hero):not(.portal-footer) {
   background: rgba(30, 41, 59, 0.55) !important;
   border: 1px solid rgba(255, 255, 255, 0.08) !important;
   border-radius: 14px !important;
@@ -1718,16 +1718,16 @@ h1 {
   -webkit-user-select: none !important;
 }
 
-.wrap > div:not(.portal-hero):hover,
-.wrap > div:not(.portal-hero):active,
-.wrap > div:not(.portal-hero).selected-net {
+.wrap > div:not(.portal-hero):not(.portal-footer):hover,
+.wrap > div:not(.portal-hero):not(.portal-footer):active,
+.wrap > div:not(.portal-hero):not(.portal-footer).selected-net {
   background: rgba(99, 102, 241, 0.22) !important;
   border-color: #818cf8 !important;
   transform: translateY(-2px) !important;
   box-shadow: 0 6px 18px rgba(99, 102, 241, 0.25) !important;
 }
 
-.wrap > div:not(.portal-hero) > a {
+.wrap > div:not(.portal-hero):not(.portal-footer) > a {
   color: #f8fafc !important;
   font-size: 0.94rem !important;
   font-weight: 600 !important;
@@ -2002,7 +2002,7 @@ window.addEventListener('DOMContentLoaded', function() {
   }
 
   // Scanned network row selection, highlighting, and auto-scroll to #p
-  wrap.querySelectorAll('.wrap > div:not(.portal-hero)').forEach(function(row) {
+  wrap.querySelectorAll('.wrap > div:not(.portal-hero):not(.portal-footer)').forEach(function(row) {
     row.addEventListener('click', function() {
       wrap.querySelectorAll('.wrap > div').forEach(function(d) { d.classList.remove('selected-net'); });
       row.classList.add('selected-net');
